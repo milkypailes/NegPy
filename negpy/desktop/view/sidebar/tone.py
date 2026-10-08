@@ -546,9 +546,9 @@ class ToneSidebar(BaseSidebar):
         self._write_curves(True, [(x, x) for x in CURVE_DEFAULT_X])
 
     def _reset_curves_all(self) -> None:
-        from negpy.features.exposure.curves import curves_fields
+        from negpy.features.exposure.curves import curves_defaults
 
-        self.update_config_section("exposure", render=True, persist=True, readback_metrics=True, **{f: 0.0 for f in curves_fields()})
+        self.update_config_section("exposure", render=True, persist=True, readback_metrics=True, **curves_defaults())
 
     def _sync_curves_histogram(self) -> None:
         metrics = self.controller.state.last_metrics
