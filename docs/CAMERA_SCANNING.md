@@ -23,6 +23,12 @@ catches leakage from the red and the blue light at once. One narrow band at a ti
 that crosstalk by construction, and every channel gets the full dynamic range of the sensor
 instead of sharing it.
 
+**Single-capture narrowband scanning.** An RGB preset can instead light red, green and blue
+together for one exposure. The frame is imported as an ordinary RAW, and its roll is
+recorded with Trichrome Mode off. It takes one shutter actuation per frame and has no registration between channels.
+The channels overlap on the sensor, so pair it with a
+[sensor calibration](#sensor-calibration) profile.
+
 ---
 
 ## What you need
@@ -73,17 +79,33 @@ automatically. There is no address to type, no login and no pairing.
 
 **Frame and focus.** Open **Live View & Scan**. Click anywhere on the image to aim the
 camera's *hardware* focus magnifier at that spot. Click again to return to the full frame.
+The **Focus meter** under the image reads live sharpness against the best value since the
+last click: turn the focus ring past best focus, then back until it reads **at peak**. It
+works on every body with live view.
 In white-light and normal (camera-only) scanning, you can set ISO, shutter and aperture
 live from the toolbar. With a calibrated RGB preset those controls are hidden and locked to
 the preset instead (see **Presets**), so the scan cannot drift. A control the body cannot
 offer is grayed out. Aperture on a lens with no electronic diaphragm is the usual case, and
 that is most enlarging and macro glass.
 
+A thin border marks the edge of the captured frame.
+
 **Calibrate (RGB mode).** Set the ISO and the aperture you will scan with. Press **+**
 beside the preset dropdown, place the small rectangle on the clear film base, name the
 preset and run it. The rebate strip between frames is an ideal target. Calibration meters
 that patch and solves one shared shutter plus a per-channel LED level, so each channel
 lands just under clipping. It records the ISO and the aperture with them.
+
+The dropdown beside the name picks the capture mode. **Triplet** solves each channel under
+its own LED. **Single Capture** solves the three levels together for one exposure with all
+three LEDs lit: each sensor channel also reads the neighboring LEDs, so the run measures
+that overlap and lowers the levels to match. If the overlap leaves no levels that balance
+the channels, the run stops and says so. Calibrate a triplet preset instead.
+
+With **Sensor Profile** on, a Single Capture run also saves a
+[sensor calibration](#sensor-calibration) profile under the preset's name, measured from the
+same exposures. A roll scanned with the preset takes that profile and turns Linear RAW on.
+Turn the toggle off to keep a profile you made yourself.
 
 That highlight matters, because the clear base becomes the *black point* after inversion. A
 clip guard therefore checks the raw Bayer photosites and backs the exposure off if any
@@ -98,13 +120,14 @@ window that stayed open.
 aperture. The scan forces that exposure on the body before every frame, so a bumped dial
 cannot falsify the result. To build a preset by hand instead, pick **Create a manual
 preset…** from the dropdown. The sliders and the exposure steppers unlock. Dial them in,
-then press the save (floppy) button to name and store the preset. White is the white-light
+**Capture mode** marks the manual preset as a triplet or a single capture. Then press the
+save (floppy) button to name and store the preset. White is the white-light
 preset's channel only, because the Scanlight cannot light it together with RGB.
 
 **Scan.** Pick an output folder and a preset, then press **Scan** for each frame. Files
 land in a per-roll subfolder, auto-numbered, and are imported and merged automatically, so
-the inverted positive appears a moment after the shutter. **Retake** re-shoots the current
-frame without advancing the counter. The **Delay between exposures** control adds a pause
+the inverted positive appears a moment after the shutter. A single-capture preset writes
+one file per frame. **Retake** re-shoots the current frame without advancing the counter. The **Delay between exposures** control adds a pause
 between red/green/blue captures so older bodies can finish flushing the previous shot before
 the next one arrives; this avoids the USB/PTP lockups that some cameras trigger when they are
 bombarded with a new capture command too quickly.
@@ -124,7 +147,8 @@ camera's color-filter passbands overlap the source's bands, so the green pixel s
 blue LED and some red, and every channel carries a share of its neighbours. It is a fixed
 property of your sensor and light pair, independent of the film.
 
-To correct it, photograph the bare light three times with no film in the holder: red only,
+A Single Capture preset calibrated with **Sensor Profile** on measures this for you. To
+build a profile by hand, photograph the bare light three times with no film in the holder: red only,
 green only, blue only. Use the same settings you scan with, exposed just below clipping.
 Then open the **Calibration** panel, find *Single-Shot Narrowband Calibration*, press the calibrate
 button, pick the three captures, name the profile and save it. The selected profile un-mixes
@@ -153,6 +177,7 @@ is film-dye crosstalk, which the density-domain **Crosstalk** matrix handles (se
 | The aperture stepper is grayed out | The lens has no electronic diaphragm. | Expected. Set the aperture on the lens itself. |
 | A setting snaps back to its old value | Property writes are asynchronous, so the body needs a moment. | NegPy polls until the value lands and logs a warning if it never does. If it never does, that setting is not writable in the body's current mode. Try **M**. |
 | The Scanlight is not detected | Wrong USB-C port. | The Scanlight has two ports and only one carries data. The other is power only. Use the data port. |
+| The Scanlight is not detected on Linux, and the data port is right | Your user cannot open the serial port; most distributions give it to the `dialout` group. | `sudo usermod -aG dialout $USER`, then log out and back in. |
 
 ---
 
@@ -171,7 +196,9 @@ is film-dye crosstalk, which the density-domain **Crosstalk** matrix handles (se
   point into one property, so a click both magnifies *and* aims. Canon (`eoszoom`) and
   Nikon (`liveviewimagezoomratio`) split them, and their coordinate space is unknown here,
   so a click magnifies where the body already looks. Every other body has no magnifier at
-  all, and the feature disables itself.
+  all, and the feature disables itself. A body that stops streaming while magnified (the
+  Nikon D3300) returns to full frame, and its magnifier stays off for the session. On all of
+  these, focus with the Focus meter.
 - **Tested on macOS.** The Python is portable and libgphoto2 is a Linux-first project, so
   Linux should be at least as good. This is unverified.
 - **Speed.** A three-shot RGB triplet takes about six seconds on an a7C II over USB. Almost

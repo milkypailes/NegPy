@@ -1,8 +1,9 @@
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Iterator, Optional
 
 import numpy as np
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal, pyqtSlot
@@ -32,9 +33,44 @@ from negpy.services.rendering.image_processor import ImageProcessor
 
 logger = get_logger(__name__)
 
-# Native codec buffers for the selected frame and filmstrip must not overlap.
-# The automatic thumbnail path stays bounded inside this gate.
-_DECODE_MEMORY_GATE = threading.Lock()
+
+class _DecodeGate:
+    """One native decode at a time, so codec buffers never overlap. A foreground preview may run
+    beside a prefetch of another file: LibRaw's unpack cannot stop mid-read. Each kind is one thread."""
+
+    def __init__(self) -> None:
+        self._cond = threading.Condition()
+        self._holders: dict[str, str] = {}
+
+    def _may_enter(self, kind: str, path: str) -> bool:
+        if not self._holders:
+            return True
+        if kind == "foreground" and set(self._holders) == {"prefetch"}:
+            return self._holders["prefetch"] != path
+        return False
+
+    @contextmanager
+    def hold(self, kind: str, path: str = "", abandoned: Optional[Callable[[], bool]] = None) -> Iterator[bool]:
+        """Yields whether the gate was taken; a wait gives up and yields False once *abandoned* is true."""
+        acquired = False
+        with self._cond:
+            while not self._may_enter(kind, path):
+                if abandoned is not None and abandoned():
+                    break
+                self._cond.wait(0.1 if abandoned is not None else None)
+            else:
+                self._holders[kind] = path
+                acquired = True
+        try:
+            yield acquired
+        finally:
+            if acquired:
+                with self._cond:
+                    self._holders.pop(kind, None)
+                    self._cond.notify_all()
+
+
+_DECODE_MEMORY_GATE = _DecodeGate()
 
 
 @dataclass(frozen=True)
@@ -65,6 +101,8 @@ class RenderTask:
     interactive: bool = False
     # Only the controller knows whether the filmstrip is already current for this config.
     wants_thumbnail: bool = False
+    # `config` is a view of the edit, not the edit, so the pixels get no render identity.
+    config_override: bool = False
     # Decoder XYZ->camera matrix for this source; only the transparency transfer reads it.
     cam_xyz: Optional[list] = None
     # As-shot WB multipliers, needed only when the buffer was decoded without WB.
@@ -73,6 +111,7 @@ class RenderTask:
     # its halves, which are then joined. `config` is unused then — the halves own the edit.
     diptych: Optional[tuple[WorkspaceConfig, WorkspaceConfig]] = None
     split_x: float = 0.5
+    split_axis: str = "x"
     gutter_thickness: float = 0.0
 
 
@@ -109,6 +148,8 @@ class ThumbnailUpdateTask:
     monitor_icc_bytes: Optional[bytes] = None
     proof: Optional[tuple] = None
     persist: bool = True  # False = in-memory filmstrip only, skip the disk JPEG encode.
+    # The render fingerprint stored with the JPEG; None reads as stale.
+    fingerprint: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -191,12 +232,12 @@ class AssetDiscoveryTask:
     paths: list[str]
     supported_extensions: tuple[str, ...]
     rgb_scan: bool = False  # Group discovered files into R/G/B triplets (one asset per frame).
-    restore_triplets: dict | None = None  # {red_path: [green, blue]} — rebuild known triplets (session restore).
-    half_frame: bool = False  # Expand each file into two half-frame assets (left/right).
+    restore_triplets: dict | None = None  # {red_path: [green, blue, align, hashes?]}
+    half_frame: bool = False  # Split each file into two half-frame assets.
     restore_stitches: dict | None = None  # {primary_path: {paths, transforms, canvas, sizes, hash}} (session restore).
     restore_hdr: dict | None = None  # {reference_path: {paths, ratios, align, hash}} (session restore).
-    half_frame_profile: dict | None = None  # {crop_rect, split_x, gutter_thickness} override
-    half_frame_overrides: dict | None = None  # {base_hash: {crop_rect, split_x, gutter_thickness}} per-file overrides
+    half_frame_profile: dict | None = None  # {crop_rect, split_x, gutter_thickness, split_axis} override
+    half_frame_overrides: dict | None = None  # {base_hash: {crop_rect, split_x, gutter_thickness, split_axis}} per-file overrides
 
 
 @dataclass(frozen=True)
@@ -234,8 +275,8 @@ class PreviewLoadTask:
     lens_corrections: LensCorrections = LensCorrections()
     lens_flatfield: FlatFieldConfig = FlatFieldConfig()
     demosaic: str = DemosaicMode.AUTO  # CFA interpolation for the preview decode
-    half_slice: tuple[int, float, tuple[float, float, float, float] | None, float] | None = (
-        None  # (half, split_x, crop_rect, gutter_thickness)
+    half_slice: tuple[int, float, tuple[float, float, float, float] | None, float, str] | None = (
+        None  # (half, split_x, crop_rect, gutter_thickness, split_axis)
     )
 
 
@@ -286,13 +327,19 @@ class RenderWorker(QObject):
         assert task.diptych is not None
         rendered = []
         for n, config in ((1, task.diptych[0]), (2, task.diptych[1])):
-            buffer = np.ascontiguousarray(slice_half(task.buffer, n, task.split_x, gutter_thickness=task.gutter_thickness))
+            buffer = np.ascontiguousarray(
+                slice_half(task.buffer, n, task.split_x, gutter_thickness=task.gutter_thickness, split_axis=task.split_axis)
+            )
             ir = None
             if task.ir_buffer is not None:
-                ir = np.ascontiguousarray(slice_half(task.ir_buffer, n, task.split_x, gutter_thickness=task.gutter_thickness))
+                ir = np.ascontiguousarray(
+                    slice_half(task.ir_buffer, n, task.split_x, gutter_thickness=task.gutter_thickness, split_axis=task.split_axis)
+                )
             detect = None
             if task.detect_buffer is not None:
-                detect = np.ascontiguousarray(slice_half(task.detect_buffer, n, task.split_x, gutter_thickness=task.gutter_thickness))
+                detect = np.ascontiguousarray(
+                    slice_half(task.detect_buffer, n, task.split_x, gutter_thickness=task.gutter_thickness, split_axis=task.split_axis)
+                )
             out, metrics = self._processor.run_pipeline(
                 buffer,
                 config,
@@ -314,7 +361,9 @@ class RenderWorker(QObject):
         metrics["diptych"] = True
         # Half 1's GPU histogram describes half 1; let `process` bin the joined image instead.
         metrics.pop("histogram_raw", None)
-        return join_halves(left, right, gap_px(left.shape[1], right.shape[1], task.gutter_thickness)), metrics
+        along = 1 if task.split_axis == "x" else 0
+        gap = gap_px(left.shape[along], right.shape[along], task.gutter_thickness)
+        return join_halves(left, right, gap, axis=task.split_axis), metrics
 
     @pyqtSlot(RenderTask)
     def process(self, task: RenderTask) -> None:
@@ -362,10 +411,14 @@ class RenderWorker(QObject):
             metrics["render_long_edge"] = int(max(task.buffer.shape[:2])) if isinstance(task.buffer, np.ndarray) else 0
             # Render identity, so the controller can reject stale/ephemeral bounds writeback.
             metrics["source_hash"] = task.source_hash
+            # The config these pixels ran on, so the thumbnail fingerprints what ran, not a later edit.
+            # A crop-tool render shows the uncropped frame, which no config describes.
+            metrics["render_identity"] = None if task.crop_preview_full or task.config_override else (task.source_hash, task.config)
             metrics["ephemeral"] = task.ephemeral
             metrics["memo_key"] = task.memo_key
             metrics["compare"] = task.compare
             metrics["interactive"] = task.interactive
+            metrics["crop_preview_full"] = task.crop_preview_full
 
             self.finished.emit(result, metrics)
             self.metrics_updated.emit(metrics)
@@ -494,7 +547,7 @@ class ThumbnailWorker(QObject):
         key = asset_thumbnail_key(f_info)
         self.activity.emit(key)
         try:
-            with _DECODE_MEMORY_GATE:
+            with _DECODE_MEMORY_GATE.hold("thumbnail"):
                 thumb = get_thumbnail_worker(
                     f_info["path"],
                     f_info["hash"],
@@ -506,6 +559,7 @@ class ThumbnailWorker(QObject):
                     tuple(f_info["crop_rect"]) if f_info.get("crop_rect") else None,
                     float(f_info.get("gutter_thickness") or 0.0),
                     str(f_info.get("process_mode") or ""),
+                    split_axis=str(f_info.get("split_axis") or "x"),
                     fast_only=not self._slow_phase,
                     should_cancel=self._cancel_requested.is_set,
                 )
@@ -558,6 +612,7 @@ class ThumbnailWorker(QObject):
                 color_space=task.color_space,
                 monitor_icc_bytes=task.monitor_icc_bytes,
                 proof=task.proof,
+                fingerprint=task.fingerprint,
             )
             if thumb:
                 self.rendered_finished.emit({task.file_hash: thumb})
@@ -659,7 +714,7 @@ class AssetDiscoveryWorker(QObject):
     finished = pyqtSignal(list)
     error = pyqtSignal(str)
     rgb_grouped = pyqtSignal(dict)  # RGB-scan grouping outcome; the controller decides how loudly to say it
-    splits_detected = pyqtSignal(dict)  # {path: detected split_x}, for AutoDetectAllSplitsTask
+    splits_detected = pyqtSignal(dict)  # {path: (split, thickness, crop_rect|None, axis)}, for AutoDetectAllSplitsTask
 
     def _map_files(
         self,
@@ -706,7 +761,7 @@ class AssetDiscoveryWorker(QObject):
         """
         import os
 
-        from negpy.infrastructure.loaders.constants import is_ir_sidecar_path
+        from negpy.infrastructure.loaders.constants import is_hidden_path, is_ir_sidecar_path
         from negpy.kernel.image.logic import file_hashes
         from negpy.services.assets.migrations.hash import blank_ambiguous_legacy_hashes
 
@@ -715,10 +770,12 @@ class AssetDiscoveryWorker(QObject):
             try:
                 if os.path.isdir(path):
                     for f in os.listdir(path):
+                        if is_hidden_path(f):
+                            continue
                         if f.lower().endswith(task.supported_extensions):
                             discovered_paths.append(os.path.join(path, f))
                 else:
-                    if path.lower().endswith(task.supported_extensions):
+                    if not is_hidden_path(path) and path.lower().endswith(task.supported_extensions):
                         discovered_paths.append(path)
             except Exception as e:
                 logger.error(f"Discovery error for {path}: {e}")
@@ -770,25 +827,15 @@ class AssetDiscoveryWorker(QObject):
         profile: dict | None = None,
         overrides: dict | None = None,
     ) -> list:
-        """Expand each file into two half-frame assets sharing the path, with
-        per-half hash/name identities. Composite assets (triplet, stitch, HDR) stay
-        whole — an unsupported combination.
+        """Two half-frame assets per file, sharing the path; composites stay whole.
 
-        Per-file resolution, highest priority first:
-          1. ``overrides[base_hash]`` — a {crop_rect, split_x, gutter_thickness} dict
-             saved for this one file from the rectangle editor's per-frame mode, for
-             the odd frame the roll-wide setting still gets wrong.
-          2. ``profile`` (a {crop_rect, split_x, gutter_thickness} dict saved from
-             the editor) — shared across the roll, for every file without its own
-             override.
-          3. No profile yet — every file auto-detects, so a first-time roll starts
-             from a real split rather than a blind center cut.
+        The split comes from ``overrides[base_hash]``, else the roll's ``profile``, else auto-detection.
         """
         import os
 
         from negpy.services.assets.half_frame import (
             base_hash,
-            detect_split_x_for_file,
+            detect_split_axis_for_file,
             half_hash,
             half_name,
             is_composite,
@@ -802,7 +849,7 @@ class AssetDiscoveryWorker(QObject):
         auto_split = profile is None
         if auto_split:
             paths = [a["path"] for a in assets if _splittable(a) and base_hash(a["hash"]) not in overrides]
-            detected = self._map_files(paths, detect_split_x_for_file, lambda p: f"Split {os.path.basename(p)}", _DECODE_WORKERS)
+            detected = self._map_files(paths, detect_split_axis_for_file, lambda p: f"Split {os.path.basename(p)}", _DECODE_WORKERS)
             splits = dict(zip(paths, detected))
         else:
             splits = {}
@@ -815,13 +862,14 @@ class AssetDiscoveryWorker(QObject):
             override = overrides.get(base_hash(a["hash"]))
             if override is not None:
                 split_x = float(override.get("split_x") or 0.5)
+                split_axis = str(override.get("split_axis") or "x")
             elif auto_split:
-                # 0.5 is detect_split_x's own "nothing found" sentinel; auto_split is
-                # only true with no profile, so there is no tuned value to fall back to.
-                detected_x = splits.get(a["path"])
-                split_x = float(detected_x) if detected_x is not None else 0.5
+                # (0.5, "x") is the detector's "nothing found" value; with no profile there is nothing better.
+                found = splits.get(a["path"])
+                split_x, split_axis = (float(found[0]), str(found[1])) if found is not None else (0.5, "x")
             else:
                 split_x = float(profile.get("split_x") or 0.5)
+                split_axis = str(profile.get("split_axis") or "x")
             legacy = a.get("legacy_hash")
             for half in (1, 2):
                 entry = {
@@ -831,6 +879,7 @@ class AssetDiscoveryWorker(QObject):
                     "legacy_hash": half_hash(legacy, half) if legacy else "",
                     "half": half,
                     "split_x": split_x,
+                    "split_axis": split_axis,
                 }
                 source = override if override is not None else profile
                 if source is not None:
@@ -849,14 +898,34 @@ class AssetDiscoveryWorker(QObject):
         """
         import os
 
+        from negpy.kernel.image.logic import calculate_file_hash
+
+        hashes = {a["path"]: a["hash"] for a in assets}
         out = []
         parts: set = set()
         for a in assets:
             gb = triplets.get(a["path"])
-            if gb and gb[0] and gb[1] and os.path.exists(gb[0]) and os.path.exists(gb[1]):
+            stored = list(gb[3]) if gb and len(gb) > 3 else ["", "", ""]
+            if gb:
+                for path, want in zip(gb[:2], stored[1:]):
+                    if want and path and path not in hashes and os.path.exists(path):
+                        hashes[path] = calculate_file_hash(path)
+            # A stated member hash re-attaches only while the file still has it.
+            changed = gb and any(want and path in hashes and hashes[path] != want for path, want in zip((a["path"], gb[0], gb[1]), stored))
+            if gb and not changed and gb[0] and gb[1] and os.path.exists(gb[0]) and os.path.exists(gb[1]):
                 base = os.path.splitext(a["name"])[0]
                 align = bool(gb[2]) if len(gb) > 2 else True
-                out.append({**a, "name": f"{base} (RGB)", "green_path": gb[0], "blue_path": gb[1], "align": align})
+                out.append(
+                    {
+                        **a,
+                        "name": f"{base} (RGB)",
+                        "green_path": gb[0],
+                        "blue_path": gb[1],
+                        "align": align,
+                        "green_hash": hashes.get(gb[0], stored[1]),
+                        "blue_hash": hashes.get(gb[1], stored[2]),
+                    }
+                )
                 parts.update({gb[0], gb[1]})
             else:
                 out.append(a)
@@ -955,8 +1024,7 @@ class AssetDiscoveryWorker(QObject):
 
         from negpy.services.export.frame_merge import is_merged_source
 
-        # A file NegPy merged from an assembled frame is already one frame: it is neither
-        # grouped nor counted loose.
+        # A file NegPy merged from an assembled frame is already one frame.
         done = {a["path"] for a in assets if (a.get("green_path") and a.get("blue_path")) or is_merged_source(a["path"])}
         assembled = [a for a in assets if a["path"] in done]
         assets = [a for a in assets if a["path"] not in done]
@@ -990,7 +1058,16 @@ class AssetDiscoveryWorker(QObject):
                 continue
             red = by_path[t.red]
             base = os.path.splitext(red["name"])[0]
-            result.append({**red, "name": f"{base} (RGB)", "green_path": t.green, "blue_path": t.blue})
+            result.append(
+                {
+                    **red,
+                    "name": f"{base} (RGB)",
+                    "green_path": t.green,
+                    "blue_path": t.blue,
+                    "green_hash": by_path[t.green]["hash"],
+                    "blue_hash": by_path[t.blue]["hash"],
+                }
+            )
             grouped.update({t.red, t.green, t.blue})
 
         result.extend(by_path[p] for p in ordered if p not in grouped)
@@ -1007,6 +1084,39 @@ class AssetDiscoveryWorker(QObject):
             logger.warning("RGB scan: %s", summary)
             self.rgb_grouped.emit(summary)
         return result
+
+
+class PreviewLoadState:
+    """Generations shared by the foreground and prefetch workers: a click on one obsoletes work queued on the other."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._latest_generation = 0
+        self._cancelled_prefetch_generations: set[int] = set()
+        self._foreground_path: str | None = None
+
+    def expect_generation(self, generation: int, file_path: str | None = None) -> None:
+        """Obsoletes older preview work, except a running prefetch of *file_path*: the foreground load waits for it."""
+        with self._lock:
+            self._latest_generation = generation
+            self._foreground_path = file_path
+            self._cancelled_prefetch_generations = {
+                cancelled for cancelled in self._cancelled_prefetch_generations if cancelled >= generation
+            }
+
+    def cancel_prefetch(self, generation: int) -> None:
+        with self._lock:
+            self._cancelled_prefetch_generations.add(generation)
+
+    def is_current(self, generation: int) -> bool:
+        with self._lock:
+            return generation == self._latest_generation
+
+    def prefetch_is_current(self, generation: int, file_path: str) -> bool:
+        with self._lock:
+            if file_path == self._foreground_path:
+                return True
+            return generation == self._latest_generation and generation not in self._cancelled_prefetch_generations
 
 
 class PreviewLoadWorker(QObject):
@@ -1026,39 +1136,16 @@ class PreviewLoadWorker(QObject):
     load_failed = pyqtSignal(str, str)
     prefetch_finished = pyqtSignal(int, str)
 
-    def __init__(self, preview_service) -> None:
+    def __init__(self, preview_service, state: PreviewLoadState | None = None) -> None:
         super().__init__()
         self._preview_service = preview_service
-        self._generation_lock = threading.Lock()
-        self._latest_generation = 0
-        self._cancelled_prefetch_generations: set[int] = set()
-        self._foreground_path: str | None = None
-
-    def expect_generation(self, generation: int, file_path: str | None = None) -> None:
-        """Make older queued and segment-based preview work obsolete. A running prefetch of
-        *file_path* itself keeps going: the foreground load waits for it and hits its cache
-        entry, where cancelling would throw that decode away and start it again."""
-        with self._generation_lock:
-            self._latest_generation = generation
-            self._foreground_path = file_path
-            self._cancelled_prefetch_generations = {
-                cancelled for cancelled in self._cancelled_prefetch_generations if cancelled >= generation
-            }
-
-    def cancel_prefetch(self, generation: int) -> None:
-        """Cancel low-priority work without invalidating the selected frame."""
-        with self._generation_lock:
-            self._cancelled_prefetch_generations.add(generation)
+        self._state = state or PreviewLoadState()
 
     def _is_current(self, task: PreviewLoadTask) -> bool:
-        with self._generation_lock:
-            return task.generation == self._latest_generation
+        return self._state.is_current(task.generation)
 
     def _prefetch_is_current(self, task: PreviewLoadTask) -> bool:
-        with self._generation_lock:
-            if task.file_path == self._foreground_path:
-                return True
-            return task.generation == self._latest_generation and task.generation not in self._cancelled_prefetch_generations
+        return self._state.prefetch_is_current(task.generation, task.file_path)
 
     @pyqtSlot(PreviewLoadTask)
     def process(self, task: PreviewLoadTask) -> None:
@@ -1067,15 +1154,15 @@ class PreviewLoadWorker(QObject):
             return
         if not self._is_current(task):
             return
-        with _DECODE_MEMORY_GATE:
-            if self._is_current(task):
+        with _DECODE_MEMORY_GATE.hold("foreground", task.file_path, abandoned=lambda: not self._is_current(task)) as entered:
+            if entered and self._is_current(task):
                 self._process_locked(task)
 
     def _process_prefetch(self, task: PreviewLoadTask) -> None:
         try:
             if not self._prefetch_is_current(task):
                 return
-            with _DECODE_MEMORY_GATE:
+            with _DECODE_MEMORY_GATE.hold("prefetch", task.file_path):
                 if not self._prefetch_is_current(task):
                     return
                 self._preview_service.prefetch_linear_preview(
@@ -1586,14 +1673,16 @@ class ThumbnailRenderWorker(QObject):
 
     rendered = pyqtSignal(object, object)  # ThumbnailRenderInput, ndarray — the frame rides
     # along so the controller can re-check the asset is still current before persisting.
-    progress = pyqtSignal(int, int, str)
+    frame_started = pyqtSignal(int, int, str)  # index, total, name; emitted before the decode
+    progress = pyqtSignal(int, int, str, float, float)  # done, total, name, decode s, render s
     finished = pyqtSignal(int)  # frames rendered
     cancelled = pyqtSignal()
     error = pyqtSignal(str)
 
-    def __init__(self, preview_service) -> None:
+    def __init__(self, preview_service, live_preview_service=None) -> None:
         super().__init__()
         self._preview_service = preview_service
+        self._live_preview_service = live_preview_service
         self._processor = ImageProcessor(use_gpu=False)
         self._cancel_lock = threading.RLock()
         self._cancelled_generations: set[int] = set()
@@ -1618,6 +1707,42 @@ class ThumbnailRenderWorker(QObject):
     def _cancel_requested(self, generation: int) -> bool:
         with self._cancel_lock:
             return generation in self._cancelled_generations
+
+    def _peek_live_preview(self, frame: ThumbnailRenderInput, workspace_color_space: str) -> Optional[tuple[np.ndarray, dict]]:
+        """Copy of a plain frame's decode from the navigation cache, or None; never writes or reorders it.
+
+        Keyed on the whole scan, as `_decode_asset_preview_with_meta` decodes it.
+        """
+        from negpy.services.assets.half_frame import base_hash, slice_for_asset
+
+        config = frame.config
+        if self._live_preview_service is None or stitch_active(config.stitch) or hdr_active(config.hdr) or is_rgb_triplet(config.rgbscan):
+            return None
+        hit = self._live_preview_service.peek_linear_preview(
+            frame.file_info["path"],
+            workspace_color_space,
+            use_camera_wb=not effective_linear_raw(config.process),
+            file_hash=base_hash(frame.file_info.get("hash")),
+            demosaic=config.process.demosaic_preview,
+            positive_source=config.process.positive_source,
+            highlight_mode=effective_highlight_reconstruction(config.process),
+            bake_camera_wb=highlight_reconstruction_bakes_wb(config.process),
+            lens_corrections=metadata_lens_corrections(config),
+            lens_flatfield=config.flatfield,
+        )
+        logger.debug("thumbnail refresh live cache %s: %s", "miss" if hit is None else "hit", frame.file_info["path"])
+        if hit is None:
+            return None
+        raw, _dims, meta = hit
+        # The navigation cache still serves these arrays, so the pipeline gets its own.
+        meta = {k: np.copy(v) if isinstance(v, np.ndarray) else v for k, v in meta.items()}
+        return slice_for_asset(np.copy(raw), frame.file_info), meta
+
+    def _decode(self, frame: ThumbnailRenderInput, workspace_color_space: str) -> tuple[np.ndarray, dict]:
+        hit = self._peek_live_preview(frame, workspace_color_space)
+        if hit is not None:
+            return hit
+        return _decode_asset_preview_with_meta(self._preview_service, frame.file_info, frame.config, workspace_color_space)
 
     def _emit_finished_unless_cancelled(self, generation: int, rendered_count: int) -> None:
         """Atomically choose the terminal signal for a generation, so a `cancel()` racing
@@ -1652,14 +1777,19 @@ class ThumbnailRenderWorker(QObject):
                 if self._cancel_requested(generation):
                     break
                 name = str(frame.file_info.get("name") or frame.file_info.get("path") or done)
+                self.frame_started.emit(done, total, name)
+                decode_s = render_s = 0.0
+                decoding = True
+                started = time.perf_counter()
                 try:
-                    buffer, meta = _decode_asset_preview_with_meta(
-                        self._preview_service, frame.file_info, frame.config, task.workspace_color_space
-                    )
+                    buffer, meta = self._decode(frame, task.workspace_color_space)
+                    decode_s = time.perf_counter() - started
+                    decoding = False
                     cam_xyz = meta.get("cam_xyz")
                     if frame.icc_input_active:
                         cam_xyz = wb_only_cam_xyz(cam_xyz)
                     if not self._cancel_requested(generation):
+                        started = time.perf_counter()
                         result, _metrics = self._processor.run_pipeline(
                             buffer,
                             frame.config,
@@ -1674,14 +1804,20 @@ class ThumbnailRenderWorker(QObject):
                             cam_xyz=cam_xyz,
                             camera_wb=meta.get("camera_wb"),
                         )
+                        render_s = time.perf_counter() - started
                         if isinstance(result, np.ndarray) and not self._cancel_requested(generation):
                             self.rendered.emit(frame, np.ascontiguousarray(result[:, :, :3]))
                             rendered_count += 1
                 except Exception:
                     if self._cancel_requested(generation):
                         break
+                    # A failed read costs time too; the time-left estimate counts it.
+                    if decoding:
+                        decode_s = time.perf_counter() - started
+                    else:
+                        render_s = time.perf_counter() - started
                     logger.exception("Background thumbnail refresh skipped failed frame %s", name)
-                self.progress.emit(done, total, name)
+                self.progress.emit(done, total, name, decode_s, render_s)
 
             self._processor.cleanup(release_source_cache=True, collect=False)
             self._emit_finished_unless_cancelled(generation, rendered_count)

@@ -9,8 +9,11 @@ import numpy as np
 from PyQt6.QtCore import QAbstractListModel, QModelIndex, QObject, Qt, pyqtSignal
 
 from negpy.desktop.settings_catalog import GLOBAL_TIER_SECTIONS, apply_selected_fields
+from negpy.features.retouch.models import HEAL_SIZE_MAX, HEAL_SIZE_MIN
+from negpy.services.capture.presets import PresetStore
 from negpy.desktop.sticky import (
     ALWAYS_STICKY_PROCESS,
+    BRUSH_SIZE_KEY,
     DESCRIPTION_FIELDS_KEY,
     EXPORT_REMAINDER,
     STICKY_CONFIG_KEY,
@@ -35,12 +38,13 @@ from negpy.infrastructure.storage.repository import StorageRepository
 from negpy.kernel.system.config import APP_CONFIG, DEFAULT_WORKSPACE_CONFIG
 from negpy.kernel.system.text import count_of
 from negpy.services.assets.composites import remember_composites
+from negpy.services.assets.triplets import remember_triplets
 from negpy.services.assets.flatfield import FlatFieldProfiles
 from negpy.services.assets import rolls
 from negpy.services.assets import semantic_model
 from negpy.services.assets.rolls import unforked_hash
 from negpy.services.assets.search import facts_for, match, parse_query
-from negpy.services.assets.sidecar import load_or_promote
+from negpy.services.assets.sidecar import load_or_promote, read_sidecar
 from negpy.services.assets.thumbnails import asset_thumbnail_key
 
 
@@ -51,6 +55,7 @@ class ToolMode(Enum):
     DUST_PICK = auto()
     SCRATCH_PICK = auto()
     SCRATCH_LINE = auto()
+    CLONE = auto()
     LOCAL_DRAW = auto()
     LOCAL_OVAL = auto()
     LOCAL_GRADIENT = auto()
@@ -58,6 +63,10 @@ class ToolMode(Enum):
     STRAIGHTEN = auto()
     KEYSTONE_LINES = auto()
     ZONE_PLACE = auto()
+
+
+# These tools' renders carry crop_preview_full, which skips the crop, the border and the filed carrier.
+UNCROPPED_PREVIEW_TOOLS = frozenset({ToolMode.CROP_MANUAL, ToolMode.ANALYSIS_DRAW, ToolMode.KEYSTONE_LINES})
 
 
 @dataclass
@@ -69,13 +78,18 @@ class AppState:
     current_file_path: Optional[str] = None
     current_file_hash: Optional[str] = None
     source_cs: str = ""
-    # The shipped defaults, not a bare WorkspaceConfig(): the sidebars build every slider
-    # against this config, and a slider's double-click restores the value it was built with,
-    # which has to be the value a card's Reset lands on.
+    # Not a bare WorkspaceConfig(): a slider's double-click restores the value it was built with,
+    # which must be the value a card's Reset lands on.
     config: WorkspaceConfig = field(default_factory=lambda: DEFAULT_WORKSPACE_CONFIG)
     workspace_color_space: str = WORKING_COLOR_SPACE
     is_processing: bool = False
     active_tool: ToolMode = ToolMode.NONE
+    # Clone tool source on the open frame, raw-normalized: the point Alt-click set, and once a
+    # stroke starts, the destination-to-source offset every later stroke keeps (aligned).
+    clone_source: Optional[Tuple[float, float]] = None
+    clone_offset: Optional[Tuple[float, float]] = None
+    # The next Clone click picks the source instead of painting.
+    clone_picking: bool = False
     # Color page region (0 Global, 1 Shadows, 2 Highlights): scopes the WB
     # picker so a pick writes the selected region's CMY fields.
     wb_pick_region: int = 0
@@ -101,6 +115,8 @@ class AppState:
     active_adjustment_idx: int = 0
     last_metrics: Dict[str, Any] = field(default_factory=dict)
     metrics_lock: threading.Lock = field(default_factory=threading.Lock, init=False, compare=False, repr=False)
+    # file_hash -> the meters its last plain render published (desktop.auto_sliders).
+    auto_meters: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     preview_raw: Optional[Any] = None
     # Decoder XYZ->camera matrix for preview_raw. Only the transparency transfer reads it.
     # None for sources that carry no camera matrix (scanner TIFF, JPEG).
@@ -214,7 +230,7 @@ class AppState:
     # session-only, never persisted.
     printing_notes: bool = False
 
-    # Dodge/burn mask outlines draw only while their tab shows. Display-only, session-only.
+    # Display-only, session-only.
     local_masks_shown: bool = True
 
     # Zone-placement pins (ZonePin: probed spot + target zone). Session-only and dropped by
@@ -291,6 +307,7 @@ class AppState:
     linear_apply_wb: bool = False
     linear_apply_flatfield: bool = False
     linear_apply_sensor: bool = False
+    linear_apply_lens: bool = False
     linear_apply_ice: bool = False
     linear_gamma_key: str = "linear"
     linear_format: str = "tiff"
@@ -881,7 +898,7 @@ class DesktopSessionManager(QObject):
         saved_linear_output = self.repo.get_global_setting("linear_output")
         if saved_linear_output is not None:
             self.state.linear_output = bool(saved_linear_output)
-        for key in ("linear_apply_wb", "linear_apply_flatfield", "linear_apply_sensor", "linear_apply_ice"):
+        for key in ("linear_apply_wb", "linear_apply_flatfield", "linear_apply_sensor", "linear_apply_lens", "linear_apply_ice"):
             val = self.repo.get_global_setting(key)
             if val is not None:
                 setattr(self.state, key, bool(val))
@@ -898,6 +915,7 @@ class DesktopSessionManager(QObject):
             self.state.linear_jxl_effort = int(saved_jxl_effort)
 
         self.state.export_presets = self.repo.load_export_presets()
+        self.state.config = self._empty_session_config()
 
     def _invalidate_search_facts(self) -> None:
         self._search_facts = None
@@ -913,10 +931,7 @@ class DesktopSessionManager(QObject):
     def _carry_thumbnail(self, old: Dict[str, Any], new: Dict[str, Any]) -> None:
         """Give a replacement frame the thumbnail of the frame it was made from.
 
-        A merged file renders the same picture as the assembly it replaces, so the icon is
-        already right. The background pass that would otherwise fill it reads no geometry
-        (`get_thumbnail_worker`), so a rotated frame would come back unrotated beside
-        neighbours that kept a real render.
+        The background pass reads no geometry (`get_thumbnail_worker`), so it would render a rotated frame unrotated.
         """
         old_key, new_key = asset_thumbnail_key(old), asset_thumbnail_key(new)
         icon = self.state.thumbnails.get(old_key)
@@ -1044,6 +1059,7 @@ class DesktopSessionManager(QObject):
         self.repo.save_global_setting("linear_apply_wb", self.state.linear_apply_wb)
         self.repo.save_global_setting("linear_apply_flatfield", self.state.linear_apply_flatfield)
         self.repo.save_global_setting("linear_apply_sensor", self.state.linear_apply_sensor)
+        self.repo.save_global_setting("linear_apply_lens", self.state.linear_apply_lens)
         self.repo.save_global_setting("linear_apply_ice", self.state.linear_apply_ice)
         self.repo.save_global_setting("linear_gamma_key", self.state.linear_gamma_key)
         self.repo.save_global_setting("linear_format", self.state.linear_format)
@@ -1068,6 +1084,7 @@ class DesktopSessionManager(QObject):
         """
         from negpy.features.metadata.models import resolve_description_fields
 
+        config = self._with_brush_size(config)
         sticky_export = self.repo.get_global_setting("last_export_config")
         if sticky_export:
             remainder = {k: v for k, v in sticky_export.items() if k in EXPORT_REMAINDER}
@@ -1121,6 +1138,19 @@ class DesktopSessionManager(QObject):
 
         return self._with_scan_setup(config)
 
+    def _empty_session_config(self) -> WorkspaceConfig:
+        """The config with no frame loaded: what the next fresh frame gets. Any persisted
+        edit snapshots it as the sticky config, so it must hold the sticky values."""
+        return self._apply_sticky_settings(DEFAULT_WORKSPACE_CONFIG, only_global=False)
+
+    def _with_brush_size(self, config: WorkspaceConfig) -> WorkspaceConfig:
+        """The user's brush size (BRUSH_SIZE_KEY) over the frame's own."""
+        size = self.repo.get_global_setting(BRUSH_SIZE_KEY)
+        if isinstance(size, bool) or not isinstance(size, (int, float)):
+            return config
+        size = int(round(min(HEAL_SIZE_MAX, max(HEAL_SIZE_MIN, size))))
+        return replace(config, retouch=replace(config.retouch, manual_dust_size=size))
+
     def _with_scan_setup(self, config: WorkspaceConfig) -> WorkspaceConfig:
         """Overlay the scan-setup preferences (ALWAYS_STICKY_PROCESS): they describe the
         rig, so a fresh file and a reset both take them."""
@@ -1136,18 +1166,30 @@ class DesktopSessionManager(QObject):
         """Snapshot the settings a fresh file can inherit, in a single transaction.
 
         `last_export_config` is separate from the snapshot because EXPORT_REMAINDER — the
-        output folder, ICC paths, contact-sheet layout — has no catalog row to travel on.
+        export and contact-sheet output folders, ICC paths — has no catalog row to travel on.
         """
         from dataclasses import asdict
 
+        snapshot = sticky_snapshot(config)
+        if PresetStore(self.repo).owns_sensor_profile(config.process.sensor_profile):
+            # A Scanlight preset's profile reaches a roll through that preset's scans. Carried
+            # from here it would land on rolls scanned another way.
+            stored = self.repo.get_global_setting(STICKY_CONFIG_KEY)
+            stored = stored if isinstance(stored, dict) else {}
+            for key in ("sensor_profile", "sensor_matrix"):
+                if key in stored:
+                    snapshot[key] = stored[key]
+                else:
+                    snapshot.pop(key, None)
         self.repo.save_global_settings(
             {
-                STICKY_CONFIG_KEY: sticky_snapshot(config),
+                STICKY_CONFIG_KEY: snapshot,
                 "last_export_config": asdict(config.export),
                 "last_linear_raw": config.process.linear_raw,
                 "last_narrowband_scan": config.process.narrowband_scan,
                 "last_demosaic_preview": str(config.process.demosaic_preview),
                 "last_demosaic_export": str(config.process.demosaic_export),
+                BRUSH_SIZE_KEY: int(config.retouch.manual_dust_size),
             }
         )
 
@@ -1207,6 +1249,22 @@ class DesktopSessionManager(QObject):
         config = rolls.resolve_roll_config(self.repo, roll_id, file_hash, config)
         return rolls.resolve_roll_baseline(self.repo, roll_id, file_hash, config)
 
+    def load_edit_from_sidecar(self, path: str) -> bool:
+        """Replace the active frame's edit with the sidecar at *path*, as an undoable
+        history step. Like a work print, its own values beat the roll's, so diverged cards
+        lock. False when the file is not a readable sidecar."""
+        idx = self.state.selected_file_idx
+        if not 0 <= idx < len(self.state.uploaded_files):
+            return False
+        saved = read_sidecar(path)
+        if saved is None:
+            return False
+        asset = self.state.uploaded_files[idx]
+        config = self._apply_sticky_settings(saved, only_global=True)
+        self.update_config(resolve_asset_hdr(resolve_asset_stitch(resolve_asset_rgbscan(config, asset), asset), asset), persist=True)
+        self._relock_diverged_cards()
+        return True
+
     def _hydrate_asset_config(self, asset: dict) -> tuple[WorkspaceConfig, bool]:
         """Build an asset's effective config and report whether it had saved edits."""
         saved_config = load_or_promote(
@@ -1225,9 +1283,8 @@ class DesktopSessionManager(QObject):
         # Sticky settings include the global process mode, which a composite must not take over
         # the mode of the frames it was built from. _asset_defaults applies after.
         #
-        # DEFAULT_WORKSPACE_CONFIG, not a bare WorkspaceConfig(): the autocrop fields are
-        # the shipped ones only here, and the print/transfer curves are an identity at this
-        # exact config (transfer_grade_ref, test_transparency_transfer.py).
+        # Not a bare WorkspaceConfig(): only this config holds the shipped autocrop fields, and the
+        # print/transfer curves are an identity at it (transfer_grade_ref, test_transparency_transfer.py).
         config = self._overlay_roll_defaults(self._apply_sticky_settings(DEFAULT_WORKSPACE_CONFIG, only_global=False), asset)
         return self._asset_defaults(config, asset), True
 
@@ -1269,9 +1326,12 @@ class DesktopSessionManager(QObject):
         """
         if 0 <= index < len(self.state.uploaded_files):
             # Save current before switching, but only if user actually made explicit edits
-            if self.state.current_file_hash and self._config_dirty:
-                self.repo.save_file_settings(self.state.current_file_hash, self.state.config, file_path=self.state.current_file_path or "")
-                self.settings_saved.emit()
+            if self.state.current_file_hash:
+                if self._config_dirty:
+                    self.repo.save_file_settings(
+                        self.state.current_file_hash, self.state.config, file_path=self.state.current_file_path or ""
+                    )
+                    self.settings_saved.emit()
                 self.active_file_changing.emit()
             self._config_dirty = False
 
@@ -1343,9 +1403,8 @@ class DesktopSessionManager(QObject):
         self.files_changed.emit()
 
     def _scope_indices(self, scope: str) -> List[int]:
-        """Frames a scoped apply targets, for "roll" (every visible frame) or "selection"
-        (the file-list selection). A filename filter is a non-destructive view, so a
-        hidden frame is never a target in either scope."""
+        """Frames a scoped apply targets: "roll" (every visible frame) or "selection".
+        A hidden frame is never a target: a filename filter is a non-destructive view."""
         ordered = self.asset_model.visible_actual_indices_ordered()
         if scope == "roll":
             return ordered
@@ -1761,7 +1820,7 @@ class DesktopSessionManager(QObject):
         """Unlock *asset*'s roll cards and return what a reset writes: what a fresh frame
         in its roll gets, less the sticky look. DEFAULT_WORKSPACE_CONFIG, the scan-setup
         preferences, the roll's defaults, then what the asset itself is."""
-        config = self._with_scan_setup(DEFAULT_WORKSPACE_CONFIG)
+        config = self._with_brush_size(self._with_scan_setup(DEFAULT_WORKSPACE_CONFIG))
         if asset.get("hash"):
             roll_id = self.state.active_roll_id or self._roll_id_for_orphan_asset(asset)
             if roll_id is not None:
@@ -1808,11 +1867,8 @@ class DesktopSessionManager(QObject):
     def reset_section(self, section: str) -> None:
         """Reset a single feature section to its default config.
 
-        Exposure/process/geometry reset to DEFAULT_WORKSPACE_CONFIG's own section rather
-        than the bare dataclass default: the autocrop fields are the shipped ones only there,
-        not on GeometryConfig()'s own field defaults. Cast Removal's default is further
-        mode-dependent (cast_removal_for_mode) on top of that -- resetting Process can change
-        process_mode, so exposure is re-synced to the new mode too.
+        Exposure/process/geometry reset to DEFAULT_WORKSPACE_CONFIG's section, which alone holds the shipped autocrop fields.
+        Resetting Process can change process_mode, so exposure re-syncs to the mode's Cast Removal default.
         """
         from negpy.features.finish.models import FinishConfig
         from negpy.features.lab.models import LabConfig
@@ -1926,6 +1982,7 @@ class DesktopSessionManager(QObject):
         # Stitch and HDR membership is not part of the manifest: a composite outlives the
         # file list it was made in, so it is upserted into its own store instead.
         remember_composites(self.repo, self.state.uploaded_files)
+        remember_triplets(self.repo, self.state.uploaded_files)
 
     def add_files(self, file_paths: List[str], validated_info: Optional[List[Dict]] = None) -> None:
         """
@@ -2057,8 +2114,6 @@ class DesktopSessionManager(QObject):
             m = marks.get(unforked_hash(asset["hash"]))
             self.state.uploaded_files.insert(i + 1, {**asset, "keeper": m == "keeper", "excluded": m == "excluded"})
 
-        # Every insertion pushes the frames after it along, so a selection recorded as an
-        # index has to move with them or it names a different frame.
         def shifted(idx: int) -> int:
             return idx + sum(1 for i in valid if i < idx)
 
@@ -2084,10 +2139,13 @@ class DesktopSessionManager(QObject):
             "hash": calculate_file_hash(red_path),
             "green_path": green_path,
             "blue_path": blue_path,
+            "green_hash": calculate_file_hash(green_path),
+            "blue_hash": calculate_file_hash(blue_path),
             "align": align,
         }
         self.asset_model.refresh()
         self.files_changed.emit()
+        self._persist_session()
         self.select_file(index)
 
     def _reset_active_image_state(self) -> None:
@@ -2103,10 +2161,11 @@ class DesktopSessionManager(QObject):
         self.state.preview_detect = None
         self.state.preview_embedded = None
         self.state.has_ir = False
-        self.state.config = DEFAULT_WORKSPACE_CONFIG
+        self.state.config = self._empty_session_config()
         self._config_dirty = False
         with self.state.metrics_lock:
             self.state.last_metrics.clear()
+        self.state.auto_meters.clear()
         self.session_emptied.emit()
 
     def clear_files(self) -> None:

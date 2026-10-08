@@ -8,14 +8,23 @@ emit signals; `ScanlightSidebar` wires them and mirrors scanning state + status.
 """
 
 import time
+from typing import Optional
 
 import qtawesome as qta
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QCursor, QKeySequence, QShortcut
+from PyQt6.QtGui import QCursor, QKeySequence
 from PyQt6.QtWidgets import QDialog, QHBoxLayout, QLabel, QProgressBar, QToolButton, QVBoxLayout, QWidget
 
+from negpy.desktop.view.shortcut_registry import key_for, tooltip_with_shortcut
 from negpy.desktop.view.sidebar.roi_image import RoiImageLabel
-from negpy.desktop.view.styles.templates import hint_label, labeled_action, pin_dialog_default, SCAN_BUTTON_HEIGHT
+from negpy.desktop.view.styles.templates import (
+    SCAN_BUTTON_HEIGHT,
+    hint_label,
+    labeled_action,
+    pin_dialog_default,
+    set_hint_kind,
+    wrap_tooltip,
+)
 from negpy.desktop.view.styles.theme import THEME
 from negpy.desktop.view.widgets.dialog_geometry import remember_dialog_geometry
 from negpy.desktop.view.widgets.floating_panel import float_over_app
@@ -26,6 +35,7 @@ from negpy.desktop.view.widgets.floating_panel import float_over_app
 _CHANNEL_COLORS = {"R": THEME.channel_red_text, "G": THEME.channel_green_text, "B": THEME.channel_blue_text}
 _DONE_COLOR = THEME.status_success
 _FLASH_MS = 1500
+_FOCUS_AT_PEAK = 0.99
 
 
 class SettingStepper(QWidget):
@@ -141,7 +151,7 @@ class LiveViewWindow(QDialog):
 
         # ── capture toolbar (mirrors the panel so you needn't switch tabs) ──
         bar = QHBoxLayout()
-        self.scan_btn = labeled_action("fa5s.camera-retro", " Scan", "Capture this frame")
+        self.scan_btn = labeled_action("fa5s.camera-retro", " Scan", "Capture this frame, or stop the capture")
         self.scan_btn.setFixedHeight(SCAN_BUTTON_HEIGHT)
         self.retake_btn = labeled_action("fa5s.redo", " Retake", "Re-capture the current frame without advancing the counter")
         bar.addWidget(self.scan_btn, 2)
@@ -154,6 +164,17 @@ class LiveViewWindow(QDialog):
         _loupe = qta.icon("fa5s.search-plus", color=THEME.text_primary).pixmap(22, 22)
         self.image.setCursor(QCursor(_loupe, 9, 9))  # hotspot ≈ the lens centre
         layout.addWidget(self.image, 1)
+
+        self.focus_label = hint_label("")
+        self.focus_label.setToolTip(
+            wrap_tooltip(
+                "Sharpness as a share of the best seen. Turn the focus ring past the peak and back to it; "
+                "click the image to reset the peak."
+            )
+        )
+        self._focus_kind = "muted"
+        layout.addWidget(self.focus_label)
+        self.set_focus(None)
 
         # Shown in the image's place on bodies that advertise no live view (issue #621). The
         # window still scans: only the preview pane is replaced, so the toolbar, the settings row
@@ -216,13 +237,31 @@ class LiveViewWindow(QDialog):
         # once made Enter keep retaking until Scan was clicked again to reclaim it (issue #997).
         pin_dialog_default(self.scan_btn, self.retake_btn)
 
-        # Keyboard shortcuts while the pop-up is focused. There are no text fields here, so
-        # letter keys are safe. The buttons respect their gated state.
-        for key, btn in (("S", self.scan_btn), ("R", self.retake_btn)):
-            QShortcut(QKeySequence(key), self, btn.click)
-        self.scan_btn.setToolTip("Scan / Stop  (shortcut: S)")
-        self.retake_btn.setToolTip("Re-capture the current frame without advancing the counter  (shortcut: R)")
+        # Plain letter keys are safe: the pop-up has no text fields.
+        self._key_buttons = {"live_view_scan": self.scan_btn, "live_view_retake": self.retake_btn}
         remember_dialog_geometry(self, repo, "live_view")
+
+    def apply_shortcut_tooltips(self) -> None:
+        for action_id, btn in self._key_buttons.items():
+            btn.setToolTip(wrap_tooltip(tooltip_with_shortcut(btn.plain_tooltip, action_id)))
+
+    def _key_button(self, ev):
+        modifiers = ev.modifiers() & ~Qt.KeyboardModifier.KeypadModifier
+        # "?" arrives as Key_Question with Shift held: drop Shift only when the exact chord has no match.
+        for mods in (modifiers, modifiers & ~Qt.KeyboardModifier.ShiftModifier):
+            pressed = QKeySequence(ev.key() | mods.value)
+            for action_id, btn in self._key_buttons.items():
+                key = key_for(action_id)
+                if key and QKeySequence(key) == pressed:
+                    return btn
+        return None
+
+    def keyPressEvent(self, ev) -> None:
+        btn = self._key_button(ev)
+        if btn is None:
+            super().keyPressEvent(ev)
+        elif not ev.isAutoRepeat():
+            btn.click()
 
     def set_preview_available(self, available: bool, reason: str = "") -> None:
         """Swap the preview pane for an explanation on bodies that cannot stream.
@@ -231,10 +270,24 @@ class LiveViewWindow(QDialog):
         strip the only Scan button in the app and lock these cameras out (issue #621).
         """
         self.image.setVisible(available)
+        self.focus_label.setVisible(available)
         self.no_preview.setVisible(not available)
         if not available:
             self.no_preview.setText(f"{reason}\n\nFraming and focus have to be set on the camera itself. Scanning works as usual.")
         self.setWindowTitle("Scanlight — Live View" if available else "Scanlight — Scan (no live view)")
+
+    def set_focus(self, fraction: Optional[float]) -> None:
+        """Show the focus meter reading: 0..1 of the peak, or None while there is none."""
+        if fraction is None:
+            text, kind = "Focus meter: no reading", "muted"
+        else:
+            at_peak = fraction >= _FOCUS_AT_PEAK
+            text = "Focus meter: at peak" if at_peak else f"Focus meter: {round(fraction * 100)}% of peak"
+            kind = "success" if at_peak else "muted"
+        self.focus_label.setText(text)
+        if kind != self._focus_kind:
+            self._focus_kind = kind
+            set_hint_kind(self.focus_label, kind)
 
     def set_progress(self, frac: float) -> None:
         self._flash_token += 1
@@ -282,6 +335,7 @@ class LiveViewWindow(QDialog):
     def set_status(self, text: str) -> None:
         self.status.setText(text)
 
-    def closeEvent(self, ev) -> None:
+    def done(self, result: int) -> None:
+        # Esc reaches here without a closeEvent, so the session cleanup hangs off done().
         self.closed.emit()
-        super().closeEvent(ev)
+        super().done(result)

@@ -252,6 +252,7 @@ def _teardown_controller(ctrl):
         ctrl.norm_thread,
         ctrl.discovery_thread,
         ctrl.preview_load_thread,
+        ctrl.prefetch_load_thread,
         ctrl.scan_thread,
     ]:
         if thread is not None and thread.isRunning():

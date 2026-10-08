@@ -108,16 +108,21 @@ class FakeController:
             return bool(by_roll.get(roll_id, False))
         return bool(self.session.repo.get_global_setting("half_frame_mode", False))
 
+    def rgb_scan_mode_for_roll(self, roll_id):
+        by_roll = self.session.repo.get_global_setting("rgbscan_mode_by_roll", default=None) or {}
+        if roll_id and roll_id in by_roll:
+            return bool(by_roll[roll_id])
+        return bool(self.session.repo.get_global_setting("rgbscan_mode", False))
+
     def __getattr__(self, name):
         return getattr(self._mock, name)
 
 
 def dialog_classes() -> list[tuple[Path, ast.ClassDef]]:
-    """Every QDialog subclass under negpy/desktop/view with its file, the mixin-based ones included."""
     view = Path(__file__).resolve().parents[1] / "negpy" / "desktop" / "view"
     found = []
     for path in sorted(view.rglob("*.py")):
-        for node in ast.walk(ast.parse(path.read_text())):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
             if isinstance(node, ast.ClassDef) and any(
                 (base.id if isinstance(base, ast.Name) else getattr(base, "attr", "")) == "QDialog" for base in node.bases
             ):

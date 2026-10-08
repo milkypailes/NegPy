@@ -1,9 +1,9 @@
 import os
 import sys
 
-from PyQt6.QtCore import Qt, qInstallMessageHandler
+from PyQt6.QtCore import QEvent, QObject, Qt, qInstallMessageHandler
 from PyQt6.QtGui import QIcon
-from PyQt6.QtWidgets import QApplication, QProxyStyle, QStyle
+from PyQt6.QtWidgets import QAbstractSpinBox, QApplication, QComboBox, QProxyStyle, QStyle
 
 from negpy.desktop.controller import AppController
 from negpy.desktop.session import DesktopSessionManager
@@ -55,6 +55,16 @@ def _filter_qt_messages(mode, context, message: str) -> None:
     if message.startswith(_PAINTER_NOISE):
         return
     sys.stderr.write(message + "\n")
+
+
+class WheelScrollsPanel(QObject):
+    """Combo and spin boxes never take the wheel; the ignored event goes on to the panel, which scrolls."""
+
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802
+        if event.type() == QEvent.Type.Wheel and isinstance(obj, (QComboBox, QAbstractSpinBox)):
+            event.ignore()
+            return True
+        return False
 
 
 class _AppStyle(QProxyStyle):
@@ -158,7 +168,6 @@ def _bootstrap_environment() -> None:
         APP_CONFIG.crosstalk_dir,
         APP_CONFIG.sensor_dir,
         APP_CONFIG.gear_dir,
-        APP_CONFIG.contact_sheet_templates_dir,
         APP_CONFIG.default_export_dir,
     ]
     for d in dirs:
@@ -275,6 +284,7 @@ def main() -> None:
         app = QApplication(sys.argv)
         app.setApplicationName("NegPy")
         app.setStyle(_AppStyle("Fusion"))
+        app.installEventFilter(WheelScrollsPanel(app))
 
         icon_path = get_resource_path("media/icons/icon.png")
         if os.path.exists(icon_path):

@@ -1,5 +1,3 @@
-"""The simulated camera, Scanlight and scanners that `make run-sim` starts the app with."""
-
 import importlib
 import os
 import threading
@@ -8,15 +6,19 @@ import time
 import numpy as np
 import pytest
 
+from negpy.features.rgbscan.logic import classify_channel, group_triplets, probe_frame
 from negpy.infrastructure.capture import gphoto
+from negpy.infrastructure.capture.base import CaptureSettings
 from negpy.infrastructure.capture.gphoto import GphotoCamera
 from negpy.infrastructure.capture.raw_demosaic import linear_demosaic
 from negpy.infrastructure.capture.scanlight import Scanlight
 from negpy.infrastructure.scanners import registry
 from negpy.infrastructure.scanners.params import ScanParams
+from negpy.infrastructure.simulated import scanlight
 from negpy.infrastructure.simulated.gphoto import MODEL, SimGphoto
 from negpy.infrastructure.simulated.scanner import SimulatedBackend
 from negpy.services.capture.calibration import CalibrationService, Roi, meter_base
+from negpy.services.capture.service import CaptureService
 
 # Inside the clear-base band above the picture.
 _REBATE = Roi(0.3, 0.07, 0.4, 0.04)
@@ -74,6 +76,43 @@ def test_still_is_a_raw_exposed_by_the_lit_channel(camera, tmp_path, sim_env):
     assert r_bright / r_dim == pytest.approx(2.0, rel=0.05)
 
 
+def test_each_frame_is_a_new_picture_that_triplet_grouping_tells_apart(tmp_path, sim_env):
+    sim = SimGphoto()
+    sim.props["iso"].value, sim.props["shutterspeed"].value = "800", "1/2"
+    cam = GphotoCamera(gp_module=sim, jpeg_path=str(tmp_path / "live.jpg"), settings_path=str(tmp_path / "live.json"))
+    cam.open()
+    light = Scanlight()
+    paths = []
+    try:
+        light.set_color(b=80)
+        cam.capture(str(tmp_path / "calibration.raw"))
+        service = CaptureService(light, cam, sleep=lambda _s: None)
+        for frame in (1, 2, 3):
+            settings = CaptureSettings(roll_name="t", frame_number=frame, output_folder=str(tmp_path), levels=(231, 98, 82))
+            paths += service.capture_triplet(settings).paths
+    finally:
+        light.close()
+        cam.close()
+
+    probes = [probe_frame(p) for p in paths]
+    items = [(p, classify_channel(pr.means)) for p, pr in zip(paths, probes)]
+    triplets = group_triplets(items, {p: pr.signature for p, pr in zip(paths, probes)})
+    assert [(t.red, t.ok) for t in triplets] == [(paths[0], True), (paths[3], True), (paths[6], True)]
+
+
+def test_white_light_stills_advance_the_film_each_shot():
+    sim = SimGphoto()
+    scanlight._color[:] = [0, 0, 0, 255]
+    try:
+        frames = []
+        for _ in range(3):
+            sim.still_dng()
+            frames.append(sim._frame)
+    finally:
+        scanlight._color[:] = [0, 0, 0, 0]
+    assert frames == [1, 2, 3]
+
+
 def test_calibration_reaches_target_on_the_simulated_rig(camera, tmp_path, sim_env):
     light = Scanlight()
     try:
@@ -82,6 +121,23 @@ def test_calibration_reaches_target_on_the_simulated_rig(camera, tmp_path, sim_e
     finally:
         light.close()
     assert {c.channel for c in result.channels.values()} == {"R", "G", "B"}
+
+
+def test_single_capture_calibration_reaches_target_on_the_simulated_rig(camera, tmp_path, sim_env):
+    light = Scanlight()
+    try:
+        service = CalibrationService(light, camera, lambda p: linear_demosaic(p, half_size=True), settle_s=0.0)
+        result = service.calibrate(_REBATE, str(tmp_path / "cal"), single_capture=True)
+        light.set_color(*result.levels)
+        frame = camera.capture(str(tmp_path / "frame.raw"), shutter=result.shutters[0])
+    finally:
+        light.close()
+    assert result.single_capture
+    target = result.channels["R"].target
+    assert _base_signal(frame) == pytest.approx([target] * 3, rel=0.1)
+    mixing = np.linalg.inv(np.array(result.sensor_matrix).reshape(3, 3))
+    leaks = mixing[~np.eye(3, dtype=bool)]
+    assert np.diag(mixing) == pytest.approx([1.0] * 3) and np.all((leaks > 0) & (leaks < 0.2))
 
 
 def test_flag_selects_the_simulated_gphoto_module(sim_env):

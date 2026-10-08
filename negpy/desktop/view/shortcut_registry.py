@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from typing import Iterable
 
+from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QKeySequence
 
 from negpy.desktop.view.slider_shortcut_groups import (
@@ -17,6 +18,11 @@ class ShortcutEntry:
     default_key: str
     description: str
     category: str
+    # The window that dispatches the key; keys clash only within one window.
+    window: str = "main"
+
+
+LIVE_VIEW = "live_view"
 
 
 REGISTRY: dict[str, ShortcutEntry] = {
@@ -45,6 +51,7 @@ REGISTRY: dict[str, ShortcutEntry] = {
     "converge_v_inc": ShortcutEntry("", "Easel tilt up", "Geometry"),
     "converge_h_dec": ShortcutEntry("", "Easel swing down", "Geometry"),
     "converge_h_inc": ShortcutEntry("", "Easel swing up", "Geometry"),
+    "auto_skew": ShortcutEntry("", "Auto skew: square the frame to its edges", "Geometry"),
     "straighten": ShortcutEntry("L", "Toggle straighten line tool", "Geometry"),
     "keystone_lines": ShortcutEntry("", "Toggle tilt/swing reference-lines tool", "Geometry"),
     "pick_wb": ShortcutEntry("Shift+W", "Toggle WB picker", "Tools"),
@@ -58,6 +65,7 @@ REGISTRY: dict[str, ShortcutEntry] = {
     "pick_dust": ShortcutEntry("Shift+D", "Toggle heal tool", "Tools"),
     "pick_scratch": ShortcutEntry("Shift+S", "Toggle scratch tool", "Tools"),
     "pick_scratch_line": ShortcutEntry("Shift+K", "Toggle transport-scratch line tool", "Tools"),
+    "clone_tool": ShortcutEntry("Shift+J", "Toggle clone tool", "Tools"),
     "local_draw": ShortcutEntry("Shift+B", "Toggle dodge & burn mask draw", "Tools"),
     "local_oval": ShortcutEntry("", "Toggle dodge & burn oval mask draw", "Tools"),
     "local_gradient": ShortcutEntry("", "Toggle dodge & burn card-edge mask draw", "Tools"),
@@ -74,6 +82,7 @@ REGISTRY: dict[str, ShortcutEntry] = {
     "batch_autocrop": ShortcutEntry("", "Auto crop the whole roll", "Geometry"),
     "toggle_auto_density": ShortcutEntry("", "Toggle Auto Density", "Exposure"),
     "toggle_auto_grade": ShortcutEntry("", "Toggle Auto Grade", "Exposure"),
+    "toggle_auto_both": ShortcutEntry("", "Toggle Auto Density and Auto Grade together", "Exposure"),
     "preset_apply": ShortcutEntry("", "Apply the selected preset", "Actions"),
     "preset_save": ShortcutEntry("", "Save a preset from the current settings", "Actions"),
     "toggle_test_strip": ShortcutEntry("Shift+T", "Density × grade test strip", "Tools"),
@@ -132,6 +141,9 @@ REGISTRY: dict[str, ShortcutEntry] = {
     "scan_setup": ShortcutEntry("", "Scanning setup wizard", "Process"),
     "scan_prescan": ShortcutEntry("", "Prescan and set crop (Plustek)", "Process"),
     "scan_meter_frame": ShortcutEntry("", "Meter a frame and lock the scan exposure (Coolscan)", "Process"),
+    "scan_as_roll": ShortcutEntry("", "Toggle Scan as Roll", "Process"),
+    "scan_folder_as_roll": ShortcutEntry("", "Toggle Folder as Roll", "Process"),
+    "scan_new_roll": ShortcutEntry("", "Start the next scan roll", "Process"),
     "mode_color_negative": ShortcutEntry("", "Mode: Color Negative", "Process"),
     "mode_bw_negative": ShortcutEntry("", "Mode: B&W Negative", "Process"),
     "mode_transparency": ShortcutEntry("", "Mode: Transparency", "Process"),
@@ -243,6 +255,7 @@ REGISTRY: dict[str, ShortcutEntry] = {
     "merge_frame": ShortcutEntry("", "Merge Frame to TIFF Negative…", "Actions"),
     "merge_selected": ShortcutEntry("", "Merge Selected to TIFF Negative…", "Actions"),
     "merge_roll": ShortcutEntry("", "Merge Roll to TIFF Negative…", "Actions"),
+    "contact_sheet": ShortcutEntry("", "Contact Sheet…", "Actions"),
     "copy": ShortcutEntry("Ctrl+C", "Copy settings", "Actions"),
     "copy_with_bounds": ShortcutEntry("Ctrl+Shift+C", "Copy settings (with bounds)", "Actions"),
     "paste": ShortcutEntry("Ctrl+V", "Paste settings", "Actions"),
@@ -252,6 +265,7 @@ REGISTRY: dict[str, ShortcutEntry] = {
     "reset_tab": ShortcutEntry("", "Reset this tab to defaults", "Actions"),
     "reset_tab_to_roll": ShortcutEntry("", "Reset this tab to the roll's settings", "Actions"),
     "reset_to_roll": ShortcutEntry("", "Reset this frame to the roll's settings", "Actions"),
+    "load_sidecar": ShortcutEntry("", "Load this frame's edit from a sidecar…", "Actions"),
     "apply_tab": ShortcutEntry("", "Apply this tab to the roll…", "Actions"),
     "toggle_tab_cards": ShortcutEntry("", "Expand or collapse this tab's cards", "Actions"),
     "roll_batch_analysis": ShortcutEntry("", "Roll Analysis (measure the roll's baseline)", "Actions"),
@@ -267,6 +281,8 @@ REGISTRY: dict[str, ShortcutEntry] = {
     "save_work_print": ShortcutEntry("Ctrl+Shift+S", "Save the current edit as a named work print", "Actions"),
     "undo": ShortcutEntry("Ctrl+Z", "Undo", "Actions"),
     "redo": ShortcutEntry("Ctrl+Y", "Redo", "Actions"),
+    "live_view_scan": ShortcutEntry("S", "Scan, or stop the capture", "Camera Live View", LIVE_VIEW),
+    "live_view_retake": ShortcutEntry("R", "Retake the current frame", "Camera Live View", LIVE_VIEW),
     "show_shortcuts": ShortcutEntry("?", "Show shortcuts", "Help"),
     "show_tour": ShortcutEntry("", "Take the tour: a guided walk through NegPy, one chapter at a time", "Help"),
     "show_analysis_help": ShortcutEntry("", "Analysis panel guide", "Help"),
@@ -392,6 +408,16 @@ def current_bindings() -> dict[str, str]:
     if not _CURRENT_BINDINGS:
         set_current_bindings(default_bindings())
     return dict(_CURRENT_BINDINGS)
+
+
+def clash_scope(action_id: str, key: str) -> str:
+    """The window whose other bindings a key clashes with. A Ctrl or Cmd chord passes a
+    floating panel's key guard to the main window, so it clashes there too."""
+    seq = QKeySequence(key)
+    command = Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.MetaModifier
+    if not seq.isEmpty() and seq[0].keyboardModifiers() & command:
+        return "main"
+    return REGISTRY[action_id].window
 
 
 def key_for(action_id: str, bindings: dict[str, str] | None = None) -> str:

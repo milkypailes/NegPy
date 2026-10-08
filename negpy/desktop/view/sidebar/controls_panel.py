@@ -67,9 +67,8 @@ _SENSOR_FIELDS = (
 )
 # ProcessConfig is split across five cards. Each tuple is both the card's reset scope and
 # its modified count, so a field is resettable from the one card that counts it.
-# Linear RAW, Narrowband and the two demosaic choices are in none: they describe the rig and
-# the decode, not this frame's look, so they come from the scanning setup and no reset -- a
-# card's or the frame's (_with_scan_setup) -- changes them.
+# Linear RAW, Narrowband and the two demosaic choices are in none: they come from the scanning
+# setup, which no card or frame reset changes (_with_scan_setup).
 # locked_floors/locked_ceils/locked_neutral_axis are in none: they are Roll Analysis's measured result.
 _FILM_FIELDS = (
     "process_mode",
@@ -98,8 +97,7 @@ _BASELINE_FIELDS = (
 
 # Constant frozen-dataclass defaults, built once rather than per resync. Exposure/process/
 # geometry/config come from DEFAULT_WORKSPACE_CONFIG, not their own bare dataclass default:
-# the autocrop fields are the shipped ones only there, which is also what an untouched or
-# reset file actually carries.
+# the autocrop fields hold the shipped values only there, as an untouched or reset file does.
 _DEFAULT_EXPOSURE = DEFAULT_WORKSPACE_CONFIG.exposure
 _DEFAULT_LAB = LabConfig()
 _DEFAULT_TONING = ToningConfig()
@@ -201,8 +199,7 @@ class ControlsPanel(QWidget):
             icon_name="mdi6.film",
             collapsible=False,
         )
-        # How the files become frames: Trichrome is a rig flag and Half Frame a roll's own
-        # state, so neither has a scope pair.
+        # Each roll keeps its own Trichrome and Half Frame state, so neither has a scope pair.
         self.trichrome_sidebar = TrichromeSidebar(self.controller)
         self.half_frame_sidebar = HalfFrameSidebar(self.controller)
         assembly_body = QWidget()
@@ -491,6 +488,7 @@ class ControlsPanel(QWidget):
             (self.autocrop_sidebar.auto_crop_all_btn, "batch_autocrop"),
             (self.tone_sidebar.auto_density_action, "toggle_auto_density"),
             (self.tone_sidebar.auto_grade_action, "toggle_auto_grade"),
+            (self.tone_sidebar.auto_both_action, "toggle_auto_both"),
             (self.presets_sidebar.apply_btn, "preset_apply"),
             (self.presets_sidebar.save_btn, "preset_save"),
         ):
@@ -552,14 +550,16 @@ class ControlsPanel(QWidget):
         )
         exp.density_slider.setToolTip(
             tooltip_with_shortcut(
-                "Overall print density — simulates enlarger exposure time. Lower = brighter, higher = darker",
+                "Overall print density — simulates enlarger exposure time. Lower = brighter, higher = darker. "
+                "With Auto Density on, it shows the metered density; moving it trims the meter",
                 ["density_up", "density_down"],
             )
         )
         exp.grade_slider.setToolTip(
             tooltip_with_shortcut(
-                f"Contrast (ISO R paper exposure range): R{EXPOSURE_CONSTANTS['iso_r_max']:.0f} = very soft, "
-                f"R{EXPOSURE_CONSTANTS['iso_r_min']:.0f} = very hard; R110 ≈ grade 2 paper",
+                f"Paper contrast (ISO R): R{EXPOSURE_CONSTANTS['iso_r_max']:.0f} is very soft, "
+                f"R{EXPOSURE_CONSTANTS['iso_r_min']:.0f} very hard, R110 ≈ grade 2. "
+                "With Auto Grade on, it shows the grade the frame prints at; moving it trims the auto",
                 ["grade_up", "grade_down"],
             )
         )
@@ -604,7 +604,8 @@ class ControlsPanel(QWidget):
         exp.highlight_density_slider.setToolTip(
             tooltip_with_shortcut(
                 "Highlight zone density (ΔD): weighted to the highlights, bounded by paper white. "
-                "Positive burns highlights in; negative bleaches them",
+                "Positive burns highlights in; negative bleaches them. With Auto Grade on, it includes "
+                "the automatic highlight burn",
                 ["highlight_density_inc", "highlight_density_dec"],
             )
         )
@@ -629,6 +630,12 @@ class ControlsPanel(QWidget):
                 "manual_crop",
             )
         )
+        geo.auto_skew_btn.setToolTip(
+            tooltip_with_shortcut(
+                "Auto Skew: square the frame to its film edges, not to the picture. Sets Fine Rotation, Tilt and Swing",
+                "auto_skew",
+            )
+        )
         geo.straighten_btn.setToolTip(
             tooltip_with_shortcut(
                 "Straighten with a reference line — draw along the horizon or a vertical edge "
@@ -639,9 +646,8 @@ class ControlsPanel(QWidget):
         )
         geo.keystone_lines_btn.setToolTip(
             tooltip_with_shortcut(
-                "Tilt and swing with reference lines — drag a short line along each of the four "
-                "rebate edges (top, bottom, left, right); NegPy solves the Tilt and Swing that make "
-                "them parallel and square again. Stays open until you toggle it off",
+                "Tilt and swing with reference lines: drag a line along each rebate edge, and Tilt and "
+                "Swing square them. Stays on until you turn it off",
                 "keystone_lines",
             )
         )
@@ -805,18 +811,22 @@ class ControlsPanel(QWidget):
                 "pick_dust",
             )
         )
+        ret.clone_btn.setToolTip(
+            tooltip_with_shortcut(
+                "Clone Tool: copy film from another area over a defect. Alt-click the source, then paint. Uses Brush Size",
+                "clone_tool",
+            )
+        )
         ret.threshold_slider.setToolTip(
             tooltip_with_shortcut(
-                "How far a speck must stand out from the film's grain to be repaired. Lower catches more, "
-                "with more false positives on fine detail. 1.0 turns speck detection off",
+                "How far a speck must stand out from the grain to be repaired. Lower catches more, with more false positives. 1.0 is off",
                 ["threshold_inc", "threshold_dec"],
             )
         )
         ret.hair_threshold_slider.setToolTip(
             tooltip_with_shortcut(
-                "How far a hair or other long thin mark must stand out from the grain to be repaired. The bar rises "
-                "along tonal edges and in busy detail, where a thin image line looks like a hair. Lower it if a hair "
-                "across busy detail is missed. 1.0 turns hair detection off",
+                "How far a hair-shaped mark must stand out from the grain to be repaired. Lower it for a hair "
+                "missed in busy detail. 1.0 is off",
                 ["hair_threshold_inc", "hair_threshold_dec"],
             )
         )

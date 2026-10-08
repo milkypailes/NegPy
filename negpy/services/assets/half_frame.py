@@ -1,10 +1,6 @@
-"""Half-frame scans: one file holds two frames side by side.
+"""Half-frame scans: an asset with ``half`` (1 left/top, 2 right/bottom), ``split_x`` and ``split_axis`` ("x" or "y").
 
-A half asset is a normal asset dict plus ``half`` (1 = left, 2 = right) and
-``split_x`` (normalized gutter position). Its identity is the file hash
-suffixed with ``#<half>``, so every hash-keyed store (edits, history, marks,
-thumbnails) is per-frame automatically. Decode caches key on the unsuffixed
-hash so both halves share one decode.
+Its hash is the file hash plus ``#<half>``, so hash-keyed stores are per frame; decode caches key on the file hash.
 """
 
 from dataclasses import dataclass, replace
@@ -112,8 +108,13 @@ def _slice_half_bounds(
     split_x: float,
     crop_rect: Optional[tuple[float, float, float, float]] = None,
     gutter_thickness: float = 0.0,
+    split_axis: str = "x",
 ) -> tuple[int, int, int, int]:
-    """Pixel bounds read by ``slice_half``."""
+    """Pixel bounds read by ``slice_half``; a "y" split is the transposed "x" problem."""
+    if split_axis == "y":
+        t_rect = (crop_rect[1], crop_rect[0], crop_rect[3], crop_rect[2]) if crop_rect is not None else None
+        ty1, ty2, tx1, tx2 = _slice_half_bounds(width, height, half, split_x, t_rect, gutter_thickness)
+        return (tx1, tx2, ty1, ty2)
     x1, y1, x2, y2 = 0, 0, width, height
     if crop_rect is not None:
         rx1, ry1, rx2, ry2 = crop_rect
@@ -144,10 +145,11 @@ def slice_half_dimensions(
     split_x: float,
     crop_rect: Optional[tuple[float, float, float, float]] = None,
     gutter_thickness: float = 0.0,
+    split_axis: str = "x",
 ) -> tuple[int, int]:
     """Return the full-resolution image-space dimensions of a half slice."""
     height, width = dimensions
-    y1, y2, x1, x2 = _slice_half_bounds(height, width, half, split_x, crop_rect, gutter_thickness)
+    y1, y2, x1, x2 = _slice_half_bounds(height, width, half, split_x, crop_rect, gutter_thickness, split_axis)
     return (y2 - y1, x2 - x1)
 
 
@@ -157,27 +159,22 @@ def slice_half(
     split_x: float,
     crop_rect: Optional[tuple[float, float, float, float]] = None,
     gutter_thickness: float = 0.0,
+    split_axis: str = "x",
 ) -> np.ndarray:
     """View of one half of a decoded buffer; ``half=0`` crops only, without splitting.
 
-    The scan is first cropped to ``crop_rect`` (normalized x1,y1,x2,y2; None =
-    full frame), then split at the normalized gutter ``split_x`` relative to the
-    cropped width. A ``gutter_thickness`` (normalized fraction of the cropped
-    width) discards a band centered on the split so the physical black separator
-    between the two exposures does not bleed into either half.
+    ``crop_rect`` is normalized x1,y1,x2,y2 (None = full frame); ``split_x`` and ``gutter_thickness`` are
+    fractions of the cropped extent along ``split_axis`` ("x" cuts left/right, "y" top/bottom).
     """
     h, w = buf.shape[:2]
-    y1, y2, x1, x2 = _slice_half_bounds(h, w, half, split_x, crop_rect, gutter_thickness)
+    y1, y2, x1, x2 = _slice_half_bounds(h, w, half, split_x, crop_rect, gutter_thickness, split_axis)
     return buf[y1:y2, x1:x2]
 
 
 def slice_for_asset(buf: np.ndarray, file_info: Dict[str, Any]) -> np.ndarray:
     """Apply the asset's half slice; no-op for whole-frame assets without a crop rect.
 
-    Recognizes an optional ``crop_rect`` (normalized x1,y1,x2,y2) and
-    ``gutter_thickness`` (normalized fraction of the cropped width) set by the
-    half-frame rectangle editor. A whole-frame asset that carries a crop rect is a
-    diptych: cropped to the rect, still whole, split later per half.
+    A whole-frame asset with a ``crop_rect`` is a diptych: cropped to the rect, still whole, split later per half.
     """
     half = int(file_info.get("half") or 0)
     if not half and not file_info.get("crop_rect"):
@@ -190,6 +187,7 @@ def slice_for_asset(buf: np.ndarray, file_info: Dict[str, Any]) -> np.ndarray:
         float(file_info.get("split_x") or 0.5),
         crop_rect=crop_rect,
         gutter_thickness=float(file_info.get("gutter_thickness") or 0.0),
+        split_axis=str(file_info.get("split_axis") or "x"),
     )
 
 
@@ -203,6 +201,7 @@ class HalfGeometry:
     crop_rect: Optional[tuple[float, float, float, float]] = None
     split_x: float = 0.5
     gutter_thickness: float = 0.0
+    split_axis: str = "x"
 
 
 def _to_scan(x: float, y: float, half: int, geom: HalfGeometry) -> tuple[float, float]:
@@ -218,7 +217,10 @@ def _to_scan(x: float, y: float, half: int, geom: HalfGeometry) -> tuple[float, 
     else:
         lo = max(0.0, geom.split_x - geom.gutter_thickness / 2.0)
         hi = min(1.0, geom.split_x + geom.gutter_thickness / 2.0)
-        cx, cy = (x * lo, y) if half == 1 else (hi + x * (1.0 - hi), y)
+        if geom.split_axis == "y":
+            cx, cy = (x, y * lo) if half == 1 else (x, hi + y * (1.0 - hi))
+        else:
+            cx, cy = (x * lo, y) if half == 1 else (hi + x * (1.0 - hi), y)
     return x1 + cx * cw, y1 + cy * ch
 
 
@@ -231,6 +233,9 @@ def _from_scan(fx: float, fy: float, half: int, geom: HalfGeometry) -> tuple[flo
         return cx, cy
     lo = max(0.0, geom.split_x - geom.gutter_thickness / 2.0)
     hi = min(1.0, geom.split_x + geom.gutter_thickness / 2.0)
+    if geom.split_axis == "y":
+        y = cy / max(1e-9, lo) if half == 1 else (cy - hi) / max(1e-9, 1.0 - hi)
+        return cx, y
     x = cx / max(1e-9, lo) if half == 1 else (cx - hi) / max(1e-9, 1.0 - hi)
     return x, cy
 
@@ -291,42 +296,41 @@ def remap_workspace_config(config: "WorkspaceConfig", half: int, old_geom: HalfG
 
 
 def gap_px(left_width: int, right_width: int, gutter_thickness: float) -> int:
-    """Width of the diptych gap, from the two rendered halves.
+    """Width of the diptych gap, from the two rendered halves' extents along the split axis.
 
-    Derived from the halves rather than from the source: an export can resize, so the
-    discarded band's pixel count on the scan is not the gap's pixel count on the output.
-    ``gutter_thickness`` is a fraction of the cropped scan width, of which the two halves
-    hold the remaining ``1 - gutter_thickness``.
+    Derived from the halves, not the source, since an export can resize. ``gutter_thickness`` is a
+    fraction of the cropped scan extent; the halves hold the remaining ``1 - gutter_thickness``.
     """
     if gutter_thickness <= 0 or gutter_thickness >= 1:
         return 0
     return int(round((left_width + right_width) * gutter_thickness / (1.0 - gutter_thickness)))
 
 
-def _pad_height(a: np.ndarray, height: int) -> np.ndarray:
-    pad = height - a.shape[0]
+def _pad_to(a: np.ndarray, length: int, pad_axis: int) -> np.ndarray:
+    pad = length - a.shape[pad_axis]
     if pad <= 0:
         return a
-    top = pad // 2
-    return np.pad(a, ((top, pad - top), (0, 0)) + ((0, 0),) * (a.ndim - 2), constant_values=_GAP_FILL)
+    widths = [(0, 0)] * a.ndim
+    widths[pad_axis] = (pad // 2, pad - pad // 2)
+    return np.pad(a, widths, constant_values=_GAP_FILL)
 
 
-def join_halves(left: np.ndarray, right: np.ndarray, gap: int = 0) -> np.ndarray:
-    """Join two rendered halves side by side, with a ``gap``-wide band where the gutter was.
+def join_halves(left: np.ndarray, right: np.ndarray, gap: int = 0, axis: str = "x") -> np.ndarray:
+    """Join two rendered halves with a ``gap``-wide filled band: side by side for "x", half 1 on top for "y".
 
-    The gap is filled rather than copied from the scan: the source gutter is
-    scene-linear negative data, so pasting it in gives a bright bar, and running the
-    pipeline on a thin dark strip renormalizes it into noise.
-
-    Unequal heights (a per-half crop aspect or border) are centre-padded, never
-    resampled — an export must not resize pixels the pipeline already sized.
+    The gap is filled, not copied: the source gutter is scene-linear negative data and renders as a bright bar.
+    Unequal cross sizes are center-padded, never resampled: an export must not resize pixels the pipeline sized.
     """
-    height = max(left.shape[0], right.shape[0])
-    parts = [_pad_height(left, height)]
+    join_axis = 1 if axis == "x" else 0
+    pad_axis = 1 - join_axis
+    length = max(left.shape[pad_axis], right.shape[pad_axis])
+    parts = [_pad_to(left, length, pad_axis)]
     if gap > 0:
-        parts.append(np.full((height, gap) + left.shape[2:], _GAP_FILL, dtype=left.dtype))
-    parts.append(_pad_height(right, height))
-    return np.ascontiguousarray(np.concatenate(parts, axis=1))
+        gap_shape = list(parts[0].shape)
+        gap_shape[join_axis] = gap
+        parts.append(np.full(tuple(gap_shape), _GAP_FILL, dtype=left.dtype))
+    parts.append(_pad_to(right, length, pad_axis))
+    return np.ascontiguousarray(np.concatenate(parts, axis=join_axis))
 
 
 def diptych_configs(repo: Any, file_hash: Optional[str]) -> Optional[tuple[Any, Any]]:
@@ -348,27 +352,48 @@ def diptych_configs(repo: Any, file_hash: Optional[str]) -> Optional[tuple[Any, 
     return (first or second, second or first)
 
 
-def detect_gutter(buf: np.ndarray) -> tuple[float, float]:
-    """Normalized (split_x, gutter_thickness) of the unexposed band between the two frames.
-
-    The gutter is a narrow column extremal against its surroundings in either polarity,
-    bright film base on a negative and dark on a positive, so the pick is the column whose
-    smoothed luma deviates most from a local running-median background, over a window much
-    wider than the gutter. Its edges are the steepest slope on each side of that peak,
-    searched in a window sized to the smoothing rather than to the deviation band, since an
-    in-scene gradient blending into the gutter widens that band on one side and drags the
-    center with it. Returns ``(0.5, 0.0)`` when no gutter stands out.
-    """
+def _luma(buf: np.ndarray) -> np.ndarray:
     a = np.asarray(buf)
     if a.ndim == 3:
         a = a.mean(axis=2)
-    a = a.astype(np.float32, copy=False)
+    return a.astype(np.float32, copy=False)
+
+
+def detect_gutter(buf: np.ndarray) -> tuple[float, float]:
+    """Normalized (split, gutter_thickness) of the unexposed band between the two
+    frames, along x; ``(0.5, 0.0)`` when no gutter stands out."""
+    split, thickness, _ = _gutter_scan(_luma(buf))
+    return split, thickness
+
+
+# How much stronger the horizontal band must read before the split turns top/bottom: an in-scene
+# horizon can pass every gutter gate, and side by side is the common layout.
+_AXIS_MARGIN = 1.5
+
+
+def detect_gutter_axis(buf: np.ndarray) -> tuple[float, float, str]:
+    """Normalized (split, gutter_thickness, split_axis) of the gutter, measured on both axes since EXIF
+    orientation can turn the layout; "y" only past ``_AXIS_MARGIN``, "x" when neither axis shows a gutter."""
+    a = _luma(buf)
+    x_split, x_thick, x_strength = _gutter_scan(a)
+    y_split, y_thick, y_strength = _gutter_scan(np.ascontiguousarray(a.T))
+    if y_strength > _AXIS_MARGIN * x_strength:
+        return y_split, y_thick, "y"
+    return x_split, x_thick, "x"
+
+
+def _gutter_scan(a: np.ndarray) -> tuple[float, float, float]:
+    """(split, thickness, strength) of a vertical gutter in a 2-D luma array; strength is its contrast, 0.0 for none.
+
+    The pick is the column deviating most from a running-median background, in either polarity. Its edges are
+    the steepest slope each side, searched in a smoothing-sized window: an in-scene gradient widens the deviation band.
+    """
     h, w = a.shape[:2]
     if w < 64 or h < 8:
-        return 0.5, 0.0
+        return 0.5, 0.0, 0.0
     peak_val = float(a.max())
     if peak_val <= 0:
-        return 0.5, 0.0
+        return 0.5, 0.0, 0.0
     sub = a[:: max(1, h // 512)] / peak_val
     col = sub.mean(axis=0)
     k = max(3, w // 150)
@@ -399,12 +424,12 @@ def detect_gutter(buf: np.ndarray) -> tuple[float, float]:
     d1 = float(sm[center] - sm[max(0, center - delta)])
     d2 = float(sm[center] - sm[min(w - 1, center + delta)])
     if min(abs(d1), abs(d2)) < 0.04 or d1 * d2 <= 0:
-        return 0.5, 0.0
+        return 0.5, 0.0, 0.0
     # Unexposed film is uniform top to bottom; a bright/dark in-scene feature isn't.
     if float(sub[:, center].std()) > 0.10:
-        return 0.5, 0.0
+        return 0.5, 0.0, 0.0
     thickness = min(_MAX_GUTTER_THICKNESS, max(0.0, (right_edge - left_edge) / w))
-    return float(center_f / w), float(thickness)
+    return float(center_f / w), float(thickness), min(abs(d1), abs(d2))
 
 
 def _subpixel_extreme(seg: np.ndarray, offset: int, want_max: bool) -> float:
@@ -419,24 +444,21 @@ def _subpixel_extreme(seg: np.ndarray, offset: int, want_max: bool) -> float:
     return offset + idx + max(-0.5, min(0.5, frac))
 
 
-def detect_split_x(buf: np.ndarray) -> float:
-    """Normalized x of the unexposed gutter between the two frames; see ``detect_gutter``."""
-    return detect_gutter(buf)[0]
-
-
-def detect_split_x_for_file(file_path: str) -> float:
-    """Gutter position from a small decode of the file; 0.5 on any failure."""
+def detect_split_axis_for_file(file_path: str) -> tuple[float, str]:
+    """Gutter position and split axis from a small decode of the file;
+    (0.5, "x") on any failure."""
     try:
         from negpy.services.assets.thumbnails import decode_source_image
 
         img = decode_source_image(file_path)
         if img is None:
-            return 0.5
+            return 0.5, "x"
         img.thumbnail((1024, 1024))
-        return detect_split_x(np.asarray(img))
+        split, _thickness, axis = detect_gutter_axis(np.asarray(img))
+        return split, axis
     except Exception as e:
         logger.warning("Half-frame split detection failed for %s: %s", file_path, e)
-        return 0.5
+        return 0.5, "x"
 
 
 _MAX_FILM_MARGIN = 0.15  # bounds a plausible rebate/sprocket margin; wider is read as picture content
@@ -542,24 +564,23 @@ def detect_film_crop(buf: np.ndarray) -> Optional[tuple[float, float, float, flo
 
 def detect_split_and_crop_for_file(
     file_path: str,
-) -> tuple[float, float, Optional[tuple[float, float, float, float]]]:
-    """Gutter position, gutter thickness and outer film crop from one decode of the
-    file -- the triple Auto-detect All Splits saves as a roll's half-frame profile.
-    (0.5, 0.0, None) on any failure, matching detect_split_x_for_file's fallback."""
+) -> tuple[float, float, Optional[tuple[float, float, float, float]], str]:
+    """Gutter position, gutter thickness, outer film crop and split axis from one
+    decode of the file -- what Auto-detect All Splits saves per frame.
+    (0.5, 0.0, None, "x") on any failure."""
     try:
         from negpy.services.assets.thumbnails import decode_source_image
 
         img = decode_source_image(file_path)
         if img is None:
-            return 0.5, 0.0, None
+            return 0.5, 0.0, None, "x"
         img.thumbnail((1024, 1024))
         buf = np.asarray(img)
         crop_rect = detect_film_crop(buf)
-        # split_x is relative to the cropped width (slice_half's own convention), so the
-        # gutter search has to run inside the new crop, not the full, uncropped scan.
+        # The split is relative to the crop (slice_half's convention): search for the gutter inside it.
         detect_buf = slice_half(buf, 0, 0.5, crop_rect=crop_rect) if crop_rect is not None else buf
-        split_x, thickness = detect_gutter(detect_buf)
-        return split_x, thickness, crop_rect
+        split, thickness, axis = detect_gutter_axis(detect_buf)
+        return split, thickness, crop_rect, axis
     except Exception as e:
         logger.warning("Half-frame split/crop detection failed for %s: %s", file_path, e)
-        return 0.5, 0.0, None
+        return 0.5, 0.0, None, "x"

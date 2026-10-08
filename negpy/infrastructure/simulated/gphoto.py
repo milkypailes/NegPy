@@ -1,8 +1,6 @@
-"""A python-gphoto2 module stand-in: one camera body with live view, settings and stills.
+"""A python-gphoto2 stand-in: one body that exposes the simulated film under the simulated Scanlight.
 
-Every frame is exposed from the simulated film, the simulated Scanlight's current color and
-the body's shutter and ISO, so calibration and the triplet channels respond to the light. A
-still is a Bayer DNG, which the capture path decodes like any camera RAW.
+A still lit white or by the triplet's first channel advances the film; the other two channels stay on it.
 """
 
 import functools
@@ -13,6 +11,7 @@ import cv2
 import numpy as np
 import tifffile
 
+from negpy.infrastructure.capture.base import CAPTURE_ORDER
 from negpy.infrastructure.simulated.images import film
 from negpy.infrastructure.simulated.scanlight import current_color
 
@@ -20,26 +19,30 @@ MODEL = "Simulated Camera"
 _SENSOR_HW = (2000, 3000)  # a smaller frame fails the capture path's minimum RAW size
 _PREVIEW_HW = (480, 640)
 _BLACK, _WHITE = 512, 16383
-# Clear-base signal, as a fraction of full scale per LED count per second at ISO 100, of the
-# sensor channel each LED lights. The calibration's reference start point lands below target.
+# Clear-base signal per LED count per second at ISO 100, as a fraction of full scale.
+# The calibration's reference start point must land below target.
 _RESPONSE = np.array([0.012, 0.055, 0.13], np.float32)
-_CROSSTALK = 0.03  # what each narrowband LED leaks into the other two sensor channels
+_CROSSTALK = 0.03
 _WHITE_SHARE = 0.5
 _SHUTTERS = (
     "1/250", "1/200", "1/160", "1/125", "1/100", "1/80", "1/60", "1/50", "1/40", "1/30", "1/25", "1/20", "1/15",
     "1/13", "1/10", "1/8", "1/6", "1/5", "1/4", "1/3", "0.4", "1/2", "0.6", "0.8", "1", "1.3", "1.6", "2",
 )  # fmt: skip
+# DNGVersion, UniqueCameraModel, CFARepeatPatternDim, CFAPattern (RGGB), BlackLevel, WhiteLevel, ColorMatrix1, AsShotNeutral.
 _DNG_TAGS = [
-    (50706, "B", 4, (1, 4, 0, 0), True),  # DNGVersion
-    (50708, "s", 0, MODEL, True),  # UniqueCameraModel
-    (33421, "H", 2, (2, 2), True),  # CFARepeatPatternDim
-    (33422, "B", 4, (0, 1, 1, 2), True),  # CFAPattern: RGGB
-    (50714, "H", 1, (_BLACK,), True),  # BlackLevel
-    (50717, "H", 1, (_WHITE,), True),  # WhiteLevel
-    (50721, "2i", 9, (1, 1, 0, 1, 0, 1, 0, 1, 1, 1, 0, 1, 0, 1, 0, 1, 1, 1), True),  # ColorMatrix1: identity
-    (50728, "2I", 3, (1, 1, 1, 1, 1, 1), True),  # AsShotNeutral
+    (50706, "B", 4, (1, 4, 0, 0), True),
+    (50708, "s", 0, MODEL, True),
+    (33421, "H", 2, (2, 2), True),
+    (33422, "B", 4, (0, 1, 1, 2), True),
+    (50714, "H", 1, (_BLACK,), True),
+    (50717, "H", 1, (_WHITE,), True),
+    (50721, "2i", 9, (1, 1, 0, 1, 0, 1, 0, 1, 1, 1, 0, 1, 0, 1, 0, 1, 1, 1), True),
+    (50728, "2I", 3, (1, 1, 1, 1, 1, 1), True),
 ]
 _CFA_PHOTOMETRIC = 32803
+# Enough texture that every frame of a roll passes trichrome grouping's same-frame floor.
+_FILM_SHAPES = 24
+_FIRST_CHANNEL = "RGB".index(CAPTURE_ORDER[0].letter)
 
 
 def _seconds(label: str) -> float:
@@ -171,7 +174,7 @@ class SimGphoto:
         self.props = {
             "iso": _Widget("iso", "100", ["Auto ISO", "100", "200", "400", "800"]),
             "shutterspeed": _Widget("shutterspeed", "1/4", list(_SHUTTERS)),
-            # A manual scanning lens: no electronic aperture, so no choices.
+            # A manual lens: no electronic aperture.
             "f-number": _Widget("f-number", None, [], readonly=True),
             "capturetarget": _Widget("capturetarget", "card", ["card", "sdram"]),
             "focusmagnifier": _Widget("focusmagnifier", "Off,320,240", ["Off", "1", "6.9", "13.7"]),
@@ -179,6 +182,7 @@ class SimGphoto:
         self.pending_raw = b""
         self.shot_events = 0
         self._rng = np.random.default_rng(0)
+        self._frame = 0
         self.Camera = lambda: _Camera(self)
         self.Camera.autodetect = lambda: _CameraList([(MODEL, "usb:sim")])
 
@@ -191,8 +195,14 @@ class SimGphoto:
         gain = _seconds(self.props["shutterspeed"].value or "1") * (int(iso) / 100 if iso.isdigit() else 1.0)
         return transmittance * (_RESPONSE * lit * gain)
 
+    def _advance_film(self) -> None:
+        r, g, b, w = current_color()
+        if w > max(r, g, b) or int(np.argmax((r, g, b))) == _FIRST_CHANNEL:
+            self._frame += 1
+
     def still_dng(self) -> bytes:
-        quad = self._signal(_film(_SENSOR_HW[0] // 2, _SENSOR_HW[1] // 2))
+        self._advance_film()
+        quad = self._signal(_film(_SENSOR_HW[0] // 2, _SENSOR_HW[1] // 2, self._frame))
         cfa = np.empty(_SENSOR_HW, np.float32)
         cfa[0::2, 0::2], cfa[0::2, 1::2], cfa[1::2, 0::2], cfa[1::2, 1::2] = quad[..., 0], quad[..., 1], quad[..., 1], quad[..., 2]
         counts = cfa * (_WHITE - _BLACK)
@@ -203,14 +213,14 @@ class SimGphoto:
         return out.getvalue()
 
     def preview_jpeg(self) -> bytes:
-        display = np.clip(self._signal(_film(*_PREVIEW_HW)), 0.0, 1.0) ** (1 / 2.2)
+        display = np.clip(self._signal(_film(*_PREVIEW_HW, self._frame)), 0.0, 1.0) ** (1 / 2.2)
         _ok, jpeg = cv2.imencode(".jpg", cv2.cvtColor((display * 255).astype(np.uint8), cv2.COLOR_RGB2BGR))
         return jpeg.tobytes()
 
 
-@functools.cache
-def _film(h: int, w: int) -> np.ndarray:
-    return film(h, w)[0]
+@functools.lru_cache(maxsize=4)
+def _film(h: int, w: int, seed: int) -> np.ndarray:
+    return film(h, w, seed, _FILM_SHAPES)[0]
 
 
 @functools.cache

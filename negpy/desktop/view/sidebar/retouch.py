@@ -3,7 +3,7 @@ from negpy.desktop.view.widgets.choice_button import ChoiceButton
 from negpy.desktop.view.widgets.sliders import CompactSlider, SliderGroup
 from negpy.desktop.view.sidebar.base import BaseSidebar
 from negpy.desktop.session import ToolMode
-from negpy.desktop.view.styles.templates import ICON_BUTTON_WIDTH, header_row, section_subheader, wrap_tooltip
+from negpy.desktop.view.styles.templates import ICON_BUTTON_WIDTH, header_row, hint_label, section_subheader, wrap_tooltip
 from negpy.features.retouch.models import HEAL_SIZE_MAX, HEAL_SIZE_MIN, IR_METHOD_NEGPY, IR_METHOD_OPENICE
 
 _IR_REMOVAL_TIP = (
@@ -36,6 +36,12 @@ _RIGHT_CLICK_TIP = (
     "Off, a right-click opens the canvas menu and its Exclude From Optical Removal item does the same. "
     "Right-drag paints a band either way."
 )
+
+
+def _clone_hint(picking: bool, has_source: bool) -> str:
+    if picking or not has_source:
+        return "Click the photo to pick the area to copy from."
+    return "Paint over the defect; the dashed circle marks the source."
 
 
 class RetouchSidebar(BaseSidebar):
@@ -124,6 +130,40 @@ class RetouchSidebar(BaseSidebar):
         )
         self.layout.addWidget(SliderGroup(self.manual_size_slider, self.line_threshold_slider))
 
+        self.clone_subheader = section_subheader("CLONE · 0")
+        self.clone_btn = self._tool_toggle(
+            "fa5s.clone",
+            "Clone",
+            "Clone Tool: copy film from another area over a defect. Alt-click the source, then paint. Uses Brush Size",
+        )
+        self.clone_match_btn = self._small_toggle(
+            "fa5s.adjust",
+            "Match Tone",
+            conf.clone_match_tone,
+            "Keep the copied grain and detail, but match the brightness and color around the destination",
+        )
+        self.clone_undo_btn = self._icon_action("fa5s.undo", "Undo Last: remove the most recent clone stroke")
+        self.clone_clear_btn = self._icon_action("fa5s.trash-alt", "Clear All: remove all clone strokes")
+        self.layout.addLayout(header_row(self.clone_subheader, self.clone_undo_btn, self.clone_clear_btn))
+        self.clone_source_btn = self._tool_toggle(
+            "fa5s.crosshairs",
+            "Set Source",
+            "Pick a new source with the next click on the photo",
+        )
+        clone_row = QHBoxLayout()
+        for btn in (self.clone_btn, self.clone_source_btn, self.clone_match_btn):
+            clone_row.addWidget(btn, 1)
+        self.layout.addLayout(clone_row)
+        self.clone_hint = hint_label()
+        self.layout.addWidget(self.clone_hint)
+        self.clone_strength_slider = CompactSlider("Strength", 0.0, 100.0, conf.clone_strength * 100.0, step=1.0, precision=0, unit="%")
+        self.clone_strength_slider.setToolTip(
+            wrap_tooltip("How much of the source covers the destination. Lower lets the original show through")
+        )
+        self.clone_feather_slider = CompactSlider("Feather", 0.0, 100.0, conf.clone_feather * 100.0, step=1.0, precision=0, unit="%")
+        self.clone_feather_slider.setToolTip(wrap_tooltip("Fade width at the brush edge, as a share of the radius. 0 is a hard edge"))
+        self.layout.addWidget(SliderGroup(self.clone_strength_slider, self.clone_feather_slider))
+
         self.layout.addStretch()
 
         self._set_ir_controls_enabled(self.state.has_ir)
@@ -153,6 +193,19 @@ class RetouchSidebar(BaseSidebar):
         self.line_threshold_slider.valueChanged.connect(
             lambda v: self.update_config_section("retouch", readback_metrics=False, scratch_threshold=float(v))
         )
+        self.clone_btn.toggled.connect(self._on_clone_toggled)
+        self.clone_source_btn.toggled.connect(self.controller.arm_clone_source)
+        self.clone_match_btn.toggled.connect(
+            lambda c: self.update_config_section("retouch", render=False, persist=True, clone_match_tone=c)
+        )
+        self.clone_strength_slider.valueChanged.connect(
+            lambda v: self.update_config_section("retouch", render=False, persist=True, clone_strength=float(v) / 100.0)
+        )
+        self.clone_feather_slider.valueChanged.connect(
+            lambda v: self.update_config_section("retouch", render=False, persist=True, clone_feather=float(v) / 100.0)
+        )
+        self.clone_undo_btn.clicked.connect(self.controller.undo_last_clone)
+        self.clone_clear_btn.clicked.connect(self.controller.clear_clones)
         self.undo_btn.clicked.connect(self.controller.undo_last_retouch)
         self.clear_btn.clicked.connect(self.controller.clear_retouch)
         self.overlay_btn.currentChanged.connect(lambda i: self.controller.set_dust_overlay(_OVERLAY_MODES[i]))
@@ -178,7 +231,7 @@ class RetouchSidebar(BaseSidebar):
     def _brush_size_enabled(self, heal: bool, scratch: bool) -> bool:
         """The brush is sized from the canvas while an exclusion is painted, which happens
         with no tool active, so Optical Removal enables the value too."""
-        return heal or scratch or self.state.config.retouch.dust_remove
+        return heal or scratch or self.state.active_tool == ToolMode.CLONE or self.state.config.retouch.dust_remove
 
     def _on_pick_toggled(self, checked: bool) -> None:
         self.controller.set_active_tool(ToolMode.DUST_PICK if checked else ToolMode.NONE)
@@ -187,6 +240,10 @@ class RetouchSidebar(BaseSidebar):
     def _on_scratch_toggled(self, checked: bool) -> None:
         self.controller.set_active_tool(ToolMode.SCRATCH_PICK if checked else ToolMode.NONE)
         self.manual_size_slider.setEnabled(self._brush_size_enabled(self.pick_dust_btn.isChecked(), checked))
+
+    def _on_clone_toggled(self, checked: bool) -> None:
+        self.controller.set_active_tool(ToolMode.CLONE if checked else ToolMode.NONE)
+        self.manual_size_slider.setEnabled(self._brush_size_enabled(self.pick_dust_btn.isChecked(), self.pick_scratch_btn.isChecked()))
 
     def _on_line_toggled(self, checked: bool) -> None:
         # Sensitivity stands in for brush size here: the band is grown from the scratch, so what
@@ -212,6 +269,18 @@ class RetouchSidebar(BaseSidebar):
             self.pick_dust_btn.setChecked(self.state.active_tool == ToolMode.DUST_PICK)
             self.pick_scratch_btn.setChecked(self.state.active_tool == ToolMode.SCRATCH_PICK)
             self.pick_line_btn.setChecked(self.state.active_tool == ToolMode.SCRATCH_LINE)
+            cloning = self.state.active_tool == ToolMode.CLONE
+            self.clone_btn.setChecked(cloning)
+            self.clone_source_btn.setChecked(cloning and self.state.clone_picking)
+            self.clone_hint.setText(_clone_hint(self.state.clone_picking, self.state.clone_source is not None))
+            self.clone_hint.setVisible(cloning)
+            self.clone_match_btn.setChecked(conf.clone_match_tone)
+            self.clone_strength_slider.setValue(conf.clone_strength * 100.0)
+            self.clone_feather_slider.setValue(conf.clone_feather * 100.0)
+            num_clones = len(conf.clone_strokes)
+            self.clone_subheader.setText(f"CLONE · {num_clones}")
+            self.clone_undo_btn.setEnabled(num_clones > 0)
+            self.clone_clear_btn.setEnabled(num_clones > 0)
             self.manual_size_slider.setEnabled(
                 self._brush_size_enabled(self.state.active_tool == ToolMode.DUST_PICK, self.state.active_tool == ToolMode.SCRATCH_PICK)
             )
@@ -250,6 +319,11 @@ class RetouchSidebar(BaseSidebar):
             self.pick_scratch_btn,
             self.pick_line_btn,
             self.line_threshold_slider,
+            self.clone_btn,
+            self.clone_source_btn,
+            self.clone_match_btn,
+            self.clone_strength_slider,
+            self.clone_feather_slider,
             self.ir_dust_btn,
             self.ir_threshold_slider,
             self.ir_method_btn,

@@ -147,7 +147,7 @@ def test_rehome_of_one_half_leaves_the_sibling_alone(repo):
 
 
 def test_expand_half_frames_suffixes_the_legacy_hash(monkeypatch):
-    monkeypatch.setattr("negpy.services.assets.half_frame.detect_split_x_for_file", lambda _p: 0.5)
+    monkeypatch.setattr("negpy.services.assets.half_frame.detect_split_axis_for_file", lambda _p: (0.5, "x"))
     out = AssetDiscoveryWorker()._expand_half_frames([{"name": "a.tif", "path": "/p/a.tif", "hash": "v2", "legacy_hash": "v1"}])
 
     assert [a["hash"] for a in out] == ["v2#1", "v2#2"]

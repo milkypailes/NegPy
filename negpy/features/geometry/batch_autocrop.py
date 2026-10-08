@@ -16,6 +16,7 @@ import numpy as np
 from negpy.domain.types import ROI, ImageBuffer
 from negpy.features.geometry.logic import (
     BORDER_SIDES,
+    AutocropDetection,
     _closest_standard_ratio,
     _detection_luma,
     _get_threshold_autocrop_coords,
@@ -28,6 +29,10 @@ from negpy.features.geometry.logic import (
     measure_film_edges,
 )
 from negpy.features.geometry.models import FINE_ROTATION_LIMIT
+from negpy.features.geometry.skew import trusted_frame_skew
+from negpy.kernel.system.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 _TRUSTED_CONFIDENCE = 0.58
@@ -245,6 +250,51 @@ def _border_without_a_film_box(image: ImageBuffer) -> tuple[ROI, tuple[float, ..
     return box, tuple(_side_border(lum, box)[name] for name in BORDER_SIDES), _bright_side_border(lum, box)
 
 
+def _edge_fit(image: ImageBuffer) -> float | None:
+    """The rotation the four-edge fit trusts, within the automatic deskew limit, else None."""
+    try:
+        skew = trusted_frame_skew(image, fit_keystone=False)
+    except Exception:
+        # A fit that raises on every frame must not degrade the whole roll in silence.
+        logger.exception("four-edge fit failed; frame falls back to the contour angle")
+        return None
+    if skew is None:
+        return None
+    if not np.isfinite(skew.fine_rotation) or abs(skew.fine_rotation) > _MAX_AUTOMATIC_DESKEW:
+        return None
+    return float(skew.fine_rotation)
+
+
+def _no_box_evidence(
+    key: str,
+    image: ImageBuffer,
+    detection: AutocropDetection,
+    correction: float,
+    angle_confident: bool,
+    target_ratio: str,
+    rebate_trim: float,
+) -> CropEvidence:
+    """A frame with no film box at any rotation; its border walk feeds the roll's fallback template."""
+    h, w = image.shape[:2]
+    fallback_roi, fallback_border, fallback_bright = _border_without_a_film_box(image)
+    return CropEvidence(
+        key,
+        (h, w),
+        None,
+        correction,
+        0.0,
+        target_ratio=target_ratio,
+        rebate_trim=rebate_trim,
+        angle_confident=angle_confident,
+        vertical_edge_contrast=detection.vertical_edge_contrast,
+        vertical_edge_profile=np.asarray(detection.vertical_edge_profile, dtype=np.float32),
+        border=fallback_border,
+        bright_border=fallback_bright,
+        fallback_roi=fallback_roi,
+        reason="no_consensus",
+    )
+
+
 def detect_crop_candidate(
     key: str,
     image: ImageBuffer,
@@ -261,20 +311,24 @@ def detect_crop_candidate(
     h, w = image.shape[:2]
     profile, profile_contrast = _vertical_edge_profile(image)
     if w <= h:
+        skew = _edge_fit(image)
         # The roll template cannot place this frame, but the single-frame detector reads it
         # like any other. Abstaining would leave batch worse than Auto on the same frame.
+        own_angle = skew if skew is not None else 0.0
+        own_image = apply_fine_rotation(image, own_angle) if abs(own_angle) > 1e-4 else image
         try:
-            own_roi = get_autocrop_coords(image, target_ratio_str=target_ratio, rebate_trim=rebate_trim)
+            own_roi = get_autocrop_coords(own_image, target_ratio_str=target_ratio, rebate_trim=rebate_trim)
         except Exception:
             own_roi = None
         return CropEvidence(
             key,
             (h, w),
             None,
-            0.0,
+            own_angle,
             0.0,
             target_ratio=target_ratio,
             rebate_trim=rebate_trim,
+            angle_confident=skew is not None,
             vertical_edge_contrast=profile_contrast,
             vertical_edge_profile=profile,
             fallback_roi=own_roi,
@@ -282,44 +336,34 @@ def detect_crop_candidate(
         )
 
     initial = detect_film_bounds_with_confidence(image)
-    if initial.roi is None:
-        fallback_roi, fallback_border, fallback_bright = _border_without_a_film_box(image)
-        return CropEvidence(
-            key,
-            (h, w),
-            None,
-            0.0,
-            0.0,
-            target_ratio=target_ratio,
-            rebate_trim=rebate_trim,
-            vertical_edge_contrast=initial.vertical_edge_contrast,
-            vertical_edge_profile=np.asarray(initial.vertical_edge_profile, dtype=np.float32),
-            border=fallback_border,
-            bright_border=fallback_bright,
-            fallback_roi=fallback_roi,
-            reason="no_consensus",
-        )
-
-    correction = float(initial.correction_angle)
+    correction = float(initial.correction_angle) if initial.roi is not None else 0.0
     if not np.isfinite(correction) or abs(correction) > _MAX_AUTOMATIC_DESKEW:
         correction = 0.0
 
     # Before rotating, not after: the re-detection below then measures the ROI at the final
     # angle, so no rect has to be remapped.
     #
-    # The fit reads the film's own top edge on the unrotated frame, so it returns the whole
-    # angle, not a residual on top of the contour's. It replaces that angle when the two agree,
-    # and confirms it by agreeing, being the more direct measurement of the two. Disagreement
-    # past _MAX_EDGE_FIT_DELTA means one of them is not reading the film edge, and neither can
-    # be called confirmed.
-    fitted = _top_edge_slope(_detection_luma(image), initial.roi)
+    # The top-edge fit returns the whole angle; agreeing with the contour's, it replaces and confirms it.
+    # Otherwise the costly four-edge fit decides.
+    fitted = _top_edge_slope(_detection_luma(image), initial.roi) if initial.roi is not None else None
     angle_confident = fitted is not None and abs(fitted - correction) <= _MAX_EDGE_FIT_DELTA
     if angle_confident:
         correction = float(np.clip(fitted, -_MAX_AUTOMATIC_DESKEW, _MAX_AUTOMATIC_DESKEW))
+    else:
+        skew = _edge_fit(image)
+        if skew is not None:
+            correction = skew
+            angle_confident = True
+        elif initial.roi is None:
+            return _no_box_evidence(key, image, initial, 0.0, False, target_ratio, rebate_trim)
 
     corrected = apply_fine_rotation(image, correction) if abs(correction) > 1e-4 else image
-    final = detect_film_bounds_with_confidence(corrected)
+    # The detector is deterministic, so an unrotated frame reuses its detection.
+    final = initial if corrected is image else detect_film_bounds_with_confidence(corrected)
     if final.roi is None:
+        if initial.roi is None:
+            # Keeps the fallback payload: an opaque-holder roll's template rests on it.
+            return _no_box_evidence(key, corrected, final, correction, angle_confident, target_ratio, rebate_trim)
         return CropEvidence(
             key,
             corrected.shape[:2],
@@ -772,7 +816,7 @@ def _own_crop(item: CropEvidence) -> list[ResolvedCrop]:
         ResolvedCrop(
             key=item.key,
             crop_rect=rect,
-            correction_angle=0.0,
+            correction_angle=item.correction_angle,
             confidence=_OWN_CROP_CONFIDENCE,
             calibrated=False,
         )
@@ -785,8 +829,10 @@ def resolve_roll_crops(
     safety_border: float = _DEFAULT_SAFETY_BORDER,
 ) -> list[ResolvedCrop]:
     """Resolve trustworthy and template-supported frames; ambiguous frames abstain."""
+    # A portrait frame's rect and fitted angle describe a different canvas.
+    pooled = [item for item in evidence if item.reason != "unsupported_orientation"]
     templates = {
-        ratio: build_roll_template([item for item in evidence if item.target_ratio == ratio])
+        ratio: build_roll_template([item for item in pooled if item.target_ratio == ratio])
         for ratio in dict.fromkeys(item.target_ratio for item in evidence)
     }
 

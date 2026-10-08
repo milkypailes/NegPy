@@ -3,7 +3,7 @@ import unittest
 from dataclasses import replace
 
 from negpy.desktop.controller import history_step_label
-from negpy.desktop.session import AppState, DesktopSessionManager
+from negpy.desktop.session import DesktopSessionManager
 from negpy.domain.models import LabConfig, WorkspaceConfig
 from negpy.infrastructure.storage.repository import StorageRepository
 
@@ -52,6 +52,7 @@ class TestJumpToStep(unittest.TestCase):
         self.repo.initialize()
         self.session = DesktopSessionManager(self.repo)
         self.session.state.current_file_hash = "h"
+        self.start_cfg = self.session.state.config
 
         self.cfg_a = _exposure_variant()
         self.cfg_b = replace(self.cfg_a, lab=replace(self.cfg_a.lab, **_first_diff_field(self.cfg_a.lab, LabConfig)))
@@ -68,7 +69,7 @@ class TestJumpToStep(unittest.TestCase):
     def test_jump_back_loads_old_config(self):
         self.session.jump_to_step(0)
         self.assertEqual(self.session.state.undo_index, 0)
-        self.assertEqual(self.session.state.config, AppState().config)
+        self.assertEqual(self.session.state.config, self.start_cfg)
 
     def test_jump_from_top_persists_live_state(self):
         # Jumping away from the unsaved top must keep it reachable.

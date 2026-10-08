@@ -416,6 +416,40 @@ def test_run_batch_keeps_film_loaded_when_asked() -> None:
     assert service.eject_calls == []
 
 
+class _ReturnedService(_BatchService):
+    def run_scan(self, device_id, params, progress, cancel):
+        from negpy.infrastructure.scanners.base import StripReturned
+
+        self.frames.append(params.frame)
+        raise StripReturned(loaded=False)
+
+
+def test_run_batch_reports_a_returned_strip_after_its_error_and_scans_nothing_more() -> None:
+    worker = ScanWorker()
+    service = _ReturnedService()
+    worker._service = service  # type: ignore[assignment]
+    events: list[str] = []
+    worker.error.connect(lambda _msg: events.append("error"))
+    worker.strip_returned.connect(lambda loaded: events.append(f"returned loaded={loaded}"))
+
+    worker.run_batch(_batch_request((2, 3, 4)))
+
+    assert events == ["error", "returned loaded=False"]
+    assert service.frames == [2]
+    assert service.eject_calls == []
+
+
+def test_run_batch_failure_is_not_a_returned_strip() -> None:
+    worker = ScanWorker()
+    worker._service = _BatchService(fail_on=3)  # type: ignore[assignment]
+    returned: list[None] = []
+    worker.strip_returned.connect(lambda _loaded: returned.append(None))
+
+    worker.run_batch(_batch_request((2, 3, 4)))
+
+    assert returned == []
+
+
 def test_run_batch_does_not_eject_when_stopped() -> None:
     worker = ScanWorker()
     service = _BatchService(cancel_before=3)

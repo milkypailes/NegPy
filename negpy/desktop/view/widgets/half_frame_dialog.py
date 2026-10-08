@@ -1,15 +1,4 @@
-"""Modal pop-up: position a crop rectangle and a split centerline for half-frame scans.
-
-The widget shows a positive preview of one scan. A draggable/resizable rectangle
-defines what is kept (everything outside is discarded). A vertical centerline
-inside the rectangle marks the split between the two halves; its thickness
-discards a band centered on it (the physical black separator between exposures).
-
-Read after ``exec()`` via ``crop_rect()``, ``split_x()``, ``gutter_thickness()`` and
-``scope()`` — the Apply button's own split-button picks what the result gets
-applied to (this frame, the selection, or the whole roll); the caller only carries
-out whichever the user picked.
-"""
+"""Half-frame crop and split dialog. After ``exec()``, ``scope()`` names the frames Apply targets."""
 
 from typing import Optional
 
@@ -23,12 +12,13 @@ from PyQt6.QtWidgets import (
     QLabel,
     QMenu,
     QPushButton,
+    QRadioButton,
     QSizePolicy,
     QSlider,
     QVBoxLayout,
 )
 
-from negpy.desktop.view.styles.templates import pin_dialog_default
+from negpy.desktop.view.styles.templates import field_label, pin_dialog_default, wrap_tooltip
 from negpy.desktop.view.styles.theme import THEME
 from negpy.desktop.view.widgets.dialog_geometry import remember_dialog_geometry
 from negpy.desktop.view.widgets.split_button import make_split_button
@@ -73,8 +63,9 @@ class _HalfFrameLabel(QLabel):
         self.setCursor(Qt.CursorShape.CrossCursor)
         self._pixmap: Optional[QPixmap] = None
         self._rect: tuple[float, float, float, float] = (0.0, 0.0, 1.0, 1.0)
-        # split_x is relative to the cropped rect width
+        # The split is relative to the cropped rect's extent along the split axis.
         self._split_x: float = 0.5
+        self._axis: str = "x"
         self._gutter: float = 0.0
         self._mode: Optional[str] = None  # "draw" | "move" | "resize" | "split"
         self._active_corner: Optional[int] = None
@@ -99,6 +90,13 @@ class _HalfFrameLabel(QLabel):
     def set_gutter(self, gutter: float) -> None:
         self._gutter = _clamp01(gutter)
         self.update()
+
+    def set_axis(self, axis: str) -> None:
+        self._axis = "y" if axis == "y" else "x"
+        self.update()
+
+    def axis_value(self) -> str:
+        return self._axis
 
     def rect_value(self) -> tuple[float, float, float, float]:
         x1, y1, x2, y2 = self._rect
@@ -138,7 +136,11 @@ class _HalfFrameLabel(QLabel):
         return QRect(QPoint(ax, ay), QPoint(bx, by)).normalized()
 
     def _split_in_widget(self, draw_rect: QRect) -> int:
-        x1, _, x2, _ = self.rect_value()
+        """Widget pixel of the split line along the split axis."""
+        x1, y1, x2, y2 = self.rect_value()
+        if self._axis == "y":
+            cy = y1 + self._split_x * (y2 - y1)
+            return draw_rect.y() + int(cy * draw_rect.height())
         cx = x1 + self._split_x * (x2 - x1)
         return draw_rect.x() + int(cx * draw_rect.width())
 
@@ -168,8 +170,13 @@ class _HalfFrameLabel(QLabel):
             return
         # Split line grab: inside the rect, near the centerline
         x1, y1, x2, y2 = r
-        cx = x1 + self._split_x * (x2 - x1)
-        if y1 <= fy <= y2 and abs(fx - cx) <= _SPLIT_TOL:
+        if self._axis == "y":
+            cy = y1 + self._split_x * (y2 - y1)
+            on_line = x1 <= fx <= x2 and abs(fy - cy) <= _SPLIT_TOL
+        else:
+            cx = x1 + self._split_x * (x2 - x1)
+            on_line = y1 <= fy <= y2 and abs(fx - cx) <= _SPLIT_TOL
+        if on_line:
             self._mode = "split"
             return
         if x1 <= fx <= x2 and y1 <= fy <= y2:
@@ -206,9 +213,11 @@ class _HalfFrameLabel(QLabel):
                 ny2 = 1.0
             self._rect = (nx1, ny1, nx2, ny2)
         elif self._mode == "split":
-            x1, _, x2, _ = self.rect_value()
-            span = max(1e-6, x2 - x1)
-            self._split_x = _clamp01((fx - x1) / span)
+            x1, y1, x2, y2 = self.rect_value()
+            if self._axis == "y":
+                self._split_x = _clamp01((fy - y1) / max(1e-6, y2 - y1))
+            else:
+                self._split_x = _clamp01((fx - x1) / max(1e-6, x2 - x1))
         self.update()
 
     def mouseReleaseEvent(self, _ev: QMouseEvent) -> None:
@@ -273,18 +282,28 @@ class _HalfFrameLabel(QLabel):
             for corner in (wr.topLeft(), wr.topRight(), wr.bottomRight(), wr.bottomLeft()):
                 painter.drawRect(QRect(corner.x() - _HANDLE_PX, corner.y() - _HANDLE_PX, 2 * _HANDLE_PX, 2 * _HANDLE_PX))
             # Split centerline + gutter band
-            x1, _, x2, _ = r
-            span = max(1e-6, x2 - x1)
-            cx = self._split_in_widget(draw_rect)
-            gw = max(0, int(self._gutter * span * draw_rect.width()))
+            x1, y1, x2, y2 = r
+            c = self._split_in_widget(draw_rect)
+            if self._axis == "y":
+                span = max(1e-6, y2 - y1)
+                gw = max(0, int(self._gutter * span * draw_rect.height()))
+            else:
+                span = max(1e-6, x2 - x1)
+                gw = max(0, int(self._gutter * span * draw_rect.width()))
             if gw > 0:
                 painter.setPen(Qt.PenStyle.NoPen)
                 painter.setBrush(_with_alpha(THEME.warn_amber, 120))
-                painter.drawRect(QRect(cx - gw // 2, wr.top(), gw, wr.height()))
+                if self._axis == "y":
+                    painter.drawRect(QRect(wr.left(), c - gw // 2, wr.width(), gw))
+                else:
+                    painter.drawRect(QRect(c - gw // 2, wr.top(), gw, wr.height()))
             pen = QPen(QColor(THEME.warn_amber), 2)
             pen.setStyle(Qt.PenStyle.DashLine)
             painter.setPen(pen)
-            painter.drawLine(cx, wr.top(), cx, wr.bottom())
+            if self._axis == "y":
+                painter.drawLine(wr.left(), c, wr.right(), c)
+            else:
+                painter.drawLine(c, wr.top(), c, wr.bottom())
         else:
             painter.fillRect(self.rect(), QColor(THEME.bg_dark))
             painter.setPen(QColor(THEME.text_muted))
@@ -295,8 +314,8 @@ class _HalfFrameLabel(QLabel):
 class HalfFrameDialog(QDialog):
     """Pick a crop rectangle and a split centerline for half-frame scans.
 
-    Returns a ``(crop_rect, split_x, gutter_thickness)`` triple; all normalized
-    fractions. ``split_x`` is relative to the cropped rect width.
+    Returns ``(crop_rect, split_x, gutter_thickness, split_axis)``; all normalized
+    fractions. ``split_x`` is relative to the cropped rect's extent along the axis.
     """
 
     def __init__(
@@ -305,6 +324,7 @@ class HalfFrameDialog(QDialog):
         initial_rect: Optional[tuple[float, float, float, float]] = None,
         initial_split: Optional[float] = None,
         initial_gutter: Optional[float] = None,
+        initial_axis: str = "x",
         initial_scope: str = "current",
         process_mode: str = "",
         title: str = "Half Frame — split & crop",
@@ -331,8 +351,21 @@ class HalfFrameDialog(QDialog):
         hint.setStyleSheet(f"color: {THEME.text_hint};")
         layout.addWidget(hint)
 
+        axis_row = QHBoxLayout()
+        axis_row.addWidget(field_label("Split direction"))
+        self._axis_vertical = QRadioButton("Vertical")
+        self._axis_vertical.setToolTip(wrap_tooltip("A vertical cut: the two halves sit side by side."))
+        self._axis_horizontal = QRadioButton("Horizontal")
+        self._axis_horizontal.setToolTip(wrap_tooltip("A horizontal cut: the two halves sit stacked, as a rotated scan lays them."))
+        self._axis_vertical.toggled.connect(lambda on: on and self._set_axis("x"))
+        self._axis_horizontal.toggled.connect(lambda on: on and self._set_axis("y"))
+        axis_row.addWidget(self._axis_vertical)
+        axis_row.addWidget(self._axis_horizontal)
+        axis_row.addStretch()
+        layout.addLayout(axis_row)
+
         gutter_row = QHBoxLayout()
-        gutter_row.addWidget(QLabel("Cut thickness"))
+        gutter_row.addWidget(field_label("Cut thickness"))
         self._gutter_slider = QSlider(Qt.Orientation.Horizontal)
         self._gutter_slider.setRange(0, 100)
         self._gutter_slider.setValue(int((initial_gutter or 0.0) * 1000))
@@ -380,6 +413,7 @@ class HalfFrameDialog(QDialog):
         self._label.set_rect(initial_rect or (0.0, 0.0, 1.0, 1.0))
         self._label.set_split(initial_split if initial_split is not None else 0.5)
         self._label.set_gutter(initial_gutter or 0.0)
+        self._set_axis(initial_axis)
         self._label.changed.connect(self._update_gutter_label)
         self._update_gutter_label()
         remember_dialog_geometry(self, repo, "half_frame")
@@ -411,20 +445,27 @@ class HalfFrameDialog(QDialog):
         self._gutter_label.setText(f"{g * 100:.1f}%")
 
     def _on_auto(self) -> None:
-        from negpy.services.assets.half_frame import detect_film_crop, detect_gutter, slice_half
+        from negpy.services.assets.half_frame import detect_film_crop, detect_gutter_axis, slice_half
 
         crop_rect = detect_film_crop(self._preview_rgb)
-        # split_x is relative to the cropped width (slice_half's own convention), so the
-        # gutter search has to run inside the new crop, not the full, uncropped scan.
+        # The split is relative to the crop (slice_half's convention): search for the gutter inside it.
         detect_buf = self._preview_rgb
         if crop_rect is not None:
             self._label.set_rect(crop_rect)
             detect_buf = slice_half(self._preview_rgb, 0, 0.5, crop_rect=crop_rect)
-        sx, gutter = detect_gutter(detect_buf)
-        self._label.set_split(sx)
+        split, gutter, axis = detect_gutter_axis(detect_buf)
+        self._set_axis(axis)
+        self._label.set_split(split)
         self._label.set_gutter(gutter)
         self._gutter_slider.setValue(int(gutter * 1000))
         self._update_gutter_label()
+
+    def _set_axis(self, axis: str) -> None:
+        axis = "y" if axis == "y" else "x"
+        self._label.set_axis(axis)
+        btn = self._axis_horizontal if axis == "y" else self._axis_vertical
+        if not btn.isChecked():
+            btn.setChecked(True)
 
     def _set_scope(self, key: str) -> None:
         self._scope = key
@@ -434,6 +475,7 @@ class HalfFrameDialog(QDialog):
     def _on_reset(self) -> None:
         self._label.set_rect((0.0, 0.0, 1.0, 1.0))
         self._label.set_split(0.5)
+        self._set_axis("x")
         self._label.set_gutter(0.0)
         self._gutter_slider.setValue(0)
         self._update_gutter_label()
@@ -448,6 +490,10 @@ class HalfFrameDialog(QDialog):
 
     def gutter_thickness(self) -> float:
         return self._label.gutter_value()
+
+    def split_axis(self) -> str:
+        """The split direction: "x" cuts left/right, "y" top/bottom."""
+        return self._label.axis_value()
 
     def scope(self) -> str:
         """What Apply was set to when clicked: 'current', 'selected' or 'all'."""

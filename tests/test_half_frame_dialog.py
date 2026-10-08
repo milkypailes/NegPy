@@ -54,7 +54,7 @@ class TestApplyScope:
 
 class TestAutoDetect:
     def test_sets_both_split_and_gutter_thickness(self, monkeypatch):
-        monkeypatch.setattr("negpy.services.assets.half_frame.detect_gutter", lambda buf: (0.42, 0.03))
+        monkeypatch.setattr("negpy.services.assets.half_frame.detect_gutter_axis", lambda buf: (0.42, 0.03, "x"))
         d = _dialog()
         d._on_auto()
         assert d.split_x() == 0.42
@@ -62,7 +62,7 @@ class TestAutoDetect:
         assert d._gutter_slider.value() == 30
 
     def test_a_rejected_detection_resets_both(self, monkeypatch):
-        monkeypatch.setattr("negpy.services.assets.half_frame.detect_gutter", lambda buf: (0.5, 0.0))
+        monkeypatch.setattr("negpy.services.assets.half_frame.detect_gutter_axis", lambda buf: (0.5, 0.0, "x"))
         d = _dialog(initial_split=0.3, initial_gutter=0.05)
         d._on_auto()
         assert d.split_x() == 0.5
@@ -71,7 +71,7 @@ class TestAutoDetect:
 
     def test_also_sets_the_crop(self, monkeypatch):
         monkeypatch.setattr("negpy.services.assets.half_frame.detect_film_crop", lambda buf: (0.1, 0.1, 0.9, 0.9))
-        monkeypatch.setattr("negpy.services.assets.half_frame.detect_gutter", lambda buf: (0.5, 0.0))
+        monkeypatch.setattr("negpy.services.assets.half_frame.detect_gutter_axis", lambda buf: (0.5, 0.0, "x"))
         d = _dialog()
         d._on_auto()
         assert d.crop_rect() == (0.1, 0.1, 0.9, 0.9)
@@ -84,16 +84,16 @@ class TestAutoDetect:
 
         def _fake_gutter(buf):
             seen["width"] = buf.shape[1]
-            return 0.5, 0.0
+            return 0.5, 0.0, "x"
 
-        monkeypatch.setattr("negpy.services.assets.half_frame.detect_gutter", _fake_gutter)
+        monkeypatch.setattr("negpy.services.assets.half_frame.detect_gutter_axis", _fake_gutter)
         d = _dialog()  # buf is 32x48
         d._on_auto()
         assert seen["width"] == 24  # [0.25, 0.75) of 48
 
     def test_keeps_the_full_frame_when_crop_detection_fails(self, monkeypatch):
         monkeypatch.setattr("negpy.services.assets.half_frame.detect_film_crop", lambda buf: None)
-        monkeypatch.setattr("negpy.services.assets.half_frame.detect_gutter", lambda buf: (0.42, 0.03))
+        monkeypatch.setattr("negpy.services.assets.half_frame.detect_gutter_axis", lambda buf: (0.42, 0.03, "x"))
         d = _dialog()
         d._on_auto()
         assert d.crop_rect() == (0.0, 0.0, 1.0, 1.0)
@@ -138,3 +138,20 @@ class TestPreviewPolarity:
         shown = self._shown(HalfFrameDialog(buf, process_mode="Transparency"))
         assert shown.shape == (32, 48, 3)
         assert shown[0, 0, 0] < shown[0, -1, 0]
+
+
+class TestSplitAxis:
+    def test_initial_axis_round_trips(self):
+        d = _dialog(initial_axis="y")
+        assert d.split_axis() == "y"
+        assert d._axis_horizontal.isChecked()
+        d._axis_vertical.setChecked(True)
+        assert d.split_axis() == "x"
+
+    def test_auto_detect_sets_the_axis(self, monkeypatch):
+        monkeypatch.setattr("negpy.services.assets.half_frame.detect_film_crop", lambda buf: None)
+        monkeypatch.setattr("negpy.services.assets.half_frame.detect_gutter_axis", lambda buf: (0.52, 0.02, "y"))
+        d = _dialog()
+        d._on_auto()
+        assert d.split_axis() == "y"
+        assert d._axis_horizontal.isChecked()

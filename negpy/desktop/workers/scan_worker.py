@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
 
 from negpy.desktop.power_assertion import acquire_unattended_power_assertion
-from negpy.infrastructure.scanners.base import ScannerDevice, ScannerUnavailable
+from negpy.infrastructure.scanners.base import ScannerDevice, ScannerUnavailable, StripReturned
 from negpy.infrastructure.scanners.params import ScanParams
 from negpy.services.scanning.service import ScannerService
 from negpy.kernel.system.logging import get_logger
@@ -20,6 +20,7 @@ class ScanRequest:
     output_folder: str
     filename_pattern: str
     output_format: str  # one of settings.OUTPUT_FORMATS
+    as_roll: bool = False
 
 
 @dataclass(frozen=True)
@@ -64,6 +65,7 @@ class BatchRequest:
     # Per-frame correction (mm) on top of that ramp; an absent key means none.
     frame_offsets: dict[int, float] = field(default_factory=dict)
     eject_when_done: bool = True
+    as_roll: bool = False
 
 
 @dataclass(frozen=True)
@@ -94,6 +96,8 @@ class ScanWorker(QObject):
     error = pyqtSignal(str)
     ejected = pyqtSignal(bool)
     eject_error = pyqtSignal(str)
+    # Emitted after the operation's own error, so a listener that clears the frame state has the last word.
+    strip_returned = pyqtSignal(bool)  # the strip is back in the holder
     roll_preview_ready = pyqtSignal(object)  # roll preview: one RollPreview per slot
     roll_preview_finished = pyqtSignal()  # the whole strip is done (also after a failed slot)
     prescan_ready = pyqtSignal(object)  # ScanResult RGB preview (no file written)
@@ -160,6 +164,7 @@ class ScanWorker(QObject):
             self._scanning = True
 
         outcome: tuple[str, str | None] | None = None
+        returned: StripReturned | None = None
         try:
             if self._cancel_event.is_set():
                 outcome = ("cancelled", None)
@@ -175,6 +180,7 @@ class ScanWorker(QObject):
                         cancel=self._cancel_event,
                     )
                 except Exception as error:
+                    returned = error if isinstance(error, StripReturned) else None
                     if self._cancel_event.is_set():
                         outcome = ("cancelled", None)
                     else:
@@ -214,6 +220,8 @@ class ScanWorker(QObject):
             self.cancelled.emit()
         else:
             self.error.emit(payload or "Unknown scan error")
+        if returned is not None:
+            self.strip_returned.emit(returned.loaded)
 
     @pyqtSlot(BatchRequest)
     def run_batch(self, req: BatchRequest) -> None:
@@ -233,6 +241,7 @@ class ScanWorker(QObject):
         assertion = acquire_unattended_power_assertion("NegPy film scan batch")
         paths: list[str] = []
         outcome: tuple[str, str | None] = ("finished", None)
+        returned: StripReturned | None = None
         try:
             service = self._ensure_service()
             frames = list(req.frames) or self._whole_strip(service, req)
@@ -259,6 +268,7 @@ class ScanWorker(QObject):
                 try:
                     result = service.run_scan(req.device_id, frame_params, _progress, self._cancel_event)
                 except Exception as error:
+                    returned = error if isinstance(error, StripReturned) else None
                     if self._cancel_event.is_set():
                         outcome = ("cancelled", None)
                     else:
@@ -284,6 +294,7 @@ class ScanWorker(QObject):
                 self.frame_done.emit(frame, path)
         except Exception as error:
             logger.exception("Could not run scan batch")
+            returned = error if isinstance(error, StripReturned) else None
             outcome = ("error", str(error))
         finally:
             assertion.release()
@@ -296,6 +307,8 @@ class ScanWorker(QObject):
             self.cancelled.emit()
         elif kind == "error":
             self.error.emit(payload or "Unknown scan error")
+            if returned is not None:
+                self.strip_returned.emit(returned.loaded)
         elif kind == "finished" and req.eject_when_done:
             # Return the strip, so it need not wait for the feeder's auto-park. A capability-gated
             # no-op on devices without an eject option.
@@ -323,6 +336,7 @@ class ScanWorker(QObject):
             self._scanning = True
 
         outcome: tuple[str, str | None] = ("finished", None)
+        returned: StripReturned | None = None
         try:
             if self._cancel_event.is_set():
                 outcome = ("cancelled", None)
@@ -340,6 +354,7 @@ class ScanWorker(QObject):
                     outcome = ("cancelled", None)
         except Exception as error:
             logger.exception("Could not preview the strip")
+            returned = error if isinstance(error, StripReturned) else None
             outcome = ("cancelled", None) if self._cancel_event.is_set() else ("error", str(error))
         finally:
             with self._state_lock:
@@ -352,6 +367,8 @@ class ScanWorker(QObject):
             self.error.emit(payload or "Unknown scan error")
         else:
             self.roll_preview_finished.emit()
+        if returned is not None:
+            self.strip_returned.emit(returned.loaded)
 
     @pyqtSlot(PrescanRequest)
     def run_prescan(self, req: PrescanRequest) -> None:
@@ -367,6 +384,7 @@ class ScanWorker(QObject):
             self._scanning = True
 
         outcome: tuple[str, object | None] = ("finished", None)
+        returned: StripReturned | None = None
         try:
             if self._cancel_event.is_set():
                 outcome = ("cancelled", None)
@@ -392,6 +410,7 @@ class ScanWorker(QObject):
                     outcome = ("finished", result)
         except Exception as error:
             logger.exception("Prescan failed")
+            returned = error if isinstance(error, StripReturned) else None
             outcome = ("cancelled", None) if self._cancel_event.is_set() else ("error", str(error))
         finally:
             with self._state_lock:
@@ -404,6 +423,8 @@ class ScanWorker(QObject):
             self.prescan_error.emit(str(payload or "Unknown prescan error"))
         else:
             self.prescan_ready.emit(payload)
+        if returned is not None:
+            self.strip_returned.emit(returned.loaded)
 
     @pyqtSlot(MeterRequest)
     def run_meter(self, req: MeterRequest) -> None:
@@ -421,6 +442,7 @@ class ScanWorker(QObject):
             frame_offset_mm=frame_offset_mm(req.params.frame_offset_mm, req.frame_offset_modifier_mm, req.frame_offsets, frame),
         )
         outcome: tuple[str, object | None] = ("finished", None)
+        returned: StripReturned | None = None
         try:
             if self._cancel_event.is_set():
                 outcome = ("cancelled", None)
@@ -434,6 +456,7 @@ class ScanWorker(QObject):
                 outcome = ("cancelled", None) if self._cancel_event.is_set() else ("finished", exposures)
         except Exception as error:
             logger.exception("Metering failed")
+            returned = error if isinstance(error, StripReturned) else None
             outcome = ("cancelled", None) if self._cancel_event.is_set() else ("error", str(error))
         finally:
             with self._state_lock:
@@ -446,6 +469,8 @@ class ScanWorker(QObject):
             self.meter_error.emit(str(payload or "Unknown metering error"))
         else:
             self.exposure_metered.emit(payload, frame)
+        if returned is not None:
+            self.strip_returned.emit(returned.loaded)
 
     def prepare_scan(self) -> None:
         """Arm one queued scan without losing a Stop pressed before it starts."""

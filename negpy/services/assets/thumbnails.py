@@ -10,6 +10,7 @@ from negpy.infrastructure.loaders.factory import loader_factory
 from negpy.infrastructure.loaders.helpers import NonStandardFileWrapper, embedded_preview
 from negpy.infrastructure.display.color_spaces import WORKING_COLOR_SPACE
 from negpy.kernel.system.logging import get_logger
+from negpy.services.assets.thumbnail_fingerprint import QUICK
 
 logger = get_logger(__name__)
 
@@ -200,6 +201,7 @@ def get_thumbnail_worker(
     gutter_thickness: float = 0.0,
     process_mode: str = "",
     *,
+    split_axis: str = "x",
     fast_only: bool = False,
     should_cancel: Optional[Callable[[], bool]] = None,
 ) -> Optional[Image.Image]:
@@ -228,7 +230,9 @@ def get_thumbnail_worker(
         if half:
             from negpy.services.assets.half_frame import slice_half
 
-            img = Image.fromarray(slice_half(np.asarray(img), half, split_x, crop_rect=crop_rect, gutter_thickness=gutter_thickness))
+            img = Image.fromarray(
+                slice_half(np.asarray(img), half, split_x, crop_rect=crop_rect, gutter_thickness=gutter_thickness, split_axis=split_axis)
+            )
 
         # Shrink before the inversion, not after: preview_positive is float math over every
         # pixel, and on a full-size decode its temporaries cost a gigabyte per worker.
@@ -236,7 +240,7 @@ def get_thumbnail_worker(
         square_img: Image.Image = prepare_thumbnail(preview_positive(img, process_mode), ts)
 
         if asset_store:
-            asset_store.save_thumbnail(cache_key, square_img)
+            asset_store.save_thumbnail(cache_key, square_img, fingerprint=QUICK)
 
         return square_img
     except InterruptedError:
@@ -253,6 +257,7 @@ def get_rendered_thumbnail(
     color_space: str = WORKING_COLOR_SPACE,
     monitor_icc_bytes: Optional[bytes] = None,
     proof: Optional[tuple] = None,
+    fingerprint: Optional[str] = None,
 ) -> Optional[Image.Image]:
     """
     Creates a thumbnail from a rendered float32 buffer, applying the same display
@@ -278,7 +283,7 @@ def get_rendered_thumbnail(
         square_img: Image.Image = prepare_thumbnail(img, ts)
 
         if asset_store:
-            asset_store.save_thumbnail(file_hash, square_img)
+            asset_store.save_thumbnail(file_hash, square_img, fingerprint=fingerprint)
 
         return square_img
     except Exception as e:

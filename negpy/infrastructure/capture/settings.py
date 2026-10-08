@@ -42,10 +42,9 @@ class ScanlightSettings:
     shutter_w: str = ""
     iso: str = ""  # RGB preset's calibrated ISO/aperture, forced on the body at scan time
     aperture: str = ""  # "" for a manual-aperture lens (set by hand on the ring)
+    single_capture: bool = False  # the RGB preset lights R, G and B together for one exposure
     inter_exposure_delay_ms: int = 0
     white_process_mode: WhiteCaptureMode = WhiteCaptureMode.AUTO
-    roll_name: str = "Roll001"
-    output_folder: str = ""
     port: str = ""  # Scanlight serial port ("" = autodetect); the camera needs no address
 
     def __post_init__(self) -> None:

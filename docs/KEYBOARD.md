@@ -38,6 +38,7 @@ Actions with no default key are not listed; every one of them can still be bound
 | `Shift + D` | Toggle heal tool |
 | `Shift + S` | Toggle scratch tool |
 | `Shift + K` | Toggle transport-scratch line tool |
+| `Shift + J` | Toggle clone tool |
 | `Shift + B` | Toggle dodge & burn mask draw |
 | `Ctrl + R` | Toggle analysis region draw |
 | `M` | Peek flat scan (digital intermediate) |
@@ -162,6 +163,12 @@ Actions with no default key are not listed; every one of them can still be bound
 | `Ctrl + 9` | Scan tab |
 | `Ctrl + 0` | Favorites tab |
 
+## Camera Live View
+| Key | Action |
+|-----|--------|
+| `S` | Scan, or stop the capture |
+| `R` | Retake the current frame |
+
 ## Help
 | Key | Action |
 |-----|--------|
@@ -178,6 +185,7 @@ While a test strip or ring-around is up, `[` and `]` turn that proof's ladder in
 | `Pinch` | Zoom in / out; sizes the brush instead while the Heal or Scratch tool is live, or a right-click is set to exclude |
 | `Middle Click` + `Drag` | Pan zoomed image |
 | `Left Click` + `Drag` | Pan zoomed image (when no tool is active) |
+| `Space` + `Left-Drag` | Pan zoomed image while a canvas tool is active |
 
 ## Menu bar (macOS only)
 

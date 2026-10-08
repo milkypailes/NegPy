@@ -78,12 +78,39 @@ DROPPED_KEYS: frozenset[str] = frozenset(
         "e6_normalize",
         # Batch metadata sync: Metadata cards are roll defaults, so every frame already carries the roll's values.
         "sync_to_batch",
+        # The pixel-grid contact sheet; the darkroom sheet keeps its settings app-wide, not per edit.
+        "contact_sheet_cell_px",
+        "contact_sheet_gap",
+        "contact_sheet_margin",
+        "contact_sheet_max_tiles",
+        "contact_sheet_show_labels",
+        "contact_sheet_background_color",
+        "contact_sheet_label_color",
+        "contact_sheet_template",
+        "contact_sheet_default_cell_px",
+        "contact_sheet_default_gap",
+        "contact_sheet_default_margin",
+        "contact_sheet_default_max_tiles",
+        "contact_sheet_default_show_labels",
+        "contact_sheet_default_background_color",
+        "contact_sheet_default_label_color",
     }
 )
 
 # Retired export formats -> the closest surviving one. DNG maps to TIFF, the other
 # 16-bit master, so a saved DNG preset keeps its bit depth instead of 8-bit JPEG.
 RETIRED_EXPORT_FORMATS: Dict[str, str] = {"DNG": "TIFF"}
+
+# Renamed crosstalk profile display names, old -> current. The Portra entries follow
+# Kodak's 2026 rebrand of the line to Ektacolor Pro; the datasheets were not re-issued,
+# so the old name stays in the display name. Applied in ProcessConfig.__post_init__,
+# not here: roll defaults overlay the field raw, outside any flat-config load.
+CROSSTALK_PROFILE_RENAMES: Dict[str, str] = {
+    "Default": "Generic C41",
+    "Kodak Portra 160 (approx)": "Kodak Ektacolor Pro 160 / Portra 160 (approx)",
+    "Kodak Portra 400 (approx)": "Kodak Ektacolor Pro 400 / Portra 400 (approx)",
+    "Kodak Portra 800 (approx)": "Kodak Ektacolor Pro 800 / Portra 800 (approx)",
+}
 
 
 def migrate_export_fmt(fmt: str) -> str:
@@ -140,12 +167,6 @@ def migrate_flat_config(data: Dict[str, Any]) -> Dict[str, Any]:
     if "color_separation" in data and "crosstalk_strength" not in data:
         data["crosstalk_strength"] = min(max(float(data.pop("color_separation")) - 1.0, 0.0), 1.0)
     data.pop("color_separation", None)
-
-    # The built-in crosstalk profile "Default" became "Generic C41". Saved edits store
-    # the display name, so without this the dropdown selects the wrong row. The render
-    # is unaffected: a None matrix still falls back to the built-in.
-    if data.get("crosstalk_profile") == "Default":
-        data["crosstalk_profile"] = "Generic C41"
 
     # Vignette became an exposure-domain burn: old ±1 strength (neg = darken) maps
     # to stops (pos = burn) with an approximate look-preserving factor.

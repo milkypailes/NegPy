@@ -240,19 +240,14 @@ class TestThumbnailStreaming(unittest.TestCase):
             worker._cancel_requested.set()
             return Image.new("RGB", (4, 4))
 
-        render_workers._DECODE_MEMORY_GATE.acquire()
-        try:
-            with patch("negpy.services.assets.thumbnails.get_thumbnail_worker", side_effect=thumbnail):
-                thread = threading.Thread(target=worker._process_next)
+        with patch("negpy.services.assets.thumbnails.get_thumbnail_worker", side_effect=thumbnail):
+            thread = threading.Thread(target=worker._process_next)
+            with render_workers._DECODE_MEMORY_GATE.hold("foreground", "/tmp/selected.arw"):
                 thread.start()
                 self.assertFalse(entered.wait(0.1), "thumbnail decode crossed the foreground gate")
-                render_workers._DECODE_MEMORY_GATE.release()
-                self.assertTrue(entered.wait(5))
-                thread.join(5)
-                self.assertFalse(thread.is_alive())
-        finally:
-            if render_workers._DECODE_MEMORY_GATE.locked():
-                render_workers._DECODE_MEMORY_GATE.release()
+            self.assertTrue(entered.wait(5))
+            thread.join(5)
+        self.assertFalse(thread.is_alive())
 
 
 if __name__ == "__main__":

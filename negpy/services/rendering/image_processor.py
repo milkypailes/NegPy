@@ -65,6 +65,7 @@ from negpy.features.retouch.logic import (
     strokes_to_score,
 )
 from negpy.features.retouch import openice
+from negpy.features.retouch.clone import apply_clone_strokes, clone_token
 from negpy.features.retouch.models import IR_METHOD_OPENICE
 from negpy.features.rgbscan.logic import merge_rgb_triplet, rgbscan_token
 from negpy.features.rgbscan.models import RgbScanConfig, is_rgb_triplet
@@ -199,7 +200,7 @@ def _resolve_armed_autocrop(
 
 
 def _use_half_size_decode(raw: Any) -> bool:
-    """Mirrors the PreviewManager fast path: half_size aliases the X-Trans 6x6 CFA."""
+    """half_size aliases the X-Trans 6x6 CFA; must match the PreviewManager fast path."""
     return not isinstance(raw, NonStandardFileWrapper) and not is_xtrans(raw)
 
 
@@ -337,6 +338,10 @@ class ImageProcessor:
         self._manual_inc_threshold: Optional[float] = None
         self._manual_inc_score: Optional[np.ndarray] = None
         self._manual_inc_out: Optional[np.ndarray] = None
+        # Clone cache, keyed on input identity like the manual baseline; a strict append extends it.
+        self._clone_img: Optional[np.ndarray] = None
+        self._clone_strokes: tuple = ()
+        self._clone_out: Optional[np.ndarray] = None
         # The OpenICE method's whole result, on its own slot. The two IR methods share no
         # state, so whichever loses can be deleted without unpicking the other.
         self._ice_key: Optional[tuple] = None
@@ -548,6 +553,22 @@ class ImageProcessor:
         self._manual_value = value
         return value
 
+    def _clone_bake(self, img: np.ndarray, settings: WorkspaceConfig) -> np.ndarray:
+        """The last source bake: a clone copies film that is already clean."""
+        strokes = tuple(getattr(settings.retouch, "clone_strokes", ()))
+        if self._is_flat(settings) or not strokes:
+            return img
+        done = self._clone_strokes
+        if self._clone_img is img and self._clone_out is not None and strokes[: len(done)] == done:
+            if len(strokes) == len(done):
+                return self._clone_out
+            out = apply_clone_strokes(self._clone_out, strokes[len(done) :])
+        else:
+            self._slow_step("cloning")
+            out = apply_clone_strokes(img, strokes)
+        self._clone_img, self._clone_strokes, self._clone_out = img, strokes, out
+        return out
+
     def _manual_bake_incremental(
         self,
         img: np.ndarray,
@@ -691,6 +712,7 @@ class ImageProcessor:
         # Fold the buffer resolution into source_hash: toggling HQ re-decodes the same file
         # at full resolution with unchanged settings, so without this the engine cache
         # reports "nothing changed" and returns the stale low-res render.
+        heal_token = manual_bake_token(settings.retouch)
         base_hash = (
             source_hash
             + flatfield_token(settings.flatfield)
@@ -704,24 +726,29 @@ class ImageProcessor:
             + sensor_token(settings.process)
             + demosaic_token(settings.process.demosaic_preview)
             + ir_bake_token(settings.retouch, ir_buffer is not None)
-            + manual_bake_token(settings.retouch)
+            + heal_token
             + luma_bake_token(settings.retouch)
         )
+        # Each bake keys only on what runs ahead of it, so a heal or clone stroke re-runs only its own pass.
+        auto_hash = base_hash.replace(heal_token, "", 1) if heal_token else base_hash
+        clone_tok = clone_token(settings.retouch)
+        base_hash += clone_tok
+        repair_hash = base_hash[: len(base_hash) - len(clone_tok)]
 
         # Bake the IR correction before detection so meters/stats see the corrected buffer.
         # Gated: the bake caches are single-slot and the export prefetch bakes on a helper thread.
         want_ir = settings.retouch.ir_dust_remove and ir_buffer is not None and not self._is_flat(settings)
         with self._prepare_gate:
-            img, ir_corrected_mask, ir_degenerate, ir_routed = self._ir_bake(img, ir_buffer, settings, base_hash)
+            img, ir_corrected_mask, ir_degenerate, ir_routed = self._ir_bake(img, ir_buffer, settings, auto_hash)
 
             orig_ret = settings.retouch
-            detected_dust, hair_masks = self._detect_luma(settings, img, base_hash, detect_buffer)
+            detected_dust, hair_masks = self._detect_luma(settings, img, auto_hash, detect_buffer)
             if ir_corrected_mask is not None and (detected_dust is not None or hair_masks):
                 # What IR already repaired is not repaired again from the visible.
                 detected_dust, hair_masks = _without_ir(detected_dust, hair_masks, ir_corrected_mask)
             dust_label = _dust_step_label(orig_ret)
-            img = self._luma_bake(img, detected_dust, base_hash + hair_bake_token(orig_ret), dust_label)
-            img, manual_routed = self._manual_bake(img, settings, base_hash)
+            img = self._luma_bake(img, detected_dust, auto_hash + hair_bake_token(orig_ret), dust_label)
+            img, manual_routed = self._manual_bake(img, settings, repair_hash)
             extra = [m for m in (ir_routed, manual_routed) if m is not None]
             if extra:
                 hair_masks = hair_masks + extra  # never mutate the cached list
@@ -729,7 +756,8 @@ class ImageProcessor:
             # invalidates the base stage when detection params change.
             hair_token = hair_bake_token(orig_ret) if hair_masks else ""
             if hair_masks:
-                img = self._hair_inpaint(img, hair_masks, base_hash + hair_token, dust_label)
+                img = self._hair_inpaint(img, hair_masks, repair_hash + hair_token, dust_label)
+            img = self._clone_bake(img, settings)
 
         source_hash = base_hash + hair_token + f"|res{w_cols}x{h_orig}"
 
@@ -754,10 +782,8 @@ class ImageProcessor:
         if resolved_crop is not None:
             context.metrics["autocrop_resolved_rect"] = resolved_crop[0]
             context.metrics["autocrop_resolved_key"] = resolved_crop[1]
-        # Display-overlay data: the detection-scale sets that were repaired, and the wash over
-        # the inpainted hairs (they emit no stroke capsules). Written as None/empty when nothing
-        # was found: the controller merges metrics into the last frame's, so an absent key
-        # would keep the previous frame's marks on the overlay.
+        # Overlay data, written even when empty: the controller merges metrics into the last
+        # frame's, so an absent key keeps the previous frame's marks.
         dust_mask = detected_dust < 1.0 if detected_dust is not None else None
         context.metrics["detected_dust_mask"] = dust_mask
         context.metrics["hair_inpaint_masks"] = hair_masks
@@ -1162,6 +1188,7 @@ class ImageProcessor:
         split_x: float,
         crop_rect: Optional[tuple[float, float, float, float]] = None,
         gutter_thickness: float = 0.0,
+        split_axis: str = "x",
     ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
         """Slice a decoded source down to one half-frame; copies so the shared
         per-file decode cache is never mutated downstream. No-op when half == 0."""
@@ -1169,9 +1196,13 @@ class ImageProcessor:
             return f32_buffer, ir_full
         from negpy.services.assets.half_frame import slice_half
 
-        f32_buffer = np.ascontiguousarray(slice_half(f32_buffer, half, split_x, crop_rect=crop_rect, gutter_thickness=gutter_thickness))
+        f32_buffer = np.ascontiguousarray(
+            slice_half(f32_buffer, half, split_x, crop_rect=crop_rect, gutter_thickness=gutter_thickness, split_axis=split_axis)
+        )
         if ir_full is not None:
-            ir_full = np.ascontiguousarray(slice_half(ir_full, half, split_x, crop_rect=crop_rect, gutter_thickness=gutter_thickness))
+            ir_full = np.ascontiguousarray(
+                slice_half(ir_full, half, split_x, crop_rect=crop_rect, gutter_thickness=gutter_thickness, split_axis=split_axis)
+            )
         return f32_buffer, ir_full
 
     def _prepare_export_source(
@@ -1183,11 +1214,12 @@ class ImageProcessor:
         split_x: float = 0.5,
         crop_rect: Optional[tuple[float, float, float, float]] = None,
         gutter_thickness: float = 0.0,
+        split_axis: str = "x",
     ) -> Tuple[np.ndarray, str, str]:
         """Decode, slice and bake one frame for export: (f32_buffer, source color
         space, bake token for the engine hash). Served from the handoff slot when
         prefetched, computed under the gate otherwise."""
-        key = (file_path, source_hash, params, half, split_x, crop_rect, gutter_thickness)
+        key = (file_path, source_hash, params, half, split_x, crop_rect, gutter_thickness, split_axis)
         slot = self._prepare_slot
         if slot is not None and slot[0] == key:
             return slot[1]
@@ -1195,7 +1227,9 @@ class ImageProcessor:
             slot = self._prepare_slot
             if slot is not None and slot[0] == key:
                 return slot[1]
-            return self._prepare_export_source_locked(file_path, params, source_hash, half, split_x, crop_rect, gutter_thickness)
+            return self._prepare_export_source_locked(
+                file_path, params, source_hash, half, split_x, crop_rect, gutter_thickness, split_axis
+            )
 
     def _prepare_export_source_locked(
         self,
@@ -1206,10 +1240,11 @@ class ImageProcessor:
         split_x: float,
         crop_rect: Optional[tuple[float, float, float, float]],
         gutter_thickness: float,
+        split_axis: str = "x",
     ) -> Tuple[np.ndarray, str, str]:
         f32_buffer, ir_full, source_cs = self._load_source_f32(file_path, params)
         f32_buffer, ir_full = self._slice_half_source(
-            f32_buffer, ir_full, half, split_x, crop_rect=crop_rect, gutter_thickness=gutter_thickness
+            f32_buffer, ir_full, half, split_x, crop_rect=crop_rect, gutter_thickness=gutter_thickness, split_axis=split_axis
         )
         # Same shape as run_pipeline's base_hash, so an export of a frame previewed at full
         # resolution with the same demosaic finds every bake already in the caches.
@@ -1228,6 +1263,7 @@ class ImageProcessor:
             + ir_bake_token(params.retouch, ir_full is not None)
             + manual_bake_token(params.retouch)
             + luma_bake_token(params.retouch)
+            + clone_token(params.retouch)
         )
         f32_buffer, _, _, ir_routed = self._ir_bake(f32_buffer, ir_full, params, detect_key)
         orig_ret = params.retouch
@@ -1240,6 +1276,7 @@ class ImageProcessor:
             hair_masks = hair_masks + extra
         if hair_masks:
             f32_buffer = self._hair_inpaint(f32_buffer, hair_masks, detect_key + hair_bake_token(orig_ret), dust_label)
+        f32_buffer = self._clone_bake(f32_buffer, params)
         export_token = detect_key + (hair_bake_token(orig_ret) if hair_masks else "")
         return f32_buffer, source_cs, export_token
 
@@ -1252,10 +1289,11 @@ class ImageProcessor:
         split_x: float = 0.5,
         crop_rect: Optional[tuple[float, float, float, float]] = None,
         gutter_thickness: float = 0.0,
+        split_axis: str = "x",
     ) -> None:
         """Prepare a source into the handoff slot ahead of its render. Failures are
         dropped; the render's own prepare raises them where they are reported."""
-        key = (file_path, source_hash, params, half, split_x, crop_rect, gutter_thickness)
+        key = (file_path, source_hash, params, half, split_x, crop_rect, gutter_thickness, split_axis)
         slot = self._prepare_slot
         if slot is not None and slot[0] == key:
             return
@@ -1264,7 +1302,9 @@ class ImageProcessor:
                 slot = self._prepare_slot
                 if slot is not None and slot[0] == key:
                     return
-                value = self._prepare_export_source_locked(file_path, params, source_hash, half, split_x, crop_rect, gutter_thickness)
+                value = self._prepare_export_source_locked(
+                    file_path, params, source_hash, half, split_x, crop_rect, gutter_thickness, split_axis
+                )
                 self._prepare_slot = (key, value)
         except Exception:
             logger.exception(f"Export source prefetch failed for {file_path}")
@@ -1282,10 +1322,18 @@ class ImageProcessor:
         split_x: float = 0.5,
         crop_rect: Optional[tuple[float, float, float, float]] = None,
         gutter_thickness: float = 0.0,
+        split_axis: str = "x",
     ) -> Tuple[np.ndarray, str]:
         """Full-res render of one frame; returns the float buffer and its color space."""
         f32_buffer, source_cs, export_token = self._prepare_export_source(
-            file_path, params, source_hash, half=half, split_x=split_x, crop_rect=crop_rect, gutter_thickness=gutter_thickness
+            file_path,
+            params,
+            source_hash,
+            half=half,
+            split_x=split_x,
+            crop_rect=crop_rect,
+            gutter_thickness=gutter_thickness,
+            split_axis=split_axis,
         )
         # Ensure both GPU and CPU paths use the same export settings.
         params = dc_replace(params, export=export_settings)
@@ -1359,6 +1407,7 @@ class ImageProcessor:
         split_x: float = 0.5,
         crop_rect: Optional[tuple[float, float, float, float]] = None,
         gutter_thickness: float = 0.0,
+        split_axis: str = "x",
         diptych: Optional[Tuple[WorkspaceConfig, WorkspaceConfig]] = None,
     ) -> Tuple[Optional[np.ndarray], str]:
         """Full-res export render; returns (float buffer, its color space) or (None, error).
@@ -1383,11 +1432,13 @@ class ImageProcessor:
                         split_x=split_x,
                         crop_rect=crop_rect,
                         gutter_thickness=gutter_thickness,
+                        split_axis=split_axis,
                     )
                     for n, cfg in ((1, diptych[0]), (2, diptych[1]))
                 ]
                 (left, color_space), (right, _) = rendered
-                buffer = join_halves(left, right, gap_px(left.shape[1], right.shape[1], gutter_thickness))
+                along = 1 if split_axis == "x" else 0
+                buffer = join_halves(left, right, gap_px(left.shape[along], right.shape[along], gutter_thickness), axis=split_axis)
             else:
                 buffer, color_space = self._render_export_buffer(
                     file_path,
@@ -1401,6 +1452,7 @@ class ImageProcessor:
                     split_x=split_x,
                     crop_rect=crop_rect,
                     gutter_thickness=gutter_thickness,
+                    split_axis=split_axis,
                 )
             return buffer, color_space
         except Exception as e:
@@ -1440,6 +1492,7 @@ class ImageProcessor:
         split_x: float = 0.5,
         crop_rect: Optional[tuple[float, float, float, float]] = None,
         gutter_thickness: float = 0.0,
+        split_axis: str = "x",
         diptych: Optional[Tuple[WorkspaceConfig, WorkspaceConfig]] = None,
         embed_plan: Optional[tuple] = None,
     ) -> Tuple[Optional[bytes], str]:
@@ -1460,6 +1513,7 @@ class ImageProcessor:
             split_x=split_x,
             crop_rect=crop_rect,
             gutter_thickness=gutter_thickness,
+            split_axis=split_axis,
             diptych=diptych,
         )
         if buffer is None:
@@ -1619,6 +1673,8 @@ class ImageProcessor:
         split_x: float = 0.5,
         crop_rect: Optional[tuple[float, float, float, float]] = None,
         gutter_thickness: float = 0.0,
+        split_axis: str = "x",
+        keep_source: bool = False,
     ) -> Optional[np.ndarray]:
         """Render a file (with its edits) to a small sRGB uint8 RGB array for tiling.
 
@@ -1635,7 +1691,7 @@ class ImageProcessor:
 
             f32_buffer, ir_full, _ = self._load_source_f32(file_path, params, fast_decode=fast_decode)
             f32_buffer, ir_full = self._slice_half_source(
-                f32_buffer, ir_full, half, split_x, crop_rect=crop_rect, gutter_thickness=gutter_thickness
+                f32_buffer, ir_full, half, split_x, crop_rect=crop_rect, gutter_thickness=gutter_thickness, split_axis=split_axis
             )
 
             # Proof scale: everything downstream only needs target_long_px. The
@@ -1644,12 +1700,12 @@ class ImageProcessor:
             if ir_full is not None and ir_full.shape[:2] != f32_buffer.shape[:2]:
                 th, tw = f32_buffer.shape[:2]
                 ir_full = cv2.resize(ir_full, (tw, th), interpolation=cv2.INTER_AREA)
-            # Each frame of a contact sheet is decoded once, so the full-res source
-            # cache only pins ~300MB (24MP) across the next frame's decode.
-            self._source_cache_key = None
-            self._source_cache_value = None
-            self._precorrect_key = None
-            self._precorrect_value = None
+            # Keep the decode only for the other half of the same scan, rendered next; else it pins memory across the next decode.
+            if not keep_source:
+                self._source_cache_key = None
+                self._source_cache_value = None
+                self._precorrect_key = None
+                self._precorrect_value = None
 
             # A Print/Target-px export setting sizes the paper from print_size x DPI, which
             # re-inflates the tile to full print resolution right after the downsample. Bound
@@ -1683,6 +1739,7 @@ class ImageProcessor:
                 + ir_bake_token(params.retouch, ir_full is not None)
                 + manual_bake_token(params.retouch)
                 + luma_bake_token(params.retouch)
+                + clone_token(params.retouch)
             )
             f32_buffer, _, _, ir_routed = self._ir_bake(f32_buffer, ir_full, params, detect_key)
             orig_ret = params.retouch
@@ -1694,6 +1751,7 @@ class ImageProcessor:
                 hair_masks = hair_masks + extra
             if hair_masks:
                 f32_buffer = self._hair_inpaint(f32_buffer, hair_masks, detect_key + hair_bake_token(orig_ret))
+            f32_buffer = self._clone_bake(f32_buffer, params)
 
             params, _ = _resolve_armed_autocrop(f32_buffer, params)
 

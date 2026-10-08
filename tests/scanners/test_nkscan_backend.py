@@ -8,7 +8,7 @@ import threading
 import numpy as np
 import pytest
 
-from negpy.infrastructure.scanners.base import TransientScanError
+from negpy.infrastructure.scanners.base import StripReturned, TransientScanError
 from negpy.infrastructure.scanners.nkscan_backend import _crop_frame, _offset_units, _shift_frame, _stack_rgb
 from negpy.infrastructure.scanners.params import FILM_TYPES, ScanMode, ScanParams
 from tests.scanners import fake_nkscan
@@ -250,15 +250,64 @@ def test_film_is_loaded_when_the_holder_is_empty() -> None:
     assert module.opened[-1].loads == 1
 
 
+def test_film_the_unit_returned_is_loaded_again_and_the_scan_stops() -> None:
+    backend, module = make_backend()
+    backend.detect_frames(DEVICE_ID)
+    module.media_loaded_at_open = False
+
+    with pytest.raises(StripReturned) as raised:
+        _scan(backend)
+
+    assert raised.value.loaded
+    assert module.opened[-1].loads == 1
+    assert module.opened[-1].staged == 0
+    assert module.opened[-1].closed
+    assert backend.frames(DEVICE_ID) == []
+
+
+def test_a_returned_strip_the_unit_cannot_take_back_asks_for_it_again() -> None:
+    backend, module = make_backend()
+    backend.detect_frames(DEVICE_ID)
+    module.media_loaded_at_open = False
+    module.film_waiting = False
+
+    with pytest.raises(StripReturned, match="Insert it again") as raised:
+        _scan(backend)
+
+    assert not raised.value.loaded
+    assert module.opened[-1].staged == 0
+
+
 def test_film_reloaded_after_the_unit_returned_it_is_measured_again() -> None:
     backend, module = make_backend()
     backend.detect_frames(DEVICE_ID)
+    module.media_loaded_at_open = False
+    with pytest.raises(StripReturned):
+        _scan(backend)
+    module.media_loaded_at_open = True
+
+    _scan(backend)
+
+    assert module.opened[-1].discoveries == [None]
+
+
+def test_film_ejected_by_negpy_loads_again_without_a_word() -> None:
+    backend, module = make_backend(with_eject=True)
+    _scan(backend)
+    backend.eject(DEVICE_ID)
     module.media_loaded_at_open = False
 
     _scan(backend)
 
     assert module.opened[-1].loads == 1
-    assert module.opened[-1].discoveries == [None]
+
+
+def test_ejecting_a_strip_the_unit_returned_is_not_refused() -> None:
+    backend, module = make_backend(with_eject=True)
+    backend.detect_frames(DEVICE_ID)
+    module.media_loaded_at_open = False
+
+    assert backend.eject(DEVICE_ID) is True
 
 
 def test_a_held_device_refuses_a_stateless_scan() -> None:
@@ -449,6 +498,12 @@ def test_only_a_transport_that_measures_the_film_is_told_the_frame_length() -> N
     assert published.list_devices()[0].capabilities.film_formats == ()
 
 
+def test_only_the_framings_that_take_a_thumbnail_pass_cut_previews_from_a_strip_pass() -> None:
+    for framing, strip_pass in (("thumbnail", True), ("perforation", True), ("published", False), ("address", False)):
+        backend, _ = make_backend(caps=FakeCapabilities(framing=framing))
+        assert backend.list_devices()[0].capabilities.strip_pass is strip_pass, framing
+
+
 # ── metering ──────────────────────────────────────────────────────────────
 
 
@@ -599,3 +654,132 @@ def test_a_held_device_refuses_a_stateless_meter() -> None:
     with backend.open_session(DEVICE_ID):
         with pytest.raises(RuntimeError, match="held"):
             _meter(backend)
+
+
+def test_a_load_that_fails_still_leaves_the_return_to_report() -> None:
+    backend, module = make_backend()
+    backend.detect_frames(DEVICE_ID)
+    module.media_loaded_at_open = False
+    module.load_error = fake_nkscan.TransientError("usb glitch")
+
+    with pytest.raises(TransientScanError):
+        _scan(backend)
+    module.load_error = None
+
+    with pytest.raises(StripReturned):
+        _scan(backend)
+
+
+def test_ejecting_a_strip_the_unit_already_returned_counts_as_ejected() -> None:
+    backend, module = make_backend()
+    backend.detect_frames(DEVICE_ID)
+    module.media_loaded_at_open = False
+    module.film_waiting = False
+
+    assert backend.eject(DEVICE_ID) is True
+    assert module.opened[-1].ejects == 0
+
+    module.media_loaded_at_open = True
+    _scan(backend)  # settled by the eject: nothing left to report
+
+
+def test_an_eject_that_does_nothing_leaves_the_return_to_report() -> None:
+    backend, module = make_backend(with_eject=False)
+    backend.detect_frames(DEVICE_ID)
+    module.media_loaded_at_open = False  # the strip waits in the adapter
+
+    assert backend.eject(DEVICE_ID) is False
+
+    with pytest.raises(StripReturned):
+        _scan(backend)
+
+
+class _Clock:
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+@pytest.fixture
+def clock(monkeypatch) -> _Clock:
+    from negpy.infrastructure.scanners import nkscan_backend
+
+    fake = _Clock()
+    monkeypatch.setattr(nkscan_backend.time, "monotonic", fake)
+    return fake
+
+
+def test_a_long_idle_counts_as_a_return_though_the_strip_reads_as_loaded(clock) -> None:
+    from negpy.infrastructure.scanners.nkscan_backend import _IDLE_RETURN_S
+
+    backend, module = make_backend()
+    backend.detect_frames(DEVICE_ID)
+    clock.now += _IDLE_RETURN_S
+
+    with pytest.raises(StripReturned) as raised:
+        _scan(backend)
+
+    assert raised.value.loaded
+    assert module.opened[-1].staged == 0
+    _scan(backend)
+    assert module.opened[-1].discoveries == [None]  # measured again
+
+
+def test_a_short_idle_keeps_the_measured_strip(clock) -> None:
+    from negpy.infrastructure.scanners.nkscan_backend import _IDLE_RETURN_S
+
+    backend, module = make_backend()
+    backend.detect_frames(DEVICE_ID)
+    clock.now += _IDLE_RETURN_S - 1
+
+    _scan(backend)
+
+    assert module.opened[-1].discoveries == []
+
+
+def test_each_contact_starts_the_idle_clock_again(clock) -> None:
+    from negpy.infrastructure.scanners.nkscan_backend import _IDLE_RETURN_S
+
+    backend, module = make_backend()
+    backend.detect_frames(DEVICE_ID)
+    clock.now += _IDLE_RETURN_S - 1
+    _scan(backend)
+    clock.now += _IDLE_RETURN_S - 1
+
+    _scan(backend)
+
+    assert module.opened[-1].discoveries == []
+
+
+def test_a_long_idle_with_nothing_measured_is_not_a_return(clock) -> None:
+    from negpy.infrastructure.scanners.nkscan_backend import _IDLE_RETURN_S
+
+    backend, _ = make_backend()
+    clock.now += _IDLE_RETURN_S * 2
+
+    _scan(backend)
+
+
+def test_a_holder_with_its_own_frame_table_keeps_the_plain_reload() -> None:
+    backend, module = make_backend(caps=FakeCapabilities(framing="published"))
+    backend.detect_frames(DEVICE_ID)
+    module.media_loaded_at_open = False
+
+    _scan(backend)
+
+    assert module.opened[-1].loads == 1
+    assert module.opened[-1].staged == 1
+
+
+def test_a_long_idle_is_no_return_on_a_holder_with_its_own_frame_table(clock) -> None:
+    from negpy.infrastructure.scanners.nkscan_backend import _IDLE_RETURN_S
+
+    backend, module = make_backend(caps=FakeCapabilities(framing="published"))
+    backend.detect_frames(DEVICE_ID)
+    clock.now += _IDLE_RETURN_S * 2
+
+    _scan(backend)
+
+    assert module.opened[-1].discoveries == []

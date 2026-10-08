@@ -12,7 +12,7 @@ GPU needed), with an AppState standing in for session hydration.
 
 import os
 from dataclasses import replace
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock
 
 from negpy.desktop.controller import AppController
@@ -29,6 +29,9 @@ def _run(paths, **req_kw):
     controller.state = AppState()
     controller._pending_capture_imports = {}
     controller._last_capture_req = req
+    controller._discover_scanned = MethodType(AppController._discover_scanned, controller)
+    controller._save_rgb_scan_mode = MethodType(AppController._save_rgb_scan_mode, controller)
+    controller._RGB_SCAN_MODE_BY_ROLL_KEY = AppController._RGB_SCAN_MODE_BY_ROLL_KEY
     AppController._on_capture_finished(controller, paths)
     return controller
 
@@ -64,6 +67,17 @@ def test_rgb_triplet_import_defaults_to_c41_without_autodetect():
     c = _run(["r.ARW", "g.ARW", "b.ARW"], rgb_mode=True, white_mode=False)
 
     task = _hydrate_and_load(c, "r.ARW", ProcessMode.E6, autodetect=True)
+
+    assert c.state.config.process.process_mode == ProcessMode.C41
+    assert task.detect_mode is False
+
+
+def test_single_capture_rgb_frame_is_an_ordinary_c41_raw():
+    c = _run(["frame.ARW"], rgb_mode=True, white_mode=False, single_capture=True)
+    c.session.repo.save_global_setting.assert_any_call("rgbscan_mode", False)  # one file → no merge
+    c.request_asset_discovery.assert_called_once_with(["frame.ARW"], restore_triplets=None)
+
+    task = _hydrate_and_load(c, "frame.ARW", ProcessMode.E6, autodetect=True)
 
     assert c.state.config.process.process_mode == ProcessMode.C41
     assert task.detect_mode is False
@@ -176,3 +190,16 @@ def test_normal_scan_stamps_roll_without_process_override():
     assert c.state.config.process.process_mode == ProcessMode.C41
     assert c.state.config.metadata.capture_roll == "Roll001"
     assert c.state.config.metadata.capture_frame == 3
+
+
+def test_single_capture_frame_outside_a_roll_takes_the_sensor_profile_itself(monkeypatch):
+    import negpy.desktop.controller as controller_module
+
+    unmix = [1.0, -0.1, 0.0, -0.1, 1.0, -0.3, 0.0, -0.3, 1.0]
+    monkeypatch.setattr(controller_module.SensorProfiles, "get_matrix", staticmethod(lambda _name: unmix))
+    c = _run(["frame.ARW"], rgb_mode=True, white_mode=False, single_capture=True, sensor_profile="Portra")
+
+    _hydrate_and_load(c, "frame.ARW", ProcessMode.C41)
+
+    process = c.state.config.process
+    assert (process.sensor_profile, process.sensor_matrix, process.linear_raw) == ("Portra", tuple(unmix), True)

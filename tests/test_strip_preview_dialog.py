@@ -17,7 +17,7 @@ import sys
 import numpy as np
 import pytest
 from PyQt6.QtCore import QObject, pyqtSignal
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QLabel, QWidget
 
 from negpy.desktop.view.widgets.scan_preview_common import preview_positive
 from negpy.desktop.view.widgets.strip_preview_dialog import (
@@ -68,6 +68,7 @@ class _FakeController(QObject):
     scan_progress = pyqtSignal(float, str)
     scan_error = pyqtSignal(str)
     scan_cancelled = pyqtSignal()
+    scan_strip_returned = pyqtSignal(bool)
 
     def __init__(self, *, raise_on_preview: bool = False) -> None:
         super().__init__()
@@ -1137,6 +1138,32 @@ def test_a_detected_strip_overrides_the_saved_correction() -> None:
     assert dialog.frame_offsets() == {2: -0.9}
 
 
+def test_a_tile_with_its_own_offset_is_marked() -> None:
+    dialog = StripPreviewDialog(_FakeController(), _device(4), initial_frame_offsets={3: 1.5})
+    moved, still = dialog._tiles[3], dialog._tiles[2]
+
+    assert moved.offset_slider.is_moved() and not still.offset_slider.is_moved()
+    assert not moved.offset_value.isHidden() and moved.offset_value.text() == "+1.5 mm"
+    assert still.offset_value.isHidden()
+
+
+def test_resetting_a_tile_offset_clears_its_marks() -> None:
+    dialog = StripPreviewDialog(_FakeController(), _device(4), initial_frame_offsets={3: 1.5})
+    tile = dialog._tiles[3]
+
+    tile.offset_slider.mouseDoubleClickEvent(None)
+
+    assert not tile.offset_slider.is_moved()
+    assert tile.offset_value.isHidden()
+
+
+def test_a_moved_tile_slider_paints_without_error() -> None:
+    dialog = StripPreviewDialog(_FakeController(), _device(4), initial_frame_offsets={2: -3.0, 3: 3.0})
+
+    for frame in (1, 2, 3):
+        dialog._tiles[frame].offset_slider.grab()
+
+
 # ── finding the frames as the dialog opens ────────────────────────────────
 
 
@@ -1305,3 +1332,106 @@ def test_clearing_a_crop_on_a_tile_drops_the_saved_one() -> None:
     _dispose(dialog)
 
     assert windows == {}
+
+
+def test_the_eye_shows_only_where_previewing_one_frame_scans_it_again() -> None:
+    import dataclasses
+
+    scanned = _device(3)
+    cut = dataclasses.replace(scanned, capabilities=dataclasses.replace(scanned.capabilities, strip_pass=True))
+
+    assert not any(t.preview_btn.isHidden() for t in StripPreviewDialog(_FakeController(), scanned)._tiles.values())
+    assert all(t.preview_btn.isHidden() for t in StripPreviewDialog(_FakeController(), cut)._tiles.values())
+
+
+def test_offset_and_drift_off_zero_are_marked_like_a_tile_offset() -> None:
+    dialog = StripPreviewDialog(_FakeController(), _device(4), initial_offset=1.5)
+
+    assert dialog.offset_slider.is_moved() and not dialog.drift_slider.is_moved()
+
+    dialog.drift_slider.setValue(-20)
+    dialog.offset_slider.mouseDoubleClickEvent(None)
+
+    assert dialog.drift_slider.is_moved() and not dialog.offset_slider.is_moved()
+
+
+def test_offset_and_drift_off_zero_show_a_dot_beside_their_name() -> None:
+    dialog = StripPreviewDialog(_FakeController(), _device(4), initial_offset=1.5)
+
+    assert not dialog._name_dots["Offset"].isHidden() and dialog._name_dots["Drift"].isHidden()
+
+    dialog.offset_slider.mouseDoubleClickEvent(None)
+    dialog.drift_slider.setValue(-20)
+
+    assert dialog._name_dots["Offset"].isHidden() and not dialog._name_dots["Drift"].isHidden()
+
+
+def test_a_name_dot_stays_beside_its_name() -> None:
+    dialog = StripPreviewDialog(_FakeController(), _device(4), initial_offset=1.5)
+    dialog.resize(1200, 700)
+    dialog.show()
+    QApplication.processEvents()
+
+    dot = dialog._name_dots["Offset"]
+    name = next(w for w in dialog.findChildren(QLabel) if w.text() == "Offset")
+
+    assert name.geometry().right() < dot.geometry().x() < dialog.width() // 2
+    dialog.close()
+
+
+def test_the_readings_stay_gray_off_zero() -> None:
+    from negpy.desktop.view.styles.theme import THEME
+
+    dialog = StripPreviewDialog(_FakeController(), _device(4), initial_offset=1.5, initial_frame_offsets={2: 0.4})
+
+    assert THEME.text_secondary in dialog.offset_label.styleSheet()
+    assert THEME.channel_red_text not in dialog.findChild(QWidget, "frameOverlay").styleSheet()
+
+
+def test_the_unit_returning_the_strip_drops_its_frame_state_and_measures_it_again() -> None:
+    controller = _FakeController()
+    dialog = StripPreviewDialog(
+        controller,
+        _discovery_device(),
+        initial_selected=(2,),
+        initial_windows={1: (0.1, 0.1, 0.9, 0.9)},
+        initial_frame_offsets={2: 0.4, 7: -0.3},
+        initial_offset=1.5,
+    )
+    dialog._on_preview_all()
+    controller.deliver_all((1, 2, 3))
+    assert dialog.selected_frames() == (2,) and dialog.frame_offsets() == {2: 0.4, 7: -0.3}
+
+    dialog._on_preview_all()
+    controller.scan_error.emit("returned")
+    controller.scan_strip_returned.emit(True)
+
+    assert dialog._tiles == {}
+    assert dialog.selected_frames() == ()
+    assert dialog.frame_windows() == {}
+    assert dialog.frame_offsets() == {}
+    assert dialog.frame_offset() == 1.5
+    assert len(controller.preview_reqs) == 3  # measured again
+    assert "long enough to return the strip" in dialog.status_strip.message()
+
+
+def test_a_returned_strip_not_back_in_waits_for_detect_frames() -> None:
+    controller = _FakeController()
+    dialog = StripPreviewDialog(controller, _discovery_device(), initial_selected=(1, 2, 3), initial_frame_offsets={2: 0.4})
+    dialog._on_preview_all()
+    controller.deliver_all((1, 2, 3, 4, 5, 6))
+    dialog._on_preview_all()
+    controller.scan_error.emit("returned")
+
+    controller.scan_strip_returned.emit(False)
+
+    assert dialog._tiles == {}
+    assert (dialog.selected_frames(), dialog.frame_offsets()) == ((), {})
+    assert len(controller.preview_reqs) == 2  # no retry while the strip is out
+    assert "Insert it again" in dialog.status_strip.message()
+    assert not dialog._empty_hint.isHidden() and "Insert the strip" in dialog._empty_hint.text()
+
+    dialog._on_preview_all()  # Detect frames once it is back in
+    controller.deliver_all((1, 2, 3, 4, 5))
+
+    assert dialog.selected_frames() == (1, 2, 3, 4, 5)

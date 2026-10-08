@@ -26,7 +26,7 @@ from negpy.desktop.converters import ImageConverter
 from negpy.desktop.view.canvas.reference_pane import ReferencePane
 from negpy.desktop.view.canvas.toolbar import ActionToolbar
 from negpy.desktop.view.canvas.widget import ImageCanvas
-from negpy.desktop.view.keyboard_shortcuts import setup_keyboard_shortcuts
+from negpy.desktop.view.keyboard_shortcuts import SpacePanKeyFilter, setup_keyboard_shortcuts
 from negpy.desktop.view.mac_menu_bar import install_mac_menus
 from negpy.desktop.view.shortcut_registry import tooltip_with_shortcut
 from negpy.desktop.view.sidebar.right_panel import RightPanel
@@ -164,6 +164,8 @@ class MainWindow(QMainWindow):
         self._init_ui()
         self._connect_signals()
         self.shortcut_manager = setup_keyboard_shortcuts(self)
+        self.space_pan_filter = SpacePanKeyFilter(self)
+        self.space_pan_filter.space_held_changed.connect(self.canvas.set_space_pan_held)
         # macOS only: the global menu bar costs no window space, and elsewhere this is a
         # no-op. After the shortcut manager, whose actions the menu items dispatch through.
         self.mac_menus = install_mac_menus(self)
@@ -195,6 +197,9 @@ class MainWindow(QMainWindow):
             self.setWindowState(Qt.WindowState.WindowMaximized)
 
     def closeEvent(self, event) -> None:
+        space_pan_filter = getattr(self, "space_pan_filter", None)
+        if space_pan_filter is not None:
+            space_pan_filter.uninstall()
         try:
             geo = self.normalGeometry() if self.isMaximized() or self.isFullScreen() else self.geometry()
             self.controller.session.repo.save_global_settings(
@@ -363,6 +368,7 @@ class MainWindow(QMainWindow):
         ToolMode.WB_PICK: "WB Picker",
         ToolMode.CROP_MANUAL: "Crop",
         ToolMode.DUST_PICK: "Heal Tool",
+        ToolMode.CLONE: "Clone Tool",
     }
 
     def _update_title(self) -> None:
@@ -578,6 +584,8 @@ class MainWindow(QMainWindow):
         self.canvas.analysis_confirmed.connect(self.controller.confirm_analysis_region)
         self.canvas.local_mask_created.connect(self.controller.handle_local_mask_created)
         self.canvas.scratch_completed.connect(self.controller.handle_heal_stroke_completed)
+        self.canvas.clone_stroke_completed.connect(self.controller.handle_clone_stroke_completed)
+        self.canvas.clone_source_picked.connect(self.controller.set_clone_source)
         self.canvas.dust_exclusion_painted.connect(self.controller.handle_dust_exclusion_painted)
         self.canvas.straighten_completed.connect(self.controller.handle_straighten_completed)
         self.canvas.keystone_line_marked.connect(self.controller.handle_keystone_line_marked)
@@ -699,11 +707,11 @@ class MainWindow(QMainWindow):
         if isinstance(buffer, np.ndarray) and not self.state.gpu_enabled:
             finish_conf = self.state.config.finish
             export_conf = self.state.config.export
-            # Crop, analysis, and tilt/swing tools render the uncropped, border-less frame, and padding it would
-            # misalign the tool rect. The GPU skips the layout pass there too.
-            should_preview = (
-                finish_conf.border_size > 0 or export_conf.paper_aspect_ratio != AspectRatio.ORIGINAL
-            ) and self.state.active_tool not in (ToolMode.CROP_MANUAL, ToolMode.ANALYSIS_DRAW, ToolMode.KEYSTONE_LINES)
+            # No padding for a crop_preview_full buffer (the uncropped frame), as on the GPU: it would misalign
+            # the tool rect. The buffer's flag decides, not the live tool: a render can land after the tool changes.
+            should_preview = (finish_conf.border_size > 0 or export_conf.paper_aspect_ratio != AspectRatio.ORIGINAL) and not metrics.get(
+                "crop_preview_full"
+            )
 
             if should_preview:
                 pil_img = Image.fromarray(float_to_uint8(buffer))
@@ -789,6 +797,7 @@ class MainWindow(QMainWindow):
         self.controls_panel.color_sidebar.pick_wb_btn.setChecked(mode == ToolMode.WB_PICK)
         self.controls_panel.geometry_sidebar.manual_crop_btn.setChecked(mode == ToolMode.CROP_MANUAL)
         self.controls_panel.retouch_sidebar.pick_dust_btn.setChecked(mode == ToolMode.DUST_PICK)
+        self.controls_panel.retouch_sidebar.clone_btn.setChecked(mode == ToolMode.CLONE)
 
         self._update_title()
         self._refresh_image_info()

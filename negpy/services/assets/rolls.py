@@ -14,11 +14,12 @@ frame's own look.
 """
 
 import os
+import re
 import time
 import uuid
 from dataclasses import replace
 from fnmatch import fnmatchcase
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence
 
 from negpy.features.metadata.models import GEAR_FIELDS, PROCESS_FIELDS, SCANNING_FIELDS
 from negpy.features.process.models import neutral_axis_tuple, with_film_fields
@@ -68,6 +69,37 @@ def folder_roll_id_for_path(repo: Any, path: str) -> Optional[str]:
     return None
 
 
+def roll_folder_name(text: str) -> Optional[str]:
+    """*text* as the one folder name a scan's roll is written to; blank is "Roll001".
+    None when it would leave the output folder."""
+    name = text.strip() or "Roll001"
+    if name in {".", ".."} or any(sep in name for sep in ("/", "\\", "\0")):
+        return None
+    return name
+
+
+_TRAILING_NUMBER = re.compile(r"^(.*?)(\d+)$")
+_COUNTER_SEPARATORS = "_- ."
+
+
+def next_roll_name(name: str, taken: Callable[[str], bool]) -> str:
+    """The roll name that follows *name*, skipping every name *taken* accepts.
+    A trailing number steps up when it is zero-padded or follows a separator; any other name
+    gains "_2", so the 400 of "portra400" stays."""
+    match = _TRAILING_NUMBER.match(name)
+    stem, digits = (match.group(1), match.group(2)) if match else (name, "")
+    padded = len(digits) > 1 and digits.startswith("0")
+    if digits and (padded or not stem or stem[-1] in _COUNTER_SEPARATORS):
+        number, width = int(digits), len(digits)
+    else:
+        stem, number, width = f"{name}_", 1, 1
+    while True:
+        number += 1
+        candidate = f"{stem}{number:0{width}d}"
+        if not taken(candidate):
+            return candidate
+
+
 def recognize_folder(repo: Any, path: str, name: str = "") -> str:
     """Mark *path* as a recognized folder roll. Idempotent: returns the existing id
     when the folder is already recognized, without touching its stored name."""
@@ -82,13 +114,25 @@ def recognize_folder(repo: Any, path: str, name: str = "") -> str:
     roll_id = uuid.uuid4().hex
     store[roll_id] = {
         "kind": "folder",
-        "name": name or path.rstrip("/\\").replace("\\", "/").rsplit("/", 1)[-1] or path,
+        "name": name or _import_name(repo, path) or path.rstrip("/\\").replace("\\", "/").rsplit("/", 1)[-1] or path,
         "folder_path": path,
         "extra_paths": [],
         "created_at": time.time(),
     }
     _write(repo, store)
     return roll_id
+
+
+def _import_name(repo: Any, path: str) -> str:
+    """*path* named as Import Subfolders as Rolls names it, from the deepest import source; "" outside every source."""
+    key = _folder_key(path)
+    sources = [os.path.normpath(s) for s in import_sources(repo) if key != _folder_key(s) and _under(key, _folder_key(s))]
+    if not sources:
+        return ""
+    source = max(sources, key=len)
+    # The source's own spelling, so a case-different path on Windows joins the same tree node.
+    parts = [os.path.basename(source), *os.path.relpath(os.path.normpath(path), source).split(os.sep)]
+    return ROLL_PATH_SEP.join(parts)
 
 
 def _dismissed_folders(repo: Any) -> List[str]:
@@ -216,14 +260,16 @@ def create_virtual_roll(repo: Any, name: str, member_paths: List[str]) -> str:
 
 def add_extra_members(repo: Any, roll_id: str, paths: List[str]) -> None:
     """Extend a roll's membership, in one write: a folder roll's extra_paths, or a virtual
-    roll's member_paths. Skips an unknown roll id and paths already members."""
+    roll's member_paths. Skips an unknown roll id, paths already members and files the
+    folder's own walk already finds."""
     store = _read(repo)
     entry = store.get(roll_id)
     if entry is None:
         return
     key = "extra_paths" if entry["kind"] == "folder" else "member_paths"
     known = set(entry[key])
-    new = [p for p in dict.fromkeys(paths) if p not in known]
+    folder = _folder_key(entry["folder_path"]) if entry["kind"] == "folder" else None
+    new = [p for p in dict.fromkeys(paths) if p not in known and _folder_key(os.path.dirname(p)) != folder]
     if new:
         entry[key] = [*entry[key], *new]
         _write(repo, store)
@@ -317,12 +363,10 @@ def adopt_replacement(
     dropped_paths: List[str],
     keep_source: bool = False,
 ) -> List[str]:
-    """Give *new_path* the roll records of the file it replaces: its membership, its card
-    locks, its scene and its forks. *dropped_paths* leave every roll. The old hash keeps
-    its locks, scene and forks, so a file restored from the Trash keeps them. With
-    *keep_source* the old path stays a member beside the new one, for a replacement whose
-    sources are left on disk and stay frames of their own. Returns the ids of
-    the rolls whose fork of *old_hash* the caller must copy."""
+    """Give *new_path* the membership, card locks, scene and forks of the file it replaces; *dropped_paths* leave every roll.
+
+    The old hash keeps its records for a restore from the Trash; *keep_source* keeps the old path a member too.
+    Returns the ids of the rolls whose fork of *old_hash* the caller must copy."""
     store = _read(repo)
     gone = set(dropped_paths)
     forked_in = []

@@ -12,7 +12,7 @@ from negpy.services.assets.half_frame import (
     base_hash,
     detect_film_crop,
     detect_gutter,
-    detect_split_x,
+    detect_gutter_axis,
     SPLIT_SCANS_KEY,
     diptych_configs,
     forget_split_scan,
@@ -34,6 +34,10 @@ from negpy.services.assets.sidecar import load_or_promote, sidecar_path_for
 from negpy.services.export.templating import render_export_filename
 
 
+def _split_x(buf) -> float:
+    return detect_gutter(buf)[0]
+
+
 def _two_frame_scan(gutter_value: float, w: int = 400, gutter_w: int = 16) -> np.ndarray:
     rng = np.random.default_rng(0)
     h = 200
@@ -46,22 +50,22 @@ def _two_frame_scan(gutter_value: float, w: int = 400, gutter_w: int = 16) -> np
 
 class TestDetectSplitX:
     def test_dark_gutter(self):
-        sx = detect_split_x(_two_frame_scan(0.02))
+        sx = _split_x(_two_frame_scan(0.02))
         assert abs(sx - 0.5) < 0.03 and sx != 0.5
 
     def test_bright_gutter(self):
-        sx = detect_split_x(_two_frame_scan(0.98))
+        sx = _split_x(_two_frame_scan(0.98))
         assert abs(sx - 0.5) < 0.03 and sx != 0.5
 
     def test_off_center_gutter(self):
         scan = _two_frame_scan(0.98)
         scan = np.roll(scan, 40, axis=1)  # gutter at ~0.6
-        assert abs(detect_split_x(scan) - 0.6) < 0.03
+        assert abs(_split_x(scan) - 0.6) < 0.03
 
     def test_no_gutter_falls_back_to_center(self):
         rng = np.random.default_rng(1)
         flat = (0.4 + 0.2 * rng.random((200, 400, 3))).astype(np.float32)
-        assert detect_split_x(flat) == 0.5
+        assert _split_x(flat) == 0.5
 
     def test_in_scene_step_edge_rejected(self):
         # Bright left frame, dark right frame, no gutter: the brightness step
@@ -70,7 +74,7 @@ class TestDetectSplitX:
         left = 0.7 + 0.2 * rng.random((200, 200, 3))
         right = 0.05 + 0.1 * rng.random((200, 200, 3))
         scan = np.concatenate([left, right], axis=1).astype(np.float32)
-        assert detect_split_x(scan) == 0.5
+        assert _split_x(scan) == 0.5
 
     def test_textured_vertical_feature_rejected(self):
         # A narrow bright band that varies along y (in-scene feature, not film base).
@@ -78,10 +82,10 @@ class TestDetectSplitX:
         h, w = scan.shape[:2]
         band = slice(w // 2 - 8, w // 2 + 8)
         scan[:, band] = np.linspace(0.0, 1.0, h, dtype=np.float32)[:, None, None]
-        assert detect_split_x(scan) == 0.5
+        assert _split_x(scan) == 0.5
 
     def test_tiny_image_falls_back(self):
-        assert detect_split_x(np.zeros((4, 20, 3), np.float32)) == 0.5
+        assert _split_x(np.zeros((4, 20, 3), np.float32)) == 0.5
 
 
 def _diptych_scan_with_rebate() -> np.ndarray:
@@ -282,7 +286,7 @@ class TestIdentities:
 def test_expand_half_frames(monkeypatch):
     from negpy.desktop.workers import render as render_mod
 
-    monkeypatch.setattr("negpy.services.assets.half_frame.detect_split_x_for_file", lambda p: 0.48)
+    monkeypatch.setattr("negpy.services.assets.half_frame.detect_split_axis_for_file", lambda p: (0.48, "x"))
     worker = render_mod.AssetDiscoveryWorker()
     assets = [
         {"name": "a.tif", "path": "/p/a.tif", "hash": "ha"},
@@ -319,7 +323,7 @@ def test_expand_half_frames_with_profile_applies_it_uniformly(monkeypatch):
     gutter (0.1, per the monkeypatch) is ignored once a roll-wide value is set."""
     from negpy.desktop.workers import render as render_mod
 
-    monkeypatch.setattr("negpy.services.assets.half_frame.detect_split_x_for_file", lambda p: 0.1)
+    monkeypatch.setattr("negpy.services.assets.half_frame.detect_split_axis_for_file", lambda p: (0.1, "x"))
     worker = render_mod.AssetDiscoveryWorker()
     assets = [{"name": "a.tif", "path": "/p/a.tif", "hash": "ha"}]
     profile = {"crop_rect": [0.0, 0.0, 1.0, 1.0], "split_x": 0.6, "gutter_thickness": 0.02}
@@ -333,7 +337,7 @@ def test_expand_half_frames_per_file_override_wins_over_the_profile(monkeypatch)
     own base hash wins over it."""
     from negpy.desktop.workers import render as render_mod
 
-    monkeypatch.setattr("negpy.services.assets.half_frame.detect_split_x_for_file", lambda p: 0.9)
+    monkeypatch.setattr("negpy.services.assets.half_frame.detect_split_axis_for_file", lambda p: (0.9, "x"))
     worker = render_mod.AssetDiscoveryWorker()
     assets = [
         {"name": "a.tif", "path": "/p/a.tif", "hash": "ha"},
@@ -357,7 +361,7 @@ def test_auto_detect_all_splits_worker_emits_per_file_results(monkeypatch):
     from negpy.desktop.workers import render as render_mod
     from negpy.desktop.workers.render import AutoDetectAllSplitsTask
 
-    detected = {"/p/a.tif": (0.4, 0.02, (0.05, 0.05, 0.95, 0.95)), "/p/b.tif": (0.6, 0.0, None)}
+    detected = {"/p/a.tif": (0.4, 0.02, (0.05, 0.05, 0.95, 0.95), "x"), "/p/b.tif": (0.6, 0.0, None, "y")}
     monkeypatch.setattr("negpy.services.assets.half_frame.detect_split_and_crop_for_file", lambda p: detected[p])
     worker = render_mod.AssetDiscoveryWorker()
     results = []
@@ -409,7 +413,7 @@ def test_halves_measure_independent_bounds():
     gutter = np.full((240, 12, 3), 0.95)
     scan = np.concatenate([left, gutter, right], axis=1).astype(np.float32)
 
-    sx = detect_split_x(scan)
+    sx = _split_x(scan)
     b1 = analyze_log_exposure_bounds(np.ascontiguousarray(slice_half(scan, 1, sx)))
     b2 = analyze_log_exposure_bounds(np.ascontiguousarray(slice_half(scan, 2, sx)))
     # Floors differ per half (dark vs bright frame). Ceils can legitimately agree:
@@ -875,3 +879,91 @@ class TestDiptychAsset:
         assert "Diptych" in composite_summary(asset)
         # A half still reads as a half while the mode is on.
         assert composite_kind({"hash": "ha#1", "half": 1, "diptych": True}) == "half"
+
+
+class TestSplitAxisY:
+    def test_slice_matches_the_transposed_x_slice(self):
+        rng = np.random.default_rng(3)
+        a = rng.random((37, 53, 3)).astype(np.float32)
+        rect = (0.1, 0.05, 0.9, 0.95)
+        rect_t = (rect[1], rect[0], rect[3], rect[2])
+        for half in (0, 1, 2):
+            got = slice_half(a, half, 0.4, crop_rect=rect, gutter_thickness=0.04, split_axis="y")
+            via_t = slice_half(np.swapaxes(a, 0, 1), half, 0.4, crop_rect=rect_t, gutter_thickness=0.04)
+            assert np.array_equal(got, np.swapaxes(via_t, 0, 1))
+
+    def test_dimensions_follow_the_slice(self):
+        rng = np.random.default_rng(4)
+        a = rng.random((41, 29, 3)).astype(np.float32)
+        for half in (1, 2):
+            got = slice_half(a, half, 0.6, gutter_thickness=0.02, split_axis="y")
+            dims = slice_half_dimensions(a.shape[:2], half, 0.6, gutter_thickness=0.02, split_axis="y")
+            assert got.shape[:2] == dims
+
+    def test_halves_stack_without_losing_rows(self):
+        a = np.arange(200 * 10 * 3, dtype=np.float32).reshape(200, 10, 3)
+        top = slice_half(a, 1, 0.3, split_axis="y")
+        bottom = slice_half(a, 2, 0.3, split_axis="y")
+        assert top.shape[0] + bottom.shape[0] == 200
+        assert np.array_equal(np.concatenate([top, bottom], axis=0), a)
+
+    def test_join_stacks_vertically_with_a_gap(self):
+        top = np.ones((6, 10, 3), np.float32)
+        bottom = np.ones((5, 8, 3), np.float32)
+        joined = join_halves(top, bottom, gap=3, axis="y")
+        assert joined.shape == (6 + 3 + 5, 10, 3)
+        assert float(joined[7].max()) == 0.0
+
+    def test_remap_holds_a_point_across_an_axis_change(self):
+        geom_x = HalfGeometry(split_x=0.5, split_axis="x")
+        geom_y = HalfGeometry(split_x=0.5, split_axis="y")
+        x, y = remap_point(0.5, 0.5, 1, geom_x, geom_x)
+        assert (round(x, 6), round(y, 6)) == (0.5, 0.5)
+        fx, fy = 0.25, 0.5
+        gx, gy = remap_point(*remap_point(fx, fy, 1, geom_x, geom_x), 1, geom_x, geom_y)
+        from negpy.services.assets.half_frame import _to_scan
+
+        assert _to_scan(gx, gy, 1, geom_y) == _to_scan(fx, fy, 1, geom_x)
+
+
+class TestDetectGutterAxis:
+    def test_side_by_side_frames_pick_x(self):
+        split, thickness, axis = detect_gutter_axis(_two_frame_scan(0.95))
+        assert axis == "x"
+        assert abs(split - 0.48) < 0.03
+        assert thickness > 0.0
+
+    def test_stacked_frames_pick_y(self):
+        scan = np.swapaxes(_two_frame_scan(0.95), 0, 1)
+        split, thickness, axis = detect_gutter_axis(np.ascontiguousarray(scan))
+        assert axis == "y"
+        assert abs(split - 0.48) < 0.03
+        assert thickness > 0.0
+
+    def test_no_gutter_defaults_to_x(self):
+        flat = np.full((200, 400, 3), 0.5, np.float32)
+        assert detect_gutter_axis(flat) == (0.5, 0.0, "x")
+
+    def test_an_equal_horizontal_band_does_not_flip_the_axis(self):
+        scan = _two_frame_scan(0.95).copy()
+        mid = scan.shape[0] // 2
+        scan[mid - 8 : mid + 8] = 0.95
+        _, _, axis = detect_gutter_axis(scan)
+        assert axis == "x"
+
+
+def test_slice_for_asset_reads_the_split_axis():
+    a = np.arange(40 * 20 * 3, dtype=np.float32).reshape(40, 20, 3)
+    info = {"half": 1, "split_x": 0.5, "split_axis": "y"}
+    assert np.array_equal(slice_for_asset(a, info), a[:20])
+    info["split_axis"] = "x"
+    assert np.array_equal(slice_for_asset(a, info), a[:, :10])
+
+
+def test_diptych_half_slice_is_the_five_tuple_the_loader_unpacks():
+    from negpy.desktop.controller import AppController
+
+    info = {"split_x": 0.4, "crop_rect": (0.1, 0.1, 0.9, 0.9), "gutter_thickness": 0.02, "split_axis": "y"}
+    assert AppController._half_slice_for_diptych(info) == (0, 0.4, (0.1, 0.1, 0.9, 0.9), 0.02, "y")
+    info.pop("split_axis")
+    assert AppController._half_slice_for_diptych(info)[4] == "x"

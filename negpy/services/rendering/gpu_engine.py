@@ -397,9 +397,7 @@ class GPUEngine:
             or self._last_scale_factor != scale_factor
             or self._last_render_size_ref != render_size_ref
             or self._last_settings.process.process_mode != settings.process.process_mode
-            # Toggling the crop tool changes only the late-stage dispatch extent (see
-            # full_frame in process_to_texture), but that resizes every texture from
-            # toning on, so cached ones at the other extent cannot be reused.
+            # The crop tool resizes every texture from toning on, so nothing cached survives a toggle.
             or self._last_full_frame != full_frame
         ):
             return 0
@@ -441,7 +439,6 @@ class GPUEngine:
         Key is (w, h, usage, label). A 90°/270° rotation already swaps w and h
         upstream (see w_rot/h_rot computation), so the key naturally changes
         with geometry — no extra geometry field needed.
-        Contents are fully overwritten each render, so no stale-data risk.
 
         Invariant: callers must pass post-rotation dimensions. If rotation
         handling ever moves downstream of texture allocation, revisit this key.
@@ -589,16 +586,12 @@ class GPUEngine:
         cam_xyz: Optional[list] = None,
         camera_wb: Optional[list] = None,
         contrast_mask_override: Optional[Tuple[np.ndarray, float, Tuple[int, int, int, int]]] = None,
+        # Crop tool preview: toning and finish span the whole rotated frame, with no border or
+        # carrier; the meter, contrast mask and active_roi stay on the crop, as in the CPU engine.
         full_frame: bool = False,
     ) -> Tuple[Any, Dict[str, Any]]:
         """
         Executes the full pipeline, returning a GPU texture and associated metrics.
-
-        ``full_frame``: the crop tool's own preview, which shows the whole rotated
-        frame outside the crop rectangle too. Widens only the late-stage dispatch
-        extent (toning/finish/layout); the meter, the contrast mask and the
-        reported ``active_roi`` stay on the real crop, so the crop tool's overlay
-        still tracks it and the print exposure the CPU engine would compute.
 
         ``local_maps`` is the pre-rasterised (h, w, 2) dodge/burn EV + local grade
         map already in the post-geometry frame; tiled export passes a per-tile slice.
@@ -710,10 +703,11 @@ class GPUEngine:
         _roll_color = settings.process.use_color_average and settings.process.is_locked_initialized
         needs_bounds_analysis = not (bounds_override or (_roll_luma and _roll_color) or settings.process.is_local_initialized)
         transfer = render_path(settings.process) is not RenderPath.PRINT
-        # Measure the anchor for the render when Auto Density is on, and for the
-        # Analysis-panel stats on every preview whatever the toggle says. The render only
-        # *uses* it when auto_exposure is on (see uniforms).
-        needs_anchor = metered_anchor_override is None and not tiling_mode and (settings.exposure.auto_exposure or readback_metrics)
+        # Measure the anchor for every render that reads it: Auto Density, and on the
+        # transfer path Auto Grade's Shadow Reach, which reads it whatever Auto Density
+        # says. Previews also measure it for the Analysis-panel stats.
+        anchor_used = settings.exposure.auto_exposure or (transfer and settings.exposure.auto_normalize_contrast)
+        needs_anchor = metered_anchor_override is None and not tiling_mode and (anchor_used or readback_metrics)
         needs_textural = textural_range_override is None and not tiling_mode and settings.exposure.auto_normalize_contrast
         needs_shadow = shadow_point_override is None and not tiling_mode and settings.exposure.auto_normalize_contrast
         needs_highlight = highlight_point_override is None and not tiling_mode and settings.exposure.auto_normalize_contrast
@@ -951,6 +945,7 @@ class GPUEngine:
             render_size_ref,
             scale_factor,
             vignette_full_crop=vignette_full_crop,
+            full_frame=full_frame,
             shadow_refs=shadow_refs,
             metered_anchor=metered_anchor,
             textural_range=textural_range,
@@ -1324,11 +1319,11 @@ class GPUEngine:
                 crop_w,
                 crop_h,
             )
-            tex_for_layout = tex_finish
-        else:
-            tex_for_layout = tex_toning
+        # The pool never zeros or evicts it, so it still holds its last output when the stage
+        # is cached; tex_toning is pre-vignette and never the display source.
+        tex_for_layout = tex_finish
 
-        if not tiling_mode and apply_layout:
+        if not tiling_mode and apply_layout and not full_frame:
             paper_w, paper_h, content_w, content_h, off_x, off_y, _ = self._calculate_layout_dims(settings, crop_w, crop_h, render_size_ref)
             tex_final = self._get_intermediate_texture(
                 paper_w,
@@ -1513,6 +1508,7 @@ class GPUEngine:
         render_size_ref: Optional[float],
         scale_factor: float,
         vignette_full_crop: Optional[Tuple[int, int, int, int]] = None,
+        full_frame: bool = False,
         shadow_refs: Optional[Tuple[float, float, float]] = None,
         metered_anchor: Optional[float] = None,
         textural_range: Optional[float] = None,
@@ -2041,7 +2037,7 @@ class GPUEngine:
         else:
             v_full_w, v_full_h, v_off_x, v_off_y = vignette_full_crop
         carrier_px = 0.0
-        if settings.finish.carrier_width > 0.0:
+        if settings.finish.carrier_width > 0.0 and not full_frame:
             carrier_px = carrier_width_px(
                 settings.finish.carrier_width,
                 settings.export.export_print_size,
@@ -2568,7 +2564,7 @@ class GPUEngine:
                 global_neutral_axis = blend_neutral_axis(global_neutral_axis, pooled_axis)
 
         global_metered_anchor = None
-        if settings.exposure.auto_exposure:
+        if settings.exposure.auto_exposure or (transfer and settings.exposure.auto_normalize_contrast):
             global_metered_anchor = measure_anchor_from_log(
                 _meter_grid(), meter_bounds, None, 0.0, assumed=transfer_assumed_anchor() if transfer else None
             )

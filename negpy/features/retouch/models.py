@@ -45,6 +45,13 @@ class RetouchConfig:
     # detection is released under the pixels the band covers, so film the detector read as
     # dust keeps its own. Toggling dust_remove clears the list.
     dust_exclusion_strokes: List[Tuple] = field(default_factory=list)
+    # Each stroke: (points, size, src_dx, src_dy, strength, feather, match_tone); the first four as in
+    # manual_heal_strokes, then the brush settings it was painted with (strength and feather 0-1).
+    clone_strokes: List[Tuple] = field(default_factory=list)
+    # The Clone brush settings the next stroke takes.
+    clone_strength: float = 1.0
+    clone_feather: float = 0.5
+    clone_match_tone: bool = True
     ir_dust_remove: bool = False
     # Which reconstruction runs (IR_METHODS). ir_attenuation belongs to the NegPy method
     # alone: OpenICE folds that tier into its own base term.

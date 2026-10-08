@@ -272,7 +272,8 @@ class DarkroomEngine:
             from negpy.services.export.print import PrintService
 
             paper = PrintService.effective_paper_linear(settings.finish, settings.toning)
-            tone = rebate_tone(settings, context.metrics) if settings.finish.carrier_width > 0.0 else None
+            carrier_live = settings.finish.carrier_width > 0.0 and not context.crop_preview_full
+            tone = rebate_tone(settings, context.metrics) if carrier_live else None
             current_img = FinishProcessor(settings.finish, settings.export.export_print_size, paper, tone).process(current_img, context)
             # Output transform: scene-linear -> display-encoded (flat master skips this).
             current_img = ensure_image(working_oetf_encode(current_img))

@@ -55,6 +55,7 @@ async def generate_batch_embeddings(
             tuple(f_info["crop_rect"]) if f_info.get("crop_rect") else None,
             float(f_info.get("gutter_thickness") or 0.0),
             str(f_info.get("process_mode") or ""),
+            split_axis=str(f_info.get("split_axis") or "x"),
         )
         if thumb is None:
             return None

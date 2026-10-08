@@ -171,11 +171,7 @@ class StorageRepository(IRepository):
         return None
 
     def path_for_file_hash(self, file_hash: str) -> Optional[str]:
-        """The file this hash's edit was last saved against, or None.
-
-        Identity is the content, so two files with the same bytes are one frame. This is how
-        a merge recognizes a negative it has already written.
-        """
+        """The file this hash's edit was last saved against, or None."""
         with self._connect(self.edits_db_path) as conn:
             row = conn.execute(
                 "SELECT file_path FROM file_settings WHERE file_hash = ? AND file_path IS NOT NULL AND file_path != ''",
@@ -251,6 +247,17 @@ class StorageRepository(IRepository):
                 )
                 for file_hash, settings_json in cursor.fetchall():
                     out[str(file_hash)] = WorkspaceConfig.from_flat_dict(json.loads(settings_json))
+        return out
+
+    def saved_hashes(self, hashes: List[str]) -> set[str]:
+        """The hashes among *hashes* that hold a saved edit, without parsing any of them."""
+        out: set[str] = set()
+        with self._connect(self.edits_db_path) as conn:
+            for start in range(0, len(hashes), 500):
+                chunk = hashes[start : start + 500]
+                placeholders = ",".join("?" * len(chunk))
+                cursor = conn.execute(f"SELECT file_hash FROM file_settings WHERE file_hash IN ({placeholders})", chunk)
+                out.update(str(row[0]) for row in cursor.fetchall())
         return out
 
     def load_settings_by_path(self) -> dict[str, WorkspaceConfig]:

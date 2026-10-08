@@ -21,6 +21,21 @@ class TransientScanError(RuntimeError):
     """
 
 
+class StripReturned(RuntimeError):
+    """The unit returned a measured strip by itself (an idle timeout); its frame picks no longer line up.
+
+    `loaded` is True where a strip waited in the adapter, or where a long idle may hide one put back in.
+    """
+
+    def __init__(self, *, loaded: bool) -> None:
+        self.loaded = loaded
+        if loaded:
+            first, then = "The scanner sat idle long enough to return the strip.", "Preview the strip again."
+        else:
+            first, then = "The scanner returned the strip while it sat idle.", "Insert it again, then preview it."
+        super().__init__(f"{first} Its frame selection, crops and per-frame offsets were cleared. {then}")
+
+
 @dataclass(frozen=True)
 class ScannerCapabilities:
     ir_channel: bool
@@ -51,6 +66,8 @@ class ScannerCapabilities:
     #: Frames are detected per strip, not addressed by index: the count is unknown until a
     #: strip is measured, so the UI must grow its slots from what the preview reports.
     roll_discovery: bool = False
+    #: Previews are cut from one pass over the whole strip; previewing one frame again shows the same pixels.
+    strip_pass: bool = False
     #: Film formats the transport must be told, because it cannot measure the frame length
     #: itself. Empty when the holder fixes it.
     film_formats: tuple[str, ...] = ()

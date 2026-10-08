@@ -71,7 +71,8 @@ class FinishProcessor:
     def process(self, image: ImageBuffer, context: PipelineContext) -> ImageBuffer:
         if self.config.vignette_stops != 0.0:
             image = apply_vignette(image, self.config.vignette_stops, self.config.vignette_size, self.config.vignette_roundness)
-        if self.config.carrier_width > 0.0:
+        # The crop tool's uncropped preview has no frame edge for the carrier to file.
+        if self.config.carrier_width > 0.0 and not context.crop_preview_full:
             width = carrier_width_px(self.config.carrier_width, self.print_size_cm, float(max(image.shape[:2])))
             image = apply_carrier(
                 image,

@@ -2504,6 +2504,11 @@ def rotate_geometry_and_analysis(
     """
     pipeline_direction = -direction if geo.flip_horizontal != geo.flip_vertical else direction
     new_geo = replace(geo, rotation=(geo.rotation + pipeline_direction) % 4)
+    if geo.converge_v != 0.0 or geo.converge_h != 0.0:
+        converge_v, converge_h = geo.converge_v, geo.converge_h
+        for _ in range(direction % 4):
+            converge_v, converge_h = 0.0 - converge_h, converge_v
+        new_geo = replace(new_geo, converge_v=converge_v, converge_h=converge_h)
     if geo.crop_rect is not None:
         new_geo = replace(new_geo, crop_rect=rotate_normalized_rect(geo.crop_rect, direction))
     new_rect = rotate_normalized_rect(analysis_rect, direction) if analysis_rect is not None else None
@@ -2521,9 +2526,9 @@ def toggle_flip(geo: GeometryConfig, horizontal: bool) -> GeometryConfig:
     it frames.
     """
     if horizontal:
-        new_geo = replace(geo, flip_horizontal=not geo.flip_horizontal)
+        new_geo = replace(geo, flip_horizontal=not geo.flip_horizontal, converge_h=0.0 - geo.converge_h)
     else:
-        new_geo = replace(geo, flip_vertical=not geo.flip_vertical)
+        new_geo = replace(geo, flip_vertical=not geo.flip_vertical, converge_v=0.0 - geo.converge_v)
     if geo.fine_rotation != 0.0:
         new_geo = replace(new_geo, fine_rotation=-geo.fine_rotation)
     if geo.crop_rect is not None:

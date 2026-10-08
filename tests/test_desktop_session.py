@@ -1,3 +1,4 @@
+import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -16,6 +17,11 @@ _ROWS = {r.label: r for r in all_rows()}
 
 def _row(label: str):
     return _ROWS[label]
+
+
+def _native(path: str) -> str:
+    """*path* spelled with the OS separator, as the app's folder walk builds it."""
+    return path.replace("/", os.sep)
 
 
 class TestDesktopSessionSync(unittest.TestCase):
@@ -356,6 +362,38 @@ class TestDesktopSessionSync(unittest.TestCase):
         self.assertIn("last_export_config", saved)
         self.assertIn("last_narrowband_scan", saved)
 
+    def _with_global(self, **values):
+        base = self.mock_repo.get_global_setting.side_effect
+        self.mock_repo.get_global_setting.side_effect = lambda key, default=None: values[key] if key in values else base(key, default)
+
+    def test_a_saved_frame_opens_with_the_users_brush_size(self):
+        saved = replace(WorkspaceConfig(), retouch=replace(WorkspaceConfig().retouch, manual_dust_size=40))
+        self.mock_repo.load_file_settings.return_value = saved
+        self._with_global(last_brush_size=12)
+        self.session.select_file(0)
+        self.assertEqual(self.session.state.config.retouch.manual_dust_size, 12)
+
+    def test_a_fresh_frame_and_a_reset_take_the_users_brush_size(self):
+        self._with_global(last_brush_size=20)
+        self.assertEqual(self.session._apply_sticky_settings(WorkspaceConfig()).retouch.manual_dust_size, 20)
+        reset = self.session._reset_frame({"name": "file1.dng", "path": "path1", "hash": ""})
+        self.assertEqual(reset.retouch.manual_dust_size, 20)
+
+    def test_a_stored_brush_size_out_of_range_is_clamped_and_garbage_ignored(self):
+        self._with_global(last_brush_size=999)
+        self.assertEqual(self.session._apply_sticky_settings(WorkspaceConfig()).retouch.manual_dust_size, 64)
+        self._with_global(last_brush_size="big")
+        self.assertEqual(
+            self.session._apply_sticky_settings(WorkspaceConfig()).retouch.manual_dust_size, WorkspaceConfig().retouch.manual_dust_size
+        )
+
+    def test_changing_the_brush_size_records_it_for_every_frame(self):
+        self.session.select_file(0)
+        self.mock_repo.save_global_settings.reset_mock()
+        cfg = self.session.state.config
+        self.session.update_config(replace(cfg, retouch=replace(cfg.retouch, manual_dust_size=33)), persist=True)
+        self.assertEqual(self.mock_repo.save_global_settings.call_args.args[0]["last_brush_size"], 33)
+
     def test_persist_active_batch_config_saves_before_exposing_state(self):
         original = self.session.state.config
         updated = replace(original, geometry=replace(original.geometry, fine_rotation=1.25))
@@ -418,6 +456,25 @@ class TestDesktopSessionSync(unittest.TestCase):
         )
         config = self.session._apply_sticky_settings(base, only_global=True)
         self.assertEqual(config.metadata.description_fields, ("camera", "iso"))
+
+    def test_a_presets_sensor_profile_is_not_carried_to_other_frames(self):
+        from negpy.desktop.sticky import STICKY_CONFIG_KEY
+
+        matrix = (1.0, -0.1, 0.0, -0.1, 1.0, -0.3, 0.0, -0.3, 1.0)
+        store = {
+            "scanlight_presets": {"Portra": {"single_capture": True, "sensor_profile": "Portra"}},
+            STICKY_CONFIG_KEY: {"sensor_profile": "Hand Made", "sensor_matrix": [2.0] * 9},
+        }
+        self.mock_repo.get_global_setting.side_effect = lambda key, default=None: store.get(key, default)
+
+        def persisted(profile):
+            process = replace(WorkspaceConfig().process, sensor_profile=profile, sensor_matrix=matrix)
+            self.session._persist_sticky_settings(replace(WorkspaceConfig(), process=process))
+            return self.mock_repo.save_global_settings.call_args.args[0][STICKY_CONFIG_KEY]
+
+        kept = persisted("Portra")
+        self.assertEqual((kept["sensor_profile"], kept["sensor_matrix"]), ("Hand Made", [2.0] * 9))
+        self.assertEqual(persisted("Other Hand Made")["sensor_profile"], "Other Hand Made")
 
     def test_persist_sticky_settings_does_not_write_description_fields(self):
         """Any metadata save must not clobber last Description… confirm."""
@@ -697,27 +754,14 @@ class TestDesktopSessionSync(unittest.TestCase):
         self.assertEqual(on.exposure.density, 2.2)
 
     def test_contact_sheet_output_path_in_sticky_export(self):
+        # A record saved before the grid layout retired still carries its keys; they are ignored.
         sticky = {
             "last_export_config": {"contact_sheet_output_path": "/saved/contact", "contact_sheet_cell_px": 800},
         }
         self.mock_repo.get_global_setting.side_effect = lambda key, default=None: sticky.get(key, default)
         config = self.session._apply_sticky_settings(WorkspaceConfig(), only_global=False)
         self.assertEqual(config.export.contact_sheet_output_path, "/saved/contact")
-        self.assertEqual(config.export.contact_sheet_cell_px, 800)
-
-    def test_contact_sheet_template_in_sticky_export(self):
-        sticky = {
-            "last_export_config": {
-                "contact_sheet_template": "Tight 35mm",
-                "contact_sheet_cell_px": 400,
-                "contact_sheet_default_cell_px": 550,
-            },
-        }
-        self.mock_repo.get_global_setting.side_effect = lambda key, default=None: sticky.get(key, default)
-        config = self.session._apply_sticky_settings(WorkspaceConfig(), only_global=False)
-        self.assertEqual(config.export.contact_sheet_template, "Tight 35mm")
-        self.assertEqual(config.export.contact_sheet_cell_px, 400)
-        self.assertEqual(config.export.contact_sheet_default_cell_px, 550)
+        self.assertFalse(hasattr(config.export, "contact_sheet_cell_px"))
 
     def test_sync_selected_settings_exclusions(self):
         source_config = WorkspaceConfig(
@@ -1126,50 +1170,50 @@ class TestDesktopSessionSync(unittest.TestCase):
 
     def test_rehome_folder_paths_repoints_every_matching_asset(self):
         self.session.state.uploaded_files = [
-            {"name": "a.tif", "path": "/scans/roll_a/a.tif", "hash": "ha"},
-            {"name": "b.tif", "path": "/scans/roll_a/sub/b.tif", "hash": "hb"},
-            {"name": "c.tif", "path": "/elsewhere/c.tif", "hash": "hc"},
+            {"name": "a.tif", "path": _native("/scans/roll_a/a.tif"), "hash": "ha"},
+            {"name": "b.tif", "path": _native("/scans/roll_a/sub/b.tif"), "hash": "hb"},
+            {"name": "c.tif", "path": _native("/elsewhere/c.tif"), "hash": "hc"},
         ]
 
-        self.session.rehome_folder_paths("/scans/roll_a", "/scans/roll_b")
+        self.session.rehome_folder_paths(_native("/scans/roll_a"), _native("/scans/roll_b"))
 
         paths = [f["path"] for f in self.session.state.uploaded_files]
-        self.assertEqual(paths, ["/scans/roll_b/a.tif", "/scans/roll_b/sub/b.tif", "/elsewhere/c.tif"])
+        self.assertEqual(paths, [_native("/scans/roll_b/a.tif"), _native("/scans/roll_b/sub/b.tif"), _native("/elsewhere/c.tif")])
 
     def test_rehome_folder_paths_updates_the_active_file_path(self):
-        self.session.state.uploaded_files = [{"name": "a.tif", "path": "/scans/roll_a/a.tif", "hash": "ha"}]
-        self.session.state.current_file_path = "/scans/roll_a/a.tif"
+        self.session.state.uploaded_files = [{"name": "a.tif", "path": _native("/scans/roll_a/a.tif"), "hash": "ha"}]
+        self.session.state.current_file_path = _native("/scans/roll_a/a.tif")
 
-        self.session.rehome_folder_paths("/scans/roll_a", "/scans/roll_b")
+        self.session.rehome_folder_paths(_native("/scans/roll_a"), _native("/scans/roll_b"))
 
-        self.assertEqual(self.session.state.current_file_path, "/scans/roll_b/a.tif")
+        self.assertEqual(self.session.state.current_file_path, _native("/scans/roll_b/a.tif"))
 
     def test_rehome_folder_paths_rewrites_composite_part_paths(self):
         self.session.state.uploaded_files = [
             {
                 "name": "triplet",
-                "path": "/scans/roll_a/r.tif",
+                "path": _native("/scans/roll_a/r.tif"),
                 "hash": "ha",
-                "green_path": "/scans/roll_a/g.tif",
-                "blue_path": "/scans/roll_a/b.tif",
+                "green_path": _native("/scans/roll_a/g.tif"),
+                "blue_path": _native("/scans/roll_a/b.tif"),
             },
             {
                 "name": "stitch",
-                "path": "/scans/roll_a/1.tif",
+                "path": _native("/scans/roll_a/1.tif"),
                 "hash": "hb",
-                "stitch_paths": ["/scans/roll_a/1.tif", "/scans/roll_a/2.tif"],
+                "stitch_paths": [_native("/scans/roll_a/1.tif"), _native("/scans/roll_a/2.tif")],
                 "stitch_transforms": [[1, 0, 0], [0, 1, 0]],
                 "stitch_canvas": [100, 100],
                 "stitch_sizes": [[50, 100], [50, 100]],
             },
         ]
 
-        self.session.rehome_folder_paths("/scans/roll_a", "/scans/roll_b")
+        self.session.rehome_folder_paths(_native("/scans/roll_a"), _native("/scans/roll_b"))
 
         triplet, stitch = self.session.state.uploaded_files
-        self.assertEqual(triplet["green_path"], "/scans/roll_b/g.tif")
-        self.assertEqual(triplet["blue_path"], "/scans/roll_b/b.tif")
-        self.assertEqual(stitch["stitch_paths"], ["/scans/roll_b/1.tif", "/scans/roll_b/2.tif"])
+        self.assertEqual(triplet["green_path"], _native("/scans/roll_b/g.tif"))
+        self.assertEqual(triplet["blue_path"], _native("/scans/roll_b/b.tif"))
+        self.assertEqual(stitch["stitch_paths"], [_native("/scans/roll_b/1.tif"), _native("/scans/roll_b/2.tif")])
 
     def test_rehome_folder_paths_is_a_noop_when_nothing_matches(self):
         self.session.state.uploaded_files = [{"name": "c.tif", "path": "/elsewhere/c.tif", "hash": "hc"}]
@@ -1343,8 +1387,6 @@ class TestDesktopSessionSync(unittest.TestCase):
         self.assertEqual(saved, {"hash1", "hash2"})  # c.jpg filtered out, not touched
 
     def test_reset_roll_settings_selection_scope_respects_active_filter(self):
-        # A hidden frame is not a target in either scope, so a stale selection entry
-        # cannot reach past the filter (#1220).
         self._seed_roll()
         self.session.asset_model.set_filter(".arw", regex=False)  # hides c.jpg
         self.session.state.selected_indices = [0, 1, 2]
@@ -1442,13 +1484,13 @@ class TestDesktopSessionSync(unittest.TestCase):
         self.session.select_file(1)
         self.assertEqual(seen, ["hash1"])
 
-    def test_active_file_changing_not_emitted_when_clean(self):
+    def test_active_file_changing_emitted_when_clean(self):
         self.session.state.current_file_hash = "hash1"
         self.session.state.is_dirty = False
-        fired = []
-        self.session.active_file_changing.connect(lambda: fired.append(True))
+        seen = []
+        self.session.active_file_changing.connect(lambda: seen.append(self.session.state.current_file_hash))
         self.session.select_file(1)
-        self.assertEqual(fired, [])
+        self.assertEqual(seen, ["hash1"])
 
     def test_clear_files_persists_empty_manifest(self):
         self.session.clear_files()
@@ -1685,8 +1727,7 @@ class TestSessionEmptied(unittest.TestCase):
         self.assertIsNone(state.current_file_hash)
         self.assertIsNone(state.preview_raw)
         self.assertEqual(state.last_metrics, {})
-        # Back to a fresh session's own config, which is the one a card's Reset lands on.
-        self.assertEqual(state.config, AppState().config)
+        self.assertEqual(state.config, self.session._empty_session_config())
 
     def test_remove_current_last_file_emits_and_resets(self):
         self.session.remove_current_file()
@@ -1717,6 +1758,42 @@ class TestSessionEmptied(unittest.TestCase):
         self.assertEqual(self.emptied_count, 0)
         self.assertEqual(len(self.session.state.uploaded_files), 1)
         self.assertEqual(self.session.state.selected_file_idx, 0)
+
+
+class TestEmptySessionConfig(unittest.TestCase):
+    def setUp(self):
+        self.store = {"sticky_config": {"distortion_k1": 0.05, "autocrop_ratio": "6:7"}, "flatfield_active_profile": "rig-a"}
+        self.mock_repo = MagicMock(spec=StorageRepository)
+        self.mock_repo.load_file_settings.return_value = None
+        self.mock_repo.load_file_settings_by_path.return_value = None
+        self.mock_repo.get_global_setting.side_effect = lambda key, default=None: self.store.get(key, default)
+        self.mock_repo.save_global_settings.side_effect = self.store.update
+        self.mock_repo.get_max_history_index.return_value = 0
+        patcher = patch("negpy.desktop.session.FlatFieldProfiles.get", return_value=SimpleNamespace(id="rig-a", k1=0.0))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.session = DesktopSessionManager(self.mock_repo)
+
+    def _assert_carried(self):
+        config = self.session.state.config
+        self.assertEqual(config.geometry.distortion_k1, 0.05)
+        self.assertEqual(config.flatfield.profile_id, "rig-a")
+        self.assertTrue(config.flatfield.apply)
+
+    def test_startup_holds_the_carried_values(self):
+        self._assert_carried()
+
+    def test_emptied_session_holds_the_carried_values(self):
+        self.session.state.uploaded_files = [{"name": "f.dng", "path": "p", "hash": "h"}]
+        self.session.state.config = DEFAULT_WORKSPACE_CONFIG
+        self.session.clear_files()
+        self._assert_carried()
+
+    def test_edit_with_no_frame_keeps_other_carried_values(self):
+        config = self.session.state.config
+        self.session.update_config(replace(config, flatfield=replace(config.flatfield, apply=False)), persist=True, render=False)
+        self.assertEqual(self.store["sticky_config"]["distortion_k1"], 0.05)
+        self.assertEqual(self.store["sticky_config"]["autocrop_ratio"], "6:7")
 
 
 class TestTriageMarks(unittest.TestCase):
@@ -2168,6 +2245,28 @@ class ResetKeepsScanSetup(unittest.TestCase):
 
         self.assertFalse(self.session.state.config.process.narrowband_scan)
         self.assertIn("sensor", rolls.frame_override_cards(self.repo, roll_id, "hash1"))
+
+    def test_loading_a_sidecar_replaces_the_edit_as_one_undo_step(self):
+        import tempfile
+
+        from negpy.services.assets import rolls
+        from negpy.services.assets.sidecar import write_sidecar
+
+        roll_id = self._own_narrowband_then_reset()
+        own = self.session.state.config
+        before = self.session.state.undo_index
+        with tempfile.TemporaryDirectory() as d:
+            path = write_sidecar(
+                f"{d}/frame.tif",
+                replace(own, process=replace(own.process, narrowband_scan=False), exposure=replace(own.exposure, density=0.77)),
+            )
+            self.assertTrue(self.session.load_edit_from_sidecar(path))
+            self.assertFalse(self.session.load_edit_from_sidecar(f"{d}/missing.negpy"))
+
+        self.assertEqual(self.session.state.config.exposure.density, 0.77)
+        self.assertEqual(self.repo.load_file_settings("hash1").exposure.density, 0.77)
+        self.assertIn("sensor", rolls.frame_override_cards(self.repo, roll_id, "hash1"))
+        self.assertEqual(self.session.state.undo_index, before + 1)
 
     def test_a_paste_locks_a_card_that_differs_from_the_roll(self):
         from negpy.services.assets import rolls

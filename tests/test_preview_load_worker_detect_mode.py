@@ -173,7 +173,7 @@ def test_new_preview_generation_skips_older_queued_work(qapp):
         generation=1,
         use_splash=False,
     )
-    worker.expect_generation(2)
+    worker._state.expect_generation(2)
 
     worker.process(old)
 
@@ -198,11 +198,11 @@ def test_obsolete_preview_failure_is_not_reported(qapp):
     worker.load_failed.connect(lambda *args: failures.append(args))
 
     def fail_after_navigation(*_args, **_kwargs):
-        worker.expect_generation(2)
+        worker._state.expect_generation(2)
         raise RuntimeError("obsolete failure")
 
     service.load_linear_preview.side_effect = fail_after_navigation
-    worker.expect_generation(1)
+    worker._state.expect_generation(1)
     worker.process(task)
 
     assert errors == []

@@ -642,7 +642,6 @@ def test_grouping_leaves_an_assembled_asset_alone(tmp_path, monkeypatch):
 
 
 def test_grouping_passes_over_a_merged_triplet_tiff(tmp_path, monkeypatch):
-    """A TIFF merged from a triplet is one frame: never probed, grouped or counted loose."""
     from negpy.desktop.workers.render import AssetDiscoveryWorker
     from negpy.services.export.frame_merge import write_merged_frame
 
@@ -792,7 +791,7 @@ def test_thumbnail_worker_namespaces_triplet_cache(monkeypatch):
         def get_thumbnail(self, key):
             return saved.get(key)
 
-        def save_thumbnail(self, key, img):
+        def save_thumbnail(self, key, img, fingerprint=None):
             saved[key] = img
 
     img = Image.new("RGB", (4, 4))
@@ -822,7 +821,7 @@ def test_triplet_ignores_stale_plain_hash_cache(monkeypatch):
         def get_thumbnail(self, key):
             return saved.get(key)
 
-        def save_thumbnail(self, key, img):
+        def save_thumbnail(self, key, img, fingerprint=None):
             saved[key] = img
 
     monkeypatch.setattr(thumbnails, "decode_bounded_source_preview", lambda *a, **k: merged)

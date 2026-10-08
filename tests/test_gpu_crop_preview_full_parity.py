@@ -1,13 +1,3 @@
-"""GPU/CPU parity for the crop tool's full-frame preview.
-
-crop_preview_full shows the whole rotated frame, ignoring crop_rect, while the
-crop tool is active. The GPU engine widens only its late-stage dispatch extent
-(toning/finish/layout) to match -- the meter, the contrast mask and the
-reported active_roi stay on the real crop, so this must render identically to
-the CPU engine (which always computed the whole frame and only skips the
-final CropProcessor slice) and to itself with the crop tool off.
-"""
-
 import unittest
 from dataclasses import replace
 
@@ -104,3 +94,53 @@ class TestCropPreviewFullParity(unittest.TestCase):
 
         self.assertNotEqual(cropped.shape, full.shape)
         self.assertEqual(cropped.shape, back_to_cropped.shape)
+
+    def test_full_frame_drops_border_and_carrier(self):
+        from negpy.services.rendering.image_processor import ImageProcessor
+
+        processor = ImageProcessor()
+        if processor.engine_gpu is None:
+            self.skipTest("GPU engine not initialised")
+        base = _cropped_and_warped_settings()
+        framed = replace(base, finish=replace(base.finish, border_size=1.0, carrier_width=2.0))
+        img = self._img()
+
+        bordered, _ = self._render(processor, framed, img, prefer_gpu=True, crop_preview_full=False)
+        cropped, _ = self._render(processor, base, img, prefer_gpu=True, crop_preview_full=False)
+        self.assertGreater(bordered.shape[0], cropped.shape[0])
+
+        plain_cpu, _ = self._render(processor, base, img, prefer_gpu=False, crop_preview_full=True)
+        plain_gpu, _ = self._render(processor, base, img, prefer_gpu=True, crop_preview_full=True)
+        tolerance = float(np.max(np.abs(plain_cpu - plain_gpu)))
+        for prefer_gpu, plain in ((False, plain_cpu), (True, plain_gpu)):
+            full, metrics = self._render(processor, framed, img, prefer_gpu=prefer_gpu, crop_preview_full=True)
+            self.assertEqual(full.shape, img.shape)
+            self.assertIn(metrics.get("content_rect"), (None, (0, 0, img.shape[1], img.shape[0])))
+            self.assertLessEqual(float(np.max(np.abs(full - plain))), tolerance + 1e-9)
+
+    def test_cached_late_stages_keep_the_finish_pass(self):
+        from negpy.features.geometry.models import AspectRatio
+        from negpy.services.rendering.image_processor import ImageProcessor
+
+        processor = ImageProcessor()
+        if processor.engine_gpu is None:
+            self.skipTest("GPU engine not initialised")
+        base = _cropped_and_warped_settings()
+        vignetted = replace(base, finish=replace(base.finish, vignette_stops=1.5))
+        img = self._img()
+
+        fresh, _ = self._render(processor, vignetted, img, prefer_gpu=True, crop_preview_full=True)
+        cached, _ = self._render(processor, vignetted, img, prefer_gpu=True, crop_preview_full=True)
+        self.assertLessEqual(float(np.max(np.abs(cached - fresh))), 1e-6)
+
+        # An export-only change re-runs layout over the cached finish texture.
+        bordered = replace(vignetted, finish=replace(vignetted.finish, border_size=0.5))
+        self._render(processor, bordered, img, prefer_gpu=True, crop_preview_full=False)
+        relayout = replace(bordered, export=replace(bordered.export, paper_aspect_ratio=AspectRatio.R_1_1))
+        cached_path, _ = self._render(processor, relayout, img, prefer_gpu=True, crop_preview_full=False)
+        fresh_engine = ImageProcessor()
+        if fresh_engine.engine_gpu is None:
+            self.skipTest("GPU engine not initialised")
+        fresh_path, _ = self._render(fresh_engine, relayout, img, prefer_gpu=True, crop_preview_full=False)
+        self.assertEqual(cached_path.shape, fresh_path.shape)
+        self.assertLessEqual(float(np.max(np.abs(cached_path - fresh_path))), 1e-6)

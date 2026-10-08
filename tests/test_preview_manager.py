@@ -317,7 +317,6 @@ def test_load_linear_preview_hq_demosaic_xtrans_vs_bayer(cfa_block: int) -> None
 def test_load_linear_preview_fast_half_size_gated_on_xtrans(
     cfa_block: int, use_camera_wb: bool, half_expected: bool, demosaic_expected: object
 ) -> None:
-    """half_size is dropped for every X-Trans decode; under half_size the algorithm is moot."""
     rgb_u16 = np.ones((32, 32, 3), dtype=np.uint16) * 128
 
     raw = MagicMock()
@@ -565,7 +564,7 @@ def test_half_preview_reports_sliced_full_resolution_dimensions() -> None:
         lf.get_loader.return_value = (_Ctx(), {"color_space": "Adobe RGB"})
         buf, dims, _ = PreviewManager().load_linear_preview(
             "/fake/path.dng",
-            half_slice=(2, 0.4, (0.1, 0.1, 0.9, 0.9), 0.05),
+            half_slice=(2, 0.4, (0.1, 0.1, 0.9, 0.9), 0.05, "x"),
         )
 
     assert buf.shape == (40, 46, 3)
@@ -581,7 +580,7 @@ def test_half_splash_reports_sliced_full_resolution_dimensions() -> None:
         result = PreviewManager._try_splash_from_open_raw(
             raw,
             "/fake/path.dng",
-            half_slice=(2, 0.4, (0.1, 0.1, 0.9, 0.9), 0.05),
+            half_slice=(2, 0.4, (0.1, 0.1, 0.9, 0.9), 0.05, "x"),
         )
 
     assert result is not None
@@ -622,3 +621,25 @@ def test_explicit_demosaic_drops_half_size() -> None:
     _, kwargs = raw.postprocess.call_args
     assert kwargs["demosaic_algorithm"] == rawpy.DemosaicAlgorithm.VNG
     assert "half_size" not in kwargs
+
+
+def test_peek_linear_preview_hits_a_decode_load_linear_preview_cached() -> None:
+    ctx = NonStandardFileWrapper(np.full((120, 160, 3), 0.25, dtype=np.float32))
+    mgr = PreviewManager()
+    with patch("negpy.services.rendering.preview_manager.loader_factory") as lf:
+        lf.get_loader.return_value = (ctx, {"color_space": "Adobe RGB"})
+        buf, dims, _meta = mgr.load_linear_preview("/fake/path.tif", "Adobe RGB", use_camera_wb=True, file_hash="peek-hash")
+        lf.reset_mock()
+
+        hit = mgr.peek_linear_preview("/fake/path.tif", "Adobe RGB", use_camera_wb=True, file_hash="peek-hash")
+        wrong_wb = mgr.peek_linear_preview("/fake/path.tif", "Adobe RGB", use_camera_wb=False, file_hash="peek-hash")
+        absent = mgr.peek_linear_preview("/fake/path.tif", "Adobe RGB", use_camera_wb=True, file_hash="other-hash")
+
+        lf.get_loader.assert_not_called()
+    assert hit is not None and hit[0] is buf and hit[1] == dims
+    assert wrong_wb is None
+    assert absent is None
+
+
+def test_peek_linear_preview_without_a_hash_is_a_miss() -> None:
+    assert PreviewManager().peek_linear_preview("/fake/path.tif", "Adobe RGB", use_camera_wb=True, file_hash=None) is None

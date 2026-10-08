@@ -2,6 +2,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import List, Optional, Any, Union
 import gc
+import math
 import os
 import tempfile
 import threading
@@ -28,6 +29,15 @@ from negpy.features.hdr.models import hdr_frame_paths
 from negpy.services.export.print import PrintService
 from negpy.services.export.templating import render_export_filename
 from negpy.services.export.contact_sheet import ContactSheetService
+from negpy.services.export.contact_sheet_layout import (
+    MM_PER_INCH,
+    ContactSheetSettings,
+    SheetFormat,
+    best_dpi,
+    film_geometry,
+    plan_sheets,
+)
+from negpy.services.export.contact_sheet_roll import SheetFrame, SheetLook, tile_params, turns_for
 from negpy.services.export.encoders import encode_jpeg
 
 
@@ -84,6 +94,38 @@ class ExportTask:
 
 
 @dataclass(frozen=True)
+class ContactSheetJob:
+    """Built on the GUI thread; `frames` come in sheet order with the configs they print with."""
+
+    frames: tuple[SheetFrame, ...]
+    format: SheetFormat
+    frame_size: str
+    settings: ContactSheetSettings
+    look: SheetLook
+    out_dir: str
+    gpu_enabled: bool = True
+    working_color_space: str = WORKING_COLOR_SPACE
+    jpeg_quality: int = 95
+    jpeg_progressive: bool = False
+    # Each frame's place on the roll; empty means 0, 1, 2 …
+    numbers: tuple[int, ...] = ()
+    # Frames that start a new strip.
+    breaks: tuple[int, ...] = ()
+
+
+def contact_sheet_paths(out_dir: str, count: int) -> list[str]:
+    """One free suffix for every sheet of the set."""
+    pages = [""] if count == 1 else [f"_{i + 1}of{count}" for i in range(count)]
+    serial = 1
+    while True:
+        suffix = "" if serial == 1 else f"_{serial}"
+        paths = [os.path.join(out_dir, f"contact_sheet{suffix}{page}.jpg") for page in pages]
+        if not any(os.path.exists(path) for path in paths):
+            return paths
+        serial += 1
+
+
+@dataclass(frozen=True)
 class LinearOutputTask:
     """One frame's linear-output job. ``options`` is the keyword payload for
     export_linear_output, resolved on the UI thread where the config lives."""
@@ -127,6 +169,75 @@ def resolve_export_dir(task: ExportTask) -> str:
     return resolve_output_dir(task.file_info["path"], task.export_settings, task.roll_export_root)
 
 
+def _looks_border_crushed(buffer, task: "ExportTask") -> bool:
+    """An uncropped scan whose bright holder border drove normalization renders as a
+    near-black print inside a black frame edge. Judged on the rendered positive:
+    no crop set, black border ring, and an inner region far darker than any
+    plausible print."""
+    if task.params.geometry.crop_rect is not None:
+        return False
+    arr = buffer[:: max(1, buffer.shape[0] // 512), :: max(1, buffer.shape[1] // 512)]
+    arr = arr if arr.ndim == 2 else arr[..., :3].mean(axis=2)
+    h, w = arr.shape[:2]
+    m = max(2, int(0.04 * min(h, w)))
+    ring = np.concatenate([arr[:m].ravel(), arr[-m:].ravel(), arr[:, :m].ravel(), arr[:, -m:].ravel()])
+    inner = arr[h // 4 : 3 * h // 4, w // 4 : 3 * w // 4]
+    return float(np.median(ring)) < 0.02 and float(np.median(inner)) < 0.12
+
+
+def _companion_source_paths(task: "ExportTask") -> tuple:
+    """Every file this frame's render reads besides its own: triplet exposures,
+    bracket frames, stitch parts, IR sidecars."""
+    info = task.file_info
+    cfg = task.params
+    triplets = tuple(part for pair in cfg.stitch.stitch_triplets for part in pair)
+    from negpy.infrastructure.loaders.constants import IR_SIDECAR_SUFFIXES, SUPPORTED_TIFF_EXTENSIONS
+
+    stem = os.path.splitext(info["path"])[0]
+    # Constructed names, so only ones that exist count: a target merely spelled like
+    # a sidecar must not be refused.
+    ir_sidecars = tuple(
+        candidate
+        for token in IR_SIDECAR_SUFFIXES
+        for ext in SUPPORTED_TIFF_EXTENSIONS
+        if os.path.exists(candidate := f"{stem}{token}{ext}")
+    )
+    return tuple(
+        p
+        for p in (
+            info.get("green_path"),
+            info.get("blue_path"),
+            *hdr_frame_paths(info),
+            *cfg.stitch.stitch_paths,
+            *triplets,
+            *ir_sidecars,
+        )
+        if p
+    )
+
+
+def _export_target_is_a_source(path: str, task: "ExportTask") -> bool:
+    """An export must never land on a frame it was rendered from: a source under
+    Same as source with the default name pattern can resolve to its own path, and
+    the overwrite flag would replace the scan with the render."""
+    target = os.path.realpath(path)
+    target_norm = os.path.normcase(target)
+    for source in (task.file_info["path"], *_companion_source_paths(task)):
+        if not source:
+            continue
+        real = os.path.realpath(source)
+        if os.path.normcase(real) == target_norm:
+            return True
+        # normcase is the identity on macOS, so a case-variant target needs the
+        # filesystem's own answer: on case-insensitive APFS, same inode, same file.
+        try:
+            if os.path.samefile(target, real):
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def resolve_export_naming(task: ExportTask) -> tuple[str, str, str]:
     """(out_dir, filename-stem, extension) for a task — the shared source of truth for
     both conflict detection and the actual write, so they can never disagree."""
@@ -167,6 +278,9 @@ class ExportWorker(QObject):
     finished = pyqtSignal()
     cancelled = pyqtSignal()
     error = pyqtSignal(str)
+    # Advisory about files that were written; never counted as a failure.
+    warning = pyqtSignal(str)
+    contact_sheet_written = pyqtSignal(str)  # the folder the sheets went to
 
     def __init__(self) -> None:
         super().__init__()
@@ -195,6 +309,7 @@ class ExportWorker(QObject):
             if err:
                 self.error.emit(err)
 
+        border_crushed = 0
         try:
             for i, task in enumerate(tasks):
                 if self._cancel.is_set():
@@ -220,6 +335,15 @@ class ExportWorker(QObject):
                         resolution=_export_resolution(task),
                     )
 
+                if task.export_settings.overwrite:
+                    out_dir0, filename0, ext0 = resolve_export_naming(task)
+                    if _export_target_is_a_source(os.path.join(out_dir0, f"{filename0}.{ext0}"), task):
+                        self.error.emit(
+                            f"Export skipped for {task.file_info['name']}: it would overwrite the source file. "
+                            "Change the filename pattern or destination."
+                        )
+                        continue
+
                 buffer, status = self._processor.render_export(
                     task.file_info["path"],
                     task.params,
@@ -231,10 +355,14 @@ class ExportWorker(QObject):
                     split_x=float(task.file_info.get("split_x") or 0.5),
                     crop_rect=tuple(task.file_info["crop_rect"]) if task.file_info.get("crop_rect") else None,
                     gutter_thickness=float(task.file_info.get("gutter_thickness") or 0.0),
+                    split_axis=str(task.file_info.get("split_axis") or "x"),
                     diptych=task.diptych,
                 )
                 if prefetch_next and i == 0:
                     self._submit_prefetch(prefetcher, nxt)
+
+                if buffer is not None and _looks_border_crushed(buffer, task):
+                    border_crushed += 1
 
                 if buffer is None:
                     # render_export returns (None, error) on failure. Surface it rather
@@ -249,6 +377,11 @@ class ExportWorker(QObject):
             if pending is not None:
                 _drain(pending)
                 pending = None
+            if border_crushed:
+                self.warning.emit(
+                    f"{border_crushed} of {len(tasks)} exports rendered almost black with no crop set: "
+                    "the bright scan border drives automatic levels. Crop or Auto Crop, then re-export."
+                )
             if self._cancel.is_set():
                 self.cancelled.emit()
             else:
@@ -271,6 +404,7 @@ class ExportWorker(QObject):
             split_x=float(nxt.file_info.get("split_x") or 0.5),
             crop_rect=tuple(nxt.file_info["crop_rect"]) if nxt.file_info.get("crop_rect") else None,
             gutter_thickness=float(nxt.file_info.get("gutter_thickness") or 0.0),
+            split_axis=str(nxt.file_info.get("split_axis") or "x"),
         )
 
     def _finish_task(self, task: ExportTask, buffer: np.ndarray, color_space: str, embed_plan: Optional[tuple]) -> Optional[str]:
@@ -308,6 +442,9 @@ class ExportWorker(QObject):
             while os.path.exists(path):
                 path = os.path.join(out_dir, f"{filename}_{counter}.{ext}")
                 counter += 1
+
+        if _export_target_is_a_source(path, task):
+            return f"Export skipped for {task.file_info['name']}: it would overwrite the source file. Change the filename pattern or destination."
 
         tmp_path = None
         try:
@@ -350,98 +487,103 @@ class ExportWorker(QObject):
         finally:
             gc.collect()
 
-    @pyqtSlot(list, str, int, int, int, int, bool, str, str)
-    def run_contact_sheet(
-        self,
-        tasks: List[ExportTask],
-        out_dir: str,
-        cell_px: int,
-        gap: int,
-        margin: int,
-        max_tiles: int,
-        show_labels: bool,
-        background_color: str,
-        label_color: str,
-    ) -> None:
-        """Renders each task small and composites contact sheet(s)."""
+    @pyqtSlot(object)
+    def run_contact_sheet(self, job: "ContactSheetJob") -> None:
+        """Sheets are written as `.part` files and moved into place together, so a run never leaves half a set.
+
+        Every exit emits `finished` or `cancelled`: that releases the batch lane.
+        """
         self._cancel.clear()
-        total = len(tasks)
+        parts: list[str] = []
         try:
-            tiles = []
-            labels: list[str] = []
-            for i, task in enumerate(tasks):
+            geometry = film_geometry(job.format, job.frame_size)
+            settings = job.settings
+            plan = plan_sheets(settings.paper_width, settings.paper_height, geometry, len(job.frames), settings.roll_label, job.breaks)
+            if not plan.pages:
+                self.error.emit(f"Contact sheet: {plan.reason}")
+                self.finished.emit()
+                return
+            dpi = best_dpi(settings.paper_width, settings.paper_height, settings.dpi)
+            px_per_mm = dpi / MM_PER_INCH
+            window_long_px = int(math.ceil(max(geometry.frame_along, geometry.frame_across) * px_per_mm))
+            target_long_px = int(window_long_px * 1.5)
+            paths = contact_sheet_paths(job.out_dir, len(plan.pages))
+            os.makedirs(job.out_dir, exist_ok=True)
+            icc = _srgb_icc_bytes()
+            total = len(job.frames) + len(plan.pages)
+            step = 0
+
+            for page_index, page in enumerate(plan.pages):
+                tiles: list[Optional[np.ndarray]] = [None] * len(job.frames)
+                turns = [0] * len(job.frames)
+                indices = [i for strip in page.strips for i in range(strip.first, strip.first + strip.count)]
+                for n, index in enumerate(indices):
+                    if self._cancel.is_set():
+                        self.cancelled.emit()
+                        return
+                    frame = job.frames[index]
+                    info = frame.asset
+                    step += 1
+                    self.progress.emit(step, total, os.path.splitext(frame.name)[0])
+                    next_path = job.frames[indices[n + 1]].asset.get("path") if n + 1 < len(indices) else None
+                    tile = self._processor.render_display_array(
+                        info["path"],
+                        tile_params(frame.config),
+                        info["hash"],
+                        target_long_px=target_long_px,
+                        prefer_gpu=job.gpu_enabled,
+                        working_color_space=job.working_color_space,
+                        fast_decode=True,
+                        half=int(info.get("half") or 0),
+                        split_x=float(info.get("split_x") or 0.5),
+                        crop_rect=tuple(info["crop_rect"]) if info.get("crop_rect") else None,
+                        gutter_thickness=float(info.get("gutter_thickness") or 0.0),
+                        split_axis=str(info.get("split_axis") or "x"),
+                        keep_source=next_path == info.get("path"),
+                    )
+                    if tile is None:
+                        # The frame prints blank so the numbering stays in step.
+                        self.error.emit(f"{frame.name}: could not be rendered for the contact sheet")
+                        continue
+                    turns[index] = turns_for(frame, geometry, tile.shape[:2])
+                    tiles[index] = tile
+
                 if self._cancel.is_set():
                     self.cancelled.emit()
                     return
-                name = os.path.splitext(task.file_info["name"])[0]
-                self.progress.emit(i + 1, total, name)
-
-                tile = self._processor.render_display_array(
-                    task.file_info["path"],
-                    task.params,
-                    task.file_info["hash"],
-                    target_long_px=cell_px * 2,
-                    prefer_gpu=task.gpu_enabled,
-                    working_color_space=task.working_color_space,
-                    # half-size decode is visually identical at ~600px proof tiles
-                    fast_decode=True,
-                    half=int(task.file_info.get("half") or 0),
-                    split_x=float(task.file_info.get("split_x") or 0.5),
-                    crop_rect=tuple(task.file_info["crop_rect"]) if task.file_info.get("crop_rect") else None,
-                    gutter_thickness=float(task.file_info.get("gutter_thickness") or 0.0),
-                )
-                if tile is not None:
-                    tiles.append(tile)
-                    labels.append(task.file_info["name"])
-                else:
-                    # A dropped tile silently shrinks the sheet, so report it or the run looks like a clean
-                    # success with frames missing.
-                    self.error.emit(f"{name}: could not be rendered for the contact sheet")
-
-            sheets = ContactSheetService.build_sheets(
-                tiles,
-                labels=labels if show_labels else None,
-                show_labels=show_labels,
-                background_color=background_color,
-                label_color=label_color,
-                max_tiles=max_tiles,
-                cell_px=cell_px,
-                gap=gap,
-                margin=margin,
-            )
-            os.makedirs(out_dir, exist_ok=True)
-
-            sheet_icc = _srgb_icc_bytes()
-            delivery = tasks[0].export_settings if tasks else None
-            for idx, sheet in enumerate(sheets):
-                suffix = "" if idx == 0 else f"_{idx + 1}"
-                path = os.path.join(out_dir, f"contact_sheet{suffix}.jpg")
-                counter = 2
-                while os.path.exists(path):
-                    path = os.path.join(out_dir, f"contact_sheet{suffix}_{counter}.jpg")
-                    counter += 1
-
-                tmp_path = None
-                try:
-                    with tempfile.NamedTemporaryFile(dir=out_dir, delete=False, suffix=".part") as tmp:
-                        tmp_path = tmp.name
-                        tmp.write(
-                            encode_jpeg(
-                                np.asarray(sheet),
-                                icc=sheet_icc,
-                                quality=delivery.jpeg_quality if delivery else 95,
-                                progressive=bool(delivery.jpeg_progressive) if delivery else False,
-                            )
+                step += 1
+                self.progress.emit(step, total, f"Sheet {page_index + 1} of {len(plan.pages)}")
+                sheet = ContactSheetService.render_sheet(plan, page_index, tiles, turns, px_per_mm, job.look, numbers=job.numbers or None)
+                del tiles
+                if self._cancel.is_set():
+                    self.cancelled.emit()
+                    return
+                with tempfile.NamedTemporaryFile(dir=job.out_dir, delete=False, suffix=".part") as tmp:
+                    parts.append(tmp.name)
+                    tmp.write(
+                        encode_jpeg(
+                            sheet,
+                            icc=icc,
+                            resolution=Resolution.from_dpi(dpi),
+                            quality=job.jpeg_quality,
+                            progressive=job.jpeg_progressive,
                         )
-                    os.replace(tmp_path, path)
-                except Exception as write_err:
-                    if tmp_path is not None and os.path.exists(tmp_path):
-                        os.unlink(tmp_path)
-                    self.error.emit(str(write_err))
+                    )
+                del sheet
 
+            for part, path in zip(parts, paths):
+                os.replace(part, path)
+            parts.clear()
+            self.contact_sheet_written.emit(job.out_dir)
             self.finished.emit()
         except Exception as e:
             self.error.emit(str(e))
+            self.finished.emit()
         finally:
+            for part in parts:
+                try:
+                    os.unlink(part)
+                except OSError:
+                    pass
             # Release GPU resources once per batch, not per tile (avoids pool rebuild each frame).
             self._processor.cleanup()
