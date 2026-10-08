@@ -2100,7 +2100,7 @@ class GPUEngine:
         # ROI offset + crop dims for the density-histogram pass (tex_norm is uncropped).
         dh_data = struct.pack("IIII", crop_offset[0], crop_offset[1], crop_w, crop_h)
 
-        # Display-referred levels, over (value, red, green, blue); mirrors levels.py.
+        # Display-referred levels, over (global, red, green, blue); mirrors levels.py.
         from negpy.features.exposure.levels import uniform_rows
 
         _lv_lo, _lv_hi, _lv_inv, _lv_olo, _lv_ospan = uniform_rows(settings.exposure)

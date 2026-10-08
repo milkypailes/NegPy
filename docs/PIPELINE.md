@@ -552,7 +552,7 @@ Post-crop print finishing in scene-linear, before the output transform. Order: e
 ## 10. Levels
 **Code**: `negpy.features.exposure.levels` (CPU) / `negpy.features.exposure.shaders.levels.wgsl` (GPU)
 
-GIMP-style fine-tuning on the display-encoded output, after the output transform and every creative stage. Four channels — the Value master, then Red, Green, Blue — each mapping an input window onto an output window through a gamma:
+GIMP-style fine-tuning on the display-encoded output, after the output transform and every creative stage. Four channels — the Global master, then Red, Green, Blue — each mapping an input window onto an output window through a gamma:
 
 $$t = \mathrm{clamp}\!\left(\frac{x - l}{h - l},\ 0,\ 1\right), \qquad t \leftarrow t^{1/\gamma}, \qquad I_{out} = o_l + (o_h - o_l)\,t$$
 

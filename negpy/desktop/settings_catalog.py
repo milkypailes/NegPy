@@ -176,7 +176,7 @@ CATALOG: list[tuple[str, tuple[SettingRow, ...]]] = [
         _row("Contrast Mask", "exposure", "contrast_mask"),
         _row("Mask Spacer", "exposure", "mask_spacer"),
         _row("Preflash", "exposure", "preflash"),
-        _row("Levels Value", "exposure", "levels_in_low", "levels_gamma", "levels_in_high", "levels_out_low", "levels_out_high"),
+        _row("Levels Global", "exposure", "levels_in_low", "levels_gamma", "levels_in_high", "levels_out_low", "levels_out_high"),
         _row(
             "Levels Red",
             "exposure",

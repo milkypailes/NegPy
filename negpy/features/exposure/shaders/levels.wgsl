@@ -1,6 +1,6 @@
 // Display-referred levels, the last pipeline step; mirrors levels.py::apply_levels.
 //
-// The buffer is already display-encoded (output_encode ran). The Value master
+// The buffer is already display-encoded (output_encode ran). The Global master
 // applies equally to all three channels first, then each per-channel curve.
 // Uniforms carry normalized bounds over (value, red, green, blue); gamma rides
 // inverted, as the pow exponent.

@@ -1079,7 +1079,7 @@ class LevelsHistogramWidget(QWidget):
         self._drag: str | None = None
 
     def set_data(self, buffer: Any, channel: int = 0) -> None:
-        """Feed a (4, 256) [R, G, B, L] histogram; Value reads the L row."""
+        """Feed a (4, 256) [R, G, B, L] histogram; Global reads the L row."""
         self._channel = int(channel)
         row = None
         if isinstance(buffer, np.ndarray) and buffer.shape == (4, 256):

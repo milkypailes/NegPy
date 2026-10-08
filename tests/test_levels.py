@@ -86,7 +86,7 @@ class TestLevelsMath(unittest.TestCase):
             levels_out_low=-5,
             levels_out_high=9999,
         )
-        lo, gamma, hi, olo, ohi = channel_levels(conf, "value")
+        lo, gamma, hi, olo, ohi = channel_levels(conf, "global")
         self.assertEqual((lo, hi, olo, ohi), (255.0, 0.0, 0.0, 255.0))
         self.assertEqual(gamma, 0.1)
         out = np.asarray(apply_levels(_gray(0.0, 0.5, 1.0), conf))

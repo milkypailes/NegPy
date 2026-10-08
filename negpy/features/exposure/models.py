@@ -104,7 +104,7 @@ class ExposureConfig:
     # logic.separation_damping_gain). Inert at dye_separation 1.0: it only
     # redistributes that slider's push.
     separation_damping: float = 0.0
-    # Display-referred levels (see levels.py), the last pipeline step: the Value
+    # Display-referred levels (see levels.py), the last pipeline step: the Global
     # master first, then one curve per channel. In/out bounds are 0-255 ints,
     # gamma 0.1-10.0 at 1.0. Identity by default, so an untouched edit renders
     # exactly as before.

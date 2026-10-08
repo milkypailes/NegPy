@@ -1,6 +1,6 @@
 """Display-referred levels, GIMP-style, as the last pipeline step.
 
-Each of the four channels (the Value master, then Red, Green, Blue) carries its
+Each of the four channels (the Global master, then Red, Green, Blue) carries its
 own input low/gamma/high and output low/high. The master applies equally to all
 three channels first, then each per-channel curve trims on top. GIMP applies
 ``pow(t, 1/gamma)``; higher gamma holds more high-level intensities.
@@ -13,7 +13,7 @@ import numpy as np
 from negpy.domain.types import ImageBuffer
 from negpy.kernel.image.validation import ensure_image
 
-LEVELS_CHANNELS = ("value", "red", "green", "blue")
+LEVELS_CHANNELS = ("global", "red", "green", "blue")
 
 LEVELS_IN_MIN = 0
 LEVELS_IN_MAX = 255
@@ -23,7 +23,7 @@ LEVELS_GAMMA_MAX = 10.0
 
 def _channel_fields(channel: str) -> tuple[str, str, str, str, str]:
     """(in_low, gamma, in_high, out_low, out_high) field names for `channel`."""
-    suffix = "" if channel == "value" else f"_{channel}"
+    suffix = "" if channel == "global" else f"_{channel}"
     return (
         f"levels_in_low{suffix}",
         f"levels_gamma{suffix}",
@@ -78,7 +78,7 @@ def without_levels(config: Any) -> Any:
 
 
 def uniform_rows(config: Any) -> tuple[tuple[float, float, float, float], ...]:
-    """Five vec4s over (value, red, green, blue): input low/high, inverse gamma,
+    """Five vec4s over (global, red, green, blue): input low/high, inverse gamma,
     output low and output span, all normalized. Single source for the GPU pack."""
     lo, hi, inv, olo, orange = [], [], [], [], []
     for channel in LEVELS_CHANNELS:
@@ -126,7 +126,7 @@ def apply_levels(image: ImageBuffer, config: Any) -> ImageBuffer:
     mono = arr.ndim == 2
     img = arr[..., None] if mono else arr
     res = img.astype(np.float32, copy=True)
-    master = channel_levels(config, "value")
+    master = channel_levels(config, "global")
     if master != (0.0, 1.0, 255.0, 0.0, 255.0):
         for c in range(res.shape[-1]):
             res[..., c] = _remap_plane(res[..., c], *master)

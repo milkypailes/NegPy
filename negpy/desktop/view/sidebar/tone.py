@@ -18,7 +18,7 @@ from negpy.features.exposure.auto_sliders import NEUTRAL
 from negpy.features.exposure.models import EXPOSURE_CONSTANTS, TUNABLE_TARGETS, apply_targets
 
 _LEVELS_SUFFIX = ("", "_red", "_green", "_blue")
-_LEVELS_LABELS = ("Value", "Red", "Green", "Blue")
+_LEVELS_LABELS = ("Global", "Red", "Green", "Blue")
 
 
 def _levels_pair(label: str, spin: QWidget) -> QWidget:
@@ -274,7 +274,7 @@ class ToneSidebar(BaseSidebar):
             self.levels_combo.addItem(label)
         self.levels_combo.setToolTip(
             wrap_tooltip(
-                "Levels channel: Value edits the master curve on all channels, Red, Green "
+                "Levels channel: Global edits the master curve on all channels, Red, Green "
                 "and Blue trim one channel on top of it"
             )
         )
@@ -685,7 +685,7 @@ class ToneSidebar(BaseSidebar):
             if is_bw:
                 self.ch_btn.setCurrentIndex(0)
             self.ch_btn.setVisible(not is_bw)
-            # Levels keeps its own channel selector; B&W has only the Value master.
+            # Levels keeps its own channel selector; B&W has only the Global master.
             if is_bw:
                 self.levels_combo.setCurrentIndex(0)
             self.levels_combo.setVisible(not is_bw)
