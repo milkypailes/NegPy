@@ -1,12 +1,12 @@
 from dataclasses import replace
 
 from PyQt6.QtCore import Qt
-from PyQt6.QtWidgets import QAbstractSpinBox, QComboBox, QDialog, QDoubleSpinBox, QGridLayout, QHBoxLayout, QSpinBox, QStyle, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QAbstractSpinBox, QComboBox, QDialog, QDoubleSpinBox, QGridLayout, QHBoxLayout, QLabel, QSpinBox, QStyle, QVBoxLayout, QWidget
 
 from negpy.desktop.auto_sliders import shown_values, stored_value
 from negpy.desktop.view.shortcut_registry import tooltip_with_shortcut
 from negpy.desktop.view.sidebar.base import BaseSidebar
-from negpy.desktop.view.styles.templates import ICON_BUTTON_WIDTH, field_label, header_row, hint_label, section_subheader, wrap_tooltip
+from negpy.desktop.view.styles.templates import ICON_BUTTON_WIDTH, field_label_qss, header_row, hint_label, section_subheader, wrap_tooltip
 from negpy.desktop.view.styles.theme import THEME
 from negpy.desktop.view.widgets.charts import LevelsHistogramWidget
 from negpy.desktop.view.widgets.choice_button import ChoiceButton, ToggleMenuButton
@@ -22,12 +22,19 @@ _LEVELS_LABELS = ("Value", "Red", "Green", "Blue")
 
 
 def _levels_pair(label: str, spin: QWidget) -> QWidget:
-    """One label + entry packed tight, for the left/center/right levels rows."""
+    """One label + entry packed tight, for the left/center/right levels rows.
+
+    A plain QLabel, not a field_label: align_slider_columns widens every
+    FieldLabel to the slider label column and reserves the value column on its
+    row, which blew these inline pairs wide and squeezed the entries.
+    """
     box = QWidget()
     row = QHBoxLayout(box)
     row.setContentsMargins(0, 0, 0, 0)
     row.setSpacing(THEME.space_sm)
-    row.addWidget(field_label(label))
+    caption = QLabel(label)
+    caption.setStyleSheet(field_label_qss())
+    row.addWidget(caption)
     row.addWidget(spin)
     return box
 
@@ -305,7 +312,8 @@ class ToneSidebar(BaseSidebar):
             spin.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
             text = spin.fontMetrics().horizontalAdvance(sample)
             frame = 2 * spin.style().pixelMetric(QStyle.PixelMetric.PM_DefaultFrameWidth)
-            spin.setFixedWidth(text + frame + 4)
+            # QSS padding (4px) and border (1px) each side on top of the frame.
+            spin.setFixedWidth(text + frame + 12)
         # Left/center/right under the histogram: equal columns pin Low left, Mid
         # center and High right whatever the label widths are.
         levels_in_grid = QGridLayout()
