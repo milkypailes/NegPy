@@ -371,7 +371,7 @@ class ToneSidebar(BaseSidebar):
         curves_header.setToolTip(
             wrap_tooltip(
                 "Display-referred curves, GIMP-style, applied after Levels as the last step. "
-                "Each channel holds eight nodes; drag one vertically to reshape the tone map. "
+                "Each channel holds eight nodes; drag one to reshape the tone map. "
                 "Nodes clamp against their neighbours, so the curve can never fold."
             )
         )
@@ -393,7 +393,7 @@ class ToneSidebar(BaseSidebar):
         self.curves_widget = CurvesWidget()
         self.curves_widget.setToolTip(
             wrap_tooltip(
-                "The channel's input histogram with its tone curve. Drag a node vertically; "
+                "The channel's input histogram with its tone curve. Drag a node; "
                 "double-click resets the channel."
             )
         )
@@ -520,29 +520,30 @@ class ToneSidebar(BaseSidebar):
     def _curves_channel(self) -> int:
         return max(0, min(3, self.curves_combo.currentIndex()))
 
-    def _curves_outputs(self, conf) -> tuple:
-        from negpy.features.exposure.curves import grid_outputs
+    def _curves_points(self, conf) -> tuple:
+        from negpy.features.exposure.curves import node_points
 
-        return grid_outputs(conf, LEVELS_CHANNELS[self._curves_channel()])
+        return node_points(conf, LEVELS_CHANNELS[self._curves_channel()])
 
-    def _write_curves(self, persist: bool, outputs) -> None:
-        from negpy.features.exposure.curves import CURVE_NODES
-
+    def _write_curves(self, persist: bool, points) -> None:
         sfx = _CHANNEL_SUFFIX[self._curves_channel()]
-        fields = {f"curve_{i}{sfx}": float(outputs[i]) - i * 255.0 / (CURVE_NODES - 1) for i in range(CURVE_NODES)}
+        fields: dict = {}
+        for i, p in enumerate(points):
+            fields[f"curve_x_{i}{sfx}"] = p[0]
+            fields[f"curve_{i}{sfx}"] = float(p[1]) - float(p[0])
         self.update_config_section("exposure", render=True, persist=persist, readback_metrics=True, **fields)
 
-    def _show_curves(self, outputs) -> None:
-        self.curves_widget.set_nodes(outputs)
+    def _show_curves(self, points) -> None:
+        self.curves_widget.set_nodes(points)
 
-    def _on_curves(self, outputs, persist: bool) -> None:
-        self._show_curves(outputs)
-        self._write_curves(persist, outputs)
+    def _on_curves(self, points, persist: bool) -> None:
+        self._show_curves(points)
+        self._write_curves(persist, points)
 
     def _reset_curves_channel(self) -> None:
-        from negpy.features.exposure.curves import CURVE_NODES
+        from negpy.features.exposure.curves import CURVE_DEFAULT_X
 
-        self._write_curves(True, [i * 255.0 / (CURVE_NODES - 1) for i in range(CURVE_NODES)])
+        self._write_curves(True, [(x, x) for x in CURVE_DEFAULT_X])
 
     def _reset_curves_all(self) -> None:
         from negpy.features.exposure.curves import curves_fields
@@ -805,7 +806,7 @@ class ToneSidebar(BaseSidebar):
             if is_bw:
                 self.curves_combo.setCurrentIndex(0)
             self.curves_combo.setVisible(not is_bw)
-            self._show_curves(self._curves_outputs(conf))
+            self._show_curves(self._curves_points(conf))
             self._sync_curves_histogram()
 
             idx = self._channel_index()

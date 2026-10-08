@@ -204,10 +204,10 @@ CATALOG: list[tuple[str, tuple[SettingRow, ...]]] = [
             "levels_out_low_blue",
             "levels_out_high_blue",
         ),
-        _row("Curves Global", "exposure", *[f"curve_{i}" for i in range(8)]),
-        _row("Curves Red", "exposure", *[f"curve_{i}_red" for i in range(8)]),
-        _row("Curves Green", "exposure", *[f"curve_{i}_green" for i in range(8)]),
-        _row("Curves Blue", "exposure", *[f"curve_{i}_blue" for i in range(8)]),
+        _row("Curves Global", "exposure", *[f for i in range(8) for f in (f"curve_{i}", f"curve_x_{i}")]),
+        _row("Curves Red", "exposure", *[f for i in range(8) for f in (f"curve_{i}_red", f"curve_x_{i}_red")]),
+        _row("Curves Green", "exposure", *[f for i in range(8) for f in (f"curve_{i}_green", f"curve_x_{i}_green")]),
+        _row("Curves Blue", "exposure", *[f for i in range(8) for f in (f"curve_{i}_blue", f"curve_x_{i}_blue")]),
         _row("Auto Density", "exposure", "auto_exposure", sticky=True),
         _row("Auto Grade", "exposure", "auto_normalize_contrast", sticky=True),
         _row("Paper Profile", "exposure", "paper_profile", sticky=True),
@@ -485,6 +485,7 @@ TONE_FIELDS = (
     "levels_out_low_blue",
     "levels_out_high_blue",
     *[f"curve_{i}{sfx}" for sfx in ("", "_red", "_green", "_blue") for i in range(8)],
+    *[f"curve_x_{i}{sfx}" for sfx in ("", "_red", "_green", "_blue") for i in range(8)],
 )
 
 # Frame cards whose settings can be pushed to other frames, and the fields each owns. A

@@ -18,8 +18,11 @@ from negpy.features.exposure.curves import (
     bake_channel_lut,
     channel_offsets,
     curves_active,
+    curves_defaults,
     curves_fields,
-    grid_outputs,
+    node_points,
+    node_positions,
+    without_curves,
 )
 from negpy.features.exposure.models import ExposureConfig
 from negpy.infrastructure.gpu.device import GPUDevice
@@ -29,7 +32,9 @@ class TestCurvesMath(unittest.TestCase):
     def test_identity_by_default(self) -> None:
         conf = ExposureConfig()
         self.assertFalse(curves_active(conf))
-        self.assertEqual(len(curves_fields()), 4 * CURVE_NODES)
+        self.assertEqual(len(curves_fields()), 8 * CURVE_NODES)
+        self.assertEqual(curves_defaults(), {f: getattr(conf, f) for f in curves_fields()})
+        self.assertEqual(without_curves(replace(conf, curve_3=9.0, curve_x_3=60)), conf)
         img = np.linspace(0.0, 1.0, 300, dtype=np.float32).reshape(10, 10, 3)
         np.testing.assert_array_equal(np.asarray(apply_curves(img, conf)), img)
 
@@ -76,11 +81,37 @@ class TestCurvesMath(unittest.TestCase):
         out = np.asarray(apply_curves(np.full((2, 2, 3), 0.5, dtype=np.float32), conf))
         self.assertTrue(bool(np.all(out >= 0.0)) and bool(np.all(out <= 1.0)))
 
-    def test_grid_outputs_match_the_bake(self) -> None:
-        self.assertEqual(grid_outputs(ExposureConfig(), "global"), (0, 36, 73, 109, 146, 182, 219, 255))
+    def test_node_points_match_the_bake(self) -> None:
+        self.assertEqual(
+            node_points(ExposureConfig(), "global"),
+            ((0, 0), (36, 36), (73, 73), (109, 109), (146, 146), (182, 182), (219, 219), (255, 255)),
+        )
         conf = replace(ExposureConfig(), curve_7_blue=-300.0)
         # Held at the monotone bound: the bake never folds, the marker shows it.
-        self.assertEqual(grid_outputs(conf, "blue")[-1], 219)
+        self.assertEqual(node_points(conf, "blue")[-1], (255, 219))
+        moved = replace(ExposureConfig(), curve_x_3=60, curve_3=49.0)
+        self.assertEqual(node_points(moved, "global")[2], (60, 109))
+
+    def test_horizontal_drag_preserving_y_reshapes(self) -> None:
+        conf = replace(ExposureConfig(), curve_x_3=60, curve_3=49.0)
+        self.assertTrue(curves_active(conf))
+        out = np.asarray(apply_curves(np.full((2, 2, 3), 80 / 255, dtype=np.float32), conf))
+        self.assertAlmostEqual(float(out[0, 0, 0] * 255), 109, delta=2.0)
+
+    def test_diagonal_x_move_stays_inactive(self) -> None:
+        # A node slid along the diagonal maps identity: correctly a no-op.
+        conf = replace(ExposureConfig(), curve_x_5_red=150)
+        self.assertFalse(curves_active(conf))
+        self.assertEqual(node_positions(conf, "red")[5], 150)
+
+    def test_bake_orders_and_dedupes(self) -> None:
+        # Unordered and stacked nodes bake without dividing by zero.
+        lut = bake_channel_lut((0.0,) * CURVE_NODES, (200, 0, 73, 109, 146, 182, 219, 255))
+        self.assertTrue(bool(np.all(np.diff(lut) >= 0)))
+        # Zero offsets stay identity on any grid.
+        np.testing.assert_array_equal(lut, np.arange(256, dtype=np.float32) / 255.0)
+        degenerate = bake_channel_lut((5.0,) * CURVE_NODES, (100,) * CURVE_NODES)
+        np.testing.assert_array_equal(degenerate, np.arange(256, dtype=np.float32) / 255.0)
 
 
 class TestCurvesPipeline(unittest.TestCase):
@@ -163,6 +194,8 @@ class TestGpuCurvesParity(unittest.TestCase):
                 curve_5=-30.0,
                 curve_2_red=40.0,
                 curve_6_blue=-45.0,
+                curve_x_2=50,
+                curve_2=23.0,
                 levels_in_low=10,
                 levels_gamma=1.2,
             ),

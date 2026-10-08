@@ -38,6 +38,7 @@ TRANSFER = (
     }
     # Display-referred curves run after levels on every path, for the same reason.
     | {f"curve_{i}{suffix}" for suffix in ("", "_red", "_green", "_blue") for i in range(8)}
+    | {f"curve_x_{i}{suffix}" for suffix in ("", "_red", "_green", "_blue") for i in range(8)}
 )
 # Meter the frame on a raw slide and on a Positive frame alike; a slide starts with both off.
 METERS = {"auto_exposure", "auto_normalize_contrast"}
@@ -73,6 +74,13 @@ def _moved(field: str, value):
         return not value
     if field == "paper_profile":
         return "kodak_endura"
+    if field.startswith("curve_x_"):
+        # Integer 0-255 positions: ±5 stays in range and off the end clamps.
+        return value - 5.0 if value > 128 else value + 5.0
+    if field.startswith("curve_"):
+        # Offsets read through holds, clips and downstream lanes, so the move is
+        # sized to survive all three: up, except off the top end.
+        return value - 20.0 if field.split("_")[1] == "7" else value + 20.0
     if field.startswith("levels_"):
         # Integer 0-255 bounds: ±25 stays in range and off the clamp for both ends.
         if "gamma" in field:
@@ -95,8 +103,11 @@ def _image() -> np.ndarray:
 
 
 def _config(positive: bool):
-    """Toe, Shoulder and Dye Separation off neutral, so their widths, trims and damping bite."""
+    """Toe, Shoulder and Dye Separation off neutral, so their widths, trims and damping bite.
+    A pinned-ends S-curve on every curves channel, so each offset and position move reshapes
+    live, nonlinear mapping rather than an identity the holds and clips swallow."""
     cfg = DEFAULT_WORKSPACE_CONFIG
+    s_curve = (0.0, 12.0, -14.0, 22.0, -18.0, 16.0, -12.0, 0.0)
     exposure = replace(
         cfg.exposure,
         cast_removal_strength=cast_removal_for_mode(ProcessMode.E6, cfg.exposure.cast_removal_strength),
@@ -105,6 +116,7 @@ def _config(positive: bool):
         dye_separation=1.3,
         auto_exposure=False,
         auto_normalize_contrast=False,
+        **{f"curve_{i}{sfx}": v for sfx in ("", "_red", "_green", "_blue") for i, v in enumerate(s_curve)},
     )
     return replace(cfg, process=replace(cfg.process, process_mode=ProcessMode.E6, positive_source=positive), exposure=exposure)
 

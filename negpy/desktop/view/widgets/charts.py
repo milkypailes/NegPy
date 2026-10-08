@@ -1300,9 +1300,9 @@ class LevelsHistogramWidget(QWidget):
 
 class CurvesWidget(QWidget):
     """GIMP-style curve editor over the selected channel's input histogram: the
-    channel's baked curve with one draggable node per fixed grid position.
-    Nodes move vertically only, clamped between their neighbours so the curve
-    can never fold. Double-click resets the channel."""
+    channel's baked curve with one draggable node per position. Nodes move in
+    both directions, clamped against their neighbours so the curve can never
+    fold or reorder. Double-click resets the channel."""
 
     nodesChanged = pyqtSignal(list)
     nodesCommitted = pyqtSignal(list)
@@ -1318,7 +1318,7 @@ class CurvesWidget(QWidget):
         self.setMouseTracking(True)
         self._counts: list = []
         self._channel = 0
-        self._nodes: list = [0, 36, 73, 109, 146, 182, 219, 255]
+        self._nodes: list = [[0, 0], [36, 36], [73, 73], [109, 109], [146, 146], [182, 182], [219, 219], [255, 255]]
         self._curve: list = [i / 255 for i in range(256)]
         self._drag: int | None = None
 
@@ -1335,31 +1335,31 @@ class CurvesWidget(QWidget):
             self._counts = row or []
             self.update()
 
-    def set_nodes(self, outputs: Any) -> None:
-        """Show these node outputs (0-255 per grid position) without emitting."""
-        nodes = [min(max(int(round(v)), 0), 255) for v in list(outputs)]
+    def set_nodes(self, points: Any) -> None:
+        """Show these (x, y) node positions without emitting."""
+        nodes = [[min(max(int(round(p[0])), 0), 255), min(max(int(round(p[1])), 0), 255)] for p in list(points)]
         if nodes != self._nodes:
             self._nodes = nodes
             self._update_curve()
             self.update()
 
     def _update_curve(self) -> None:
-        from negpy.features.exposure.curves import CURVE_INPUTS, bake_channel_lut
+        from negpy.features.exposure.curves import bake_channel_lut
 
-        offsets = [o - x for o, x in zip(self._nodes, CURVE_INPUTS)]
-        self._curve = (np.asarray(bake_channel_lut(offsets), dtype=float) * 255.0).tolist()
+        xs = [p[0] for p in self._nodes]
+        self._curve = (np.asarray(bake_channel_lut([p[1] - p[0] for p in self._nodes], xs), dtype=float) * 255.0).tolist()
 
-    def _x(self, i: int, w: int) -> float:
-        return float(i) / 7.0 * max(1, w - 1)
+    def _px(self, x: float, w: int) -> float:
+        return float(x) / 255.0 * max(1, w - 1)
 
     def _y(self, v: float, hist_h: int) -> float:
         return hist_h - float(v) / 255.0 * hist_h
 
     def _node_at(self, x: float, y: float, w: int, hist_h: int) -> int | None:
         near = [
-            (i, abs(x - self._x(i, w)) + abs(y - self._y(v, hist_h)))
-            for i, v in enumerate(self._nodes)
-            if abs(x - self._x(i, w)) <= self._HIT_PX and abs(y - self._y(v, hist_h)) <= self._HIT_PX + 4
+            (i, abs(x - self._px(p[0], w)) + abs(y - self._y(p[1], hist_h)))
+            for i, p in enumerate(self._nodes)
+            if abs(x - self._px(p[0], w)) <= self._HIT_PX and abs(y - self._y(p[1], hist_h)) <= self._HIT_PX + 4
         ]
         return min(near, key=lambda t: t[1])[0] if near else None
 
@@ -1376,24 +1376,28 @@ class CurvesWidget(QWidget):
 
     def mouseMoveEvent(self, event) -> None:
         x, y = event.position().x(), event.position().y()
-        hist_h = self.height() - 12
+        w, hist_h = self.width(), self.height() - 12
         if self._drag is not None:
-            v = int(round((hist_h - y) / max(1, hist_h) * 255))
-            lo = self._nodes[self._drag - 1] if self._drag > 0 else 0
-            hi = self._nodes[self._drag + 1] if self._drag < 7 else 255
-            self._nodes[self._drag] = min(max(v, lo), hi)
+            i = self._drag
+            nx = int(round(x / max(1, w - 1) * 255))
+            ny = int(round((hist_h - y) / max(1, hist_h) * 255))
+            x_lo = self._nodes[i - 1][0] if i > 0 else 0
+            x_hi = self._nodes[i + 1][0] if i < 7 else 255
+            y_lo = self._nodes[i - 1][1] if i > 0 else 0
+            y_hi = self._nodes[i + 1][1] if i < 7 else 255
+            self._nodes[i] = [min(max(nx, x_lo), x_hi), min(max(ny, y_lo), y_hi)]
             self._update_curve()
-            self.nodesChanged.emit(list(self._nodes))
+            self.nodesChanged.emit([list(p) for p in self._nodes])
             self.update()
             event.accept()
             return
-        over = self._node_at(x, y, self.width(), hist_h) is not None
+        over = self._node_at(x, y, w, hist_h) is not None
         self.setCursor(Qt.CursorShape.PointingHandCursor if over else Qt.CursorShape.ArrowCursor)
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:
         if self._drag is not None and event.button() == Qt.MouseButton.LeftButton:
-            self.nodesCommitted.emit(list(self._nodes))
+            self.nodesCommitted.emit([list(p) for p in self._nodes])
             self._drag = None
             self.unsetCursor()
             event.accept()
@@ -1424,8 +1428,8 @@ class CurvesWidget(QWidget):
         for i in range(1, 4):
             gy = int(i / 4 * hist_h)
             painter.drawLine(0, gy, w, gy)
-        for i in range(8):
-            gx = int(self._x(i, w))
+        for p in self._nodes:
+            gx = int(self._px(p[0], w))
             painter.drawLine(gx, 0, gx, hist_h)
 
         if self._counts:
@@ -1456,9 +1460,9 @@ class CurvesWidget(QWidget):
         painter.drawPath(curve_path)
 
         painter.setPen(QPen(QColor(240, 240, 240, 220), 1))
-        for i, v in enumerate(self._nodes):
+        for i, p in enumerate(self._nodes):
             c = QColor(base)
             c.setAlpha(255)
             painter.setBrush(QBrush(c))
             r = self._NODE_R + (1.5 if i == self._drag else 0.0)
-            painter.drawEllipse(QPointF(self._x(i, w), self._y(v, hist_h)), r, r)
+            painter.drawEllipse(QPointF(self._px(p[0], w), self._y(p[1], hist_h)), r, r)

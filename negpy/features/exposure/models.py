@@ -164,6 +164,41 @@ class ExposureConfig:
     curve_5_blue: float = 0.0
     curve_6_blue: float = 0.0
     curve_7_blue: float = 0.0
+    # Curves node positions matching the offsets above, in code values. Dragging
+    # a node horizontally moves its input; order is held at the panel and the
+    # bake, so the curve can never fold.
+    curve_x_0: int = 0
+    curve_x_1: int = 36
+    curve_x_2: int = 73
+    curve_x_3: int = 109
+    curve_x_4: int = 146
+    curve_x_5: int = 182
+    curve_x_6: int = 219
+    curve_x_7: int = 255
+    curve_x_0_red: int = 0
+    curve_x_1_red: int = 36
+    curve_x_2_red: int = 73
+    curve_x_3_red: int = 109
+    curve_x_4_red: int = 146
+    curve_x_5_red: int = 182
+    curve_x_6_red: int = 219
+    curve_x_7_red: int = 255
+    curve_x_0_green: int = 0
+    curve_x_1_green: int = 36
+    curve_x_2_green: int = 73
+    curve_x_3_green: int = 109
+    curve_x_4_green: int = 146
+    curve_x_5_green: int = 182
+    curve_x_6_green: int = 219
+    curve_x_7_green: int = 255
+    curve_x_0_blue: int = 0
+    curve_x_1_blue: int = 36
+    curve_x_2_blue: int = 73
+    curve_x_3_blue: int = 109
+    curve_x_4_blue: int = 146
+    curve_x_5_blue: int = 182
+    curve_x_6_blue: int = 219
+    curve_x_7_blue: int = 255
 
     def __post_init__(self) -> None:
         """
