@@ -19,6 +19,8 @@ LEVELS_IN_MIN = 0
 LEVELS_IN_MAX = 255
 LEVELS_GAMMA_MIN = 0.1
 LEVELS_GAMMA_MAX = 10.0
+# Share of pixels clipped at each end by Auto Input Levels, as in GIMP.
+LEVELS_AUTO_CLIP = 0.006
 
 
 def _channel_fields(channel: str) -> tuple[str, str, str, str, str]:
@@ -56,6 +58,39 @@ def levels_active(config: Any) -> bool:
         if in_low != 0.0 or in_high != 255.0 or out_low != 0.0 or out_high != 255.0 or gamma != 1.0:
             return True
     return False
+
+
+def auto_input_window(counts: Any) -> tuple[int, int]:
+    """GIMP Auto Input Levels for one 256-bin input histogram: the input bounds
+    at the first bin past a 0.6% tail each end. A degenerate frame falls back to
+    identity rather than posterizing on a threshold."""
+    hist = np.asarray(counts, dtype=np.float64).ravel()
+    total = float(hist.sum())
+    if total <= 0.0 or hist.shape[0] < 256:
+        return 0, 255
+    lo, hi = 0, 255
+    acc = 0.0
+    for i in range(255):
+        acc += float(hist[i])
+        if abs(acc / total - LEVELS_AUTO_CLIP) < abs((acc + float(hist[i + 1])) / total - LEVELS_AUTO_CLIP):
+            lo = i + 1
+            break
+    acc = 0.0
+    for i in range(255, 0, -1):
+        acc += float(hist[i])
+        if abs(acc / total - LEVELS_AUTO_CLIP) < abs((acc + float(hist[i - 1])) / total - LEVELS_AUTO_CLIP):
+            hi = i - 1
+            break
+    if hi <= lo:
+        return 0, 255
+    return lo, hi
+
+
+def auto_channel_levels(counts: Any) -> tuple[int, float, int, int, int]:
+    """One channel's Auto Input Levels: gamma 1 and the full output range over
+    the auto input window, as GIMP resets the other terms on Auto."""
+    lo, hi = auto_input_window(counts)
+    return (lo, 1.0, hi, 0, 255)
 
 
 def without_levels(config: Any) -> Any:

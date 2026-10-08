@@ -10,7 +10,15 @@ from dataclasses import replace
 import numpy as np
 
 from negpy.domain.models import WorkspaceConfig, flat_master_config
-from negpy.features.exposure.levels import apply_levels, channel_levels, levels_active, levels_fields, uniform_rows
+from negpy.features.exposure.levels import (
+    apply_levels,
+    auto_channel_levels,
+    auto_input_window,
+    channel_levels,
+    levels_active,
+    levels_fields,
+    uniform_rows,
+)
 from negpy.features.exposure.models import ExposureConfig
 from negpy.infrastructure.gpu.device import GPUDevice
 
@@ -136,6 +144,27 @@ class TestLevelsPipeline(unittest.TestCase):
         assert hist is not None
         self.assertEqual(np.asarray(hist).shape, (4, 256))
 
+    def test_auto_levels_on_render_histogram(self) -> None:
+        base = WorkspaceConfig()
+        # levels_input_histogram is the pre-levels input, published whenever
+        # levels are active; seed them so the key exists.
+        seeded = replace(base, exposure=replace(base.exposure, levels_gamma=1.5))
+        _, metrics = self._render(seeded)
+        hist = metrics.get("levels_input_histogram")
+        self.assertIsNotNone(hist)
+        assert hist is not None
+        lo, gamma, hi, olo, ohi = auto_channel_levels(np.asarray(hist)[3])
+        self.assertLessEqual(lo, hi)
+        auto_cfg = replace(
+            base,
+            exposure=replace(
+                base.exposure, levels_in_low=lo, levels_gamma=gamma, levels_in_high=hi, levels_out_low=olo, levels_out_high=ohi
+            ),
+        )
+        auto, _ = self._render(auto_cfg)
+        plain, _ = self._render(base)
+        self.assertGreater(float(np.abs(auto - plain).max()), 1e-4)
+
     def test_no_histogram_key_without_levels(self) -> None:
         _, metrics = self._render(WorkspaceConfig())
         self.assertNotIn("levels_input_histogram", metrics)
@@ -145,6 +174,29 @@ class TestLevelsPipeline(unittest.TestCase):
         plain, _ = self._render(flat)
         with_levels, _ = self._render(replace(flat, exposure=replace(flat.exposure, levels_in_low=40, levels_gamma=2.0)))
         np.testing.assert_array_equal(with_levels, plain)
+
+
+class TestAutoLevels(unittest.TestCase):
+    def test_uniform_histogram_stretches_one_bin_each_end(self) -> None:
+        # 0.6% of a flat 256-bin histogram lands just inside each edge.
+        self.assertEqual(auto_input_window(np.ones(256)), (2, 253))
+
+    def test_tails_found_at_the_cliff(self) -> None:
+        counts = np.zeros(256)
+        counts[:10] = 100.0
+        self.assertEqual(auto_input_window(counts), (1, 9))
+
+    def test_single_bin_falls_back_to_identity(self) -> None:
+        counts = np.zeros(256)
+        counts[128] = 1000.0
+        self.assertEqual(auto_input_window(counts), (0, 255))
+
+    def test_empty_histogram_falls_back_to_identity(self) -> None:
+        self.assertEqual(auto_input_window(np.zeros(256)), (0, 255))
+
+    def test_auto_resets_gamma_and_output_range(self) -> None:
+        lo, gamma, hi, olo, ohi = auto_channel_levels(np.ones(256))
+        self.assertEqual((lo, gamma, hi, olo, ohi), (2, 1.0, 253, 0, 255))
 
 
 @unittest.skipUnless(GPUDevice.get().is_available, "GPU not available")

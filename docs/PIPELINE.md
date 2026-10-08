@@ -558,3 +558,5 @@ $$t = \mathrm{clamp}\!\left(\frac{x - l}{h - l},\ 0,\ 1\right), \qquad t \leftar
 
 Bounds are 0-255 code values, $\gamma$ is 0.1 to 10.0 at 1.0. The master applies equally to all three channels first, then each per-channel curve trims on top. A degenerate window ($h \le l$) thresholds at the low marker. Identity by default, so an untouched edit renders exactly as before. Skipped under the Flat intent, which never encodes.
 
+**Auto** (`auto_input_window`) stretches one channel like GIMP's Auto Input Levels: gamma 1, full output range, input bounds at the first bin past a 0.6% tail each end, identity on a degenerate frame.
+

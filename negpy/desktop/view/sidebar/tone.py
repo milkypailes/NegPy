@@ -1,5 +1,6 @@
 from dataclasses import replace
 
+import numpy as np
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QAbstractSpinBox, QComboBox, QDialog, QDoubleSpinBox, QGridLayout, QHBoxLayout, QLabel, QSpinBox, QStyle, QVBoxLayout, QWidget
 
@@ -268,7 +269,12 @@ class ToneSidebar(BaseSidebar):
                 "range through a gamma; higher gamma holds more high-level intensities."
             )
         )
-        self.layout.addWidget(levels_header)
+        self.levels_auto_btn = self._icon_action(
+            "fa5s.magic",
+            "Auto Levels: stretch this channel's input range onto the output range at the 0.6% clip points, "
+            "like GIMP's Auto Input Levels. With Global selected the stretch reads luminance, so hues don't move",
+        )
+        self.layout.addLayout(header_row(levels_header, self.levels_auto_btn))
         self.levels_combo = QComboBox()
         for label in _LEVELS_LABELS:
             self.levels_combo.addItem(label)
@@ -448,6 +454,21 @@ class ToneSidebar(BaseSidebar):
     def _reset_levels_channel(self) -> None:
         self._write_levels(True, in_low=0, gamma=1.0, in_high=255, out_low=0, out_high=255)
 
+    def _auto_levels(self) -> None:
+        """GIMP Auto Input Levels on the shown channel: gamma 1, full output range,
+        input window at the 0.6% clip points of the input histogram the panel draws."""
+        from negpy.features.exposure.levels import auto_channel_levels
+
+        metrics = self.controller.state.last_metrics
+        buf = metrics.get("levels_input_histogram")
+        if buf is None:
+            buf = metrics.get("histogram_raw")
+        if buf is None:
+            return
+        ch = self._levels_channel()
+        lo, gamma, hi, olo, ohi = auto_channel_levels(np.asarray(buf)[3 if ch == 0 else ch - 1])
+        self._write_levels(True, in_low=lo, gamma=gamma, in_high=hi, out_low=olo, out_high=ohi)
+
     def _sync_levels_histogram(self) -> None:
         metrics = self.controller.state.last_metrics
         buf = metrics.get("levels_input_histogram")
@@ -512,6 +533,7 @@ class ToneSidebar(BaseSidebar):
         self.levels_hist.outputChanged.connect(lambda olo, ohi: self._on_levels_output(olo, ohi, False))
         self.levels_hist.outputCommitted.connect(lambda olo, ohi: self._on_levels_output(olo, ohi, True))
         self.levels_hist.resetRequested.connect(self._reset_levels_channel)
+        self.levels_auto_btn.clicked.connect(self._auto_levels)
         for spin in (
             self.levels_in_low_spin,
             self.levels_gamma_spin,
@@ -781,6 +803,7 @@ class ToneSidebar(BaseSidebar):
             self.ch_btn,
             self.levels_combo,
             self.levels_hist,
+            self.levels_auto_btn,
             self.levels_in_low_spin,
             self.levels_gamma_spin,
             self.levels_in_high_spin,
