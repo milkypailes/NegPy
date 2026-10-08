@@ -1,6 +1,7 @@
 from dataclasses import replace
 
-from PyQt6.QtWidgets import QAbstractSpinBox, QComboBox, QDialog, QDoubleSpinBox, QHBoxLayout, QSpinBox, QStyle, QVBoxLayout
+from PyQt6.QtCore import Qt
+from PyQt6.QtWidgets import QAbstractSpinBox, QComboBox, QDialog, QDoubleSpinBox, QGridLayout, QHBoxLayout, QSpinBox, QStyle, QVBoxLayout, QWidget
 
 from negpy.desktop.auto_sliders import shown_values, stored_value
 from negpy.desktop.view.shortcut_registry import tooltip_with_shortcut
@@ -18,6 +19,17 @@ from negpy.features.exposure.models import EXPOSURE_CONSTANTS, TUNABLE_TARGETS, 
 
 _LEVELS_SUFFIX = ("", "_red", "_green", "_blue")
 _LEVELS_LABELS = ("Value", "Red", "Green", "Blue")
+
+
+def _levels_pair(label: str, spin: QWidget) -> QWidget:
+    """One label + entry packed tight, for the left/center/right levels rows."""
+    box = QWidget()
+    row = QHBoxLayout(box)
+    row.setContentsMargins(0, 0, 0, 0)
+    row.setSpacing(THEME.space_sm)
+    row.addWidget(field_label(label))
+    row.addWidget(spin)
+    return box
 
 _ISO_R_MIN = float(EXPOSURE_CONSTANTS["iso_r_min"])
 _ISO_R_MAX = float(EXPOSURE_CONSTANTS["iso_r_max"])
@@ -294,29 +306,48 @@ class ToneSidebar(BaseSidebar):
             text = spin.fontMetrics().horizontalAdvance(sample)
             frame = 2 * spin.style().pixelMetric(QStyle.PixelMetric.PM_DefaultFrameWidth)
             spin.setFixedWidth(text + frame + 4)
-        levels_in_row = QHBoxLayout()
-        levels_in_row.setContentsMargins(0, 0, 0, 0)
-        levels_in_row.setSpacing(THEME.space_sm)
-        for label, spin, tip in (
-            ("Low", self.levels_in_low_spin, "Input shadows below this print at output low (0-255)"),
-            ("Mid", self.levels_gamma_spin, "Input midtone gamma (0.10-10.00): 1.00 is linear, higher holds more highlights"),
-            ("High", self.levels_in_high_spin, "Input highlights above this print at output high (0-255)"),
+        # Left/center/right under the histogram: equal columns pin Low left, Mid
+        # center and High right whatever the label widths are.
+        levels_in_grid = QGridLayout()
+        levels_in_grid.setContentsMargins(0, 0, 0, 0)
+        levels_in_grid.setHorizontalSpacing(THEME.space_sm)
+        levels_in_grid.setVerticalSpacing(0)
+        for col, (label, spin, tip, align) in enumerate(
+            (
+                ("Low", self.levels_in_low_spin, "Input shadows below this print at output low (0-255)", Qt.AlignmentFlag.AlignLeft),
+                (
+                    "Mid",
+                    self.levels_gamma_spin,
+                    "Input midtone gamma (0.10-10.00): 1.00 is linear, higher holds more highlights",
+                    Qt.AlignmentFlag.AlignHCenter,
+                ),
+                ("High", self.levels_in_high_spin, "Input highlights above this print at output high (0-255)", Qt.AlignmentFlag.AlignRight),
+            )
         ):
             spin.setToolTip(wrap_tooltip(f"{tip}, this channel"))
-            levels_in_row.addWidget(field_label(label))
-            levels_in_row.addWidget(spin)
-        self.layout.addLayout(levels_in_row)
-        levels_out_row = QHBoxLayout()
-        levels_out_row.setContentsMargins(0, 0, 0, 0)
-        levels_out_row.setSpacing(THEME.space_sm)
-        for label, spin, tip in (
-            ("Out low", self.levels_out_low_spin, "Lowest output level (0-255): lifts blacks above this, this channel"),
-            ("Out high", self.levels_out_high_spin, "Highest output level (0-255): drops whites below this, this channel"),
+            levels_in_grid.setColumnStretch(col, 1)
+            levels_in_grid.addWidget(_levels_pair(label, spin), 0, col, align)
+        self.layout.addLayout(levels_in_grid)
+        # Output pair under the output bar's own ends.
+        levels_out_grid = QGridLayout()
+        levels_out_grid.setContentsMargins(0, 0, 0, 0)
+        levels_out_grid.setHorizontalSpacing(THEME.space_sm)
+        levels_out_grid.setVerticalSpacing(0)
+        for col, (label, spin, tip, align) in enumerate(
+            (
+                ("Out low", self.levels_out_low_spin, "Lowest output level (0-255): lifts blacks above this, this channel", Qt.AlignmentFlag.AlignLeft),
+                (
+                    "Out high",
+                    self.levels_out_high_spin,
+                    "Highest output level (0-255): drops whites below this, this channel",
+                    Qt.AlignmentFlag.AlignRight,
+                ),
+            )
         ):
             spin.setToolTip(wrap_tooltip(f"{tip}"))
-            levels_out_row.addWidget(field_label(label))
-            levels_out_row.addWidget(spin)
-        self.layout.addLayout(levels_out_row)
+            levels_out_grid.setColumnStretch(col, 1)
+            levels_out_grid.addWidget(_levels_pair(label, spin), 0, col, align)
+        self.layout.addLayout(levels_out_grid)
 
         self.layout.addStretch()
 
