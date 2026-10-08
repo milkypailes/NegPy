@@ -450,6 +450,10 @@ Color timing, like enlarger dichroic filters. The **Global / Shadows / Highlight
 
 In R/G/B mode these become per-layer trims: **Grade** (±30 ISO-R), **Toe** / **Shoulder** (±1), **Toe Width** / **Shoulder Width** (±2), **Snap** (±0.5), **Dye Separation** (±0.4).
 
+**Levels**, last on the panel and last in the pipeline:
+
+*   **Value / Red / Green / Blue** picks the channel GIMP-style fine-tuning acts on: Value is the master curve on all channels, the others trim one channel on top. Each channel shows its input histogram with draggable markers for **Input low / mid / high** (0-255, mid is a gamma at 1.00) and **Output low / high** fields (0-255) for the darkest and brightest output; double-click the histogram resets the channel.
+
 <!-- panel:local -->
 ### 5.3 Dodge & Burn: local exposure
 

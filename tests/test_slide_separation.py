@@ -29,6 +29,13 @@ TRANSFER = (
     | {f"{zone}_{dye}" for zone in ("shadow", "highlight") for dye in ("cyan", "magenta", "yellow")}
     | _with_trims("toe", "shoulder", "toe_width", "shoulder_width", "dye_separation")
     | {"separation_damping"}
+    # Display-referred levels run after the output transform on every path, so they
+    # move a slide exactly like a print.
+    | {
+        f"levels_{name}{suffix}"
+        for suffix in ("", "_red", "_green", "_blue")
+        for name in ("in_low", "gamma", "in_high", "out_low", "out_high")
+    }
 )
 # Meter the frame on a raw slide and on a Positive frame alike; a slide starts with both off.
 METERS = {"auto_exposure", "auto_normalize_contrast"}
@@ -64,6 +71,11 @@ def _moved(field: str, value):
         return not value
     if field == "paper_profile":
         return "kodak_endura"
+    if field.startswith("levels_"):
+        # Integer 0-255 bounds: ±25 stays in range and off the clamp for both ends.
+        if "gamma" in field:
+            return value + 2.0
+        return value - 25.0 if "high" in field else value + 25.0
     if "grade" in field:
         return value + 15.0
     if field in ("toe_width", "shoulder_width", "mask_spacer"):
@@ -96,10 +108,19 @@ def _config(positive: bool):
 
 
 def _render(cfg) -> np.ndarray:
+    """Base + exposure stages, then the engine tail (finish, output transform,
+    levels), so end-of-pipeline controls like levels read a delta too."""
+    from negpy.features.exposure.levels import apply_levels
+    from negpy.features.finish.processor import FinishProcessor
+    from negpy.kernel.image.logic import working_oetf_encode
+
     img = _image()
     ctx = PipelineContext(original_size=img.shape[:2], scale_factor=1.0, process_mode=ProcessMode.E6, wants_uv_grid=False)
     norm = base_processor(cfg).process(img, ctx)
-    return np.asarray(exposure_processor(cfg).process(norm, ctx), dtype=np.float64)
+    lin = np.asarray(exposure_processor(cfg).process(norm, ctx), dtype=np.float32)
+    finished = np.asarray(FinishProcessor(cfg.finish, cfg.export.export_print_size, (1.0, 1.0, 1.0), None).process(lin, ctx))
+    encoded = np.asarray(working_oetf_encode(finished))
+    return np.asarray(apply_levels(encoded, cfg.exposure), dtype=np.float64)
 
 
 def _delta(field: str, positive: bool) -> float:

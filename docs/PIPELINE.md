@@ -547,3 +547,14 @@ Post-crop print finishing in scene-linear, before the output transform. Order: e
 
 *   **Preview paper size**: an interactive render sizes the paper from the preview long edge (`preview_render_size`) instead of the export DPI, and resamples the content to fit, never above its own resolution, because the canvas quotes zoom against the pipeline's buffer and an upscale would make 1:1 read closer than one scan pixel per device pixel. The display shader magnifies instead.
 
+---
+
+## 10. Levels
+**Code**: `negpy.features.exposure.levels` (CPU) / `negpy.features.exposure.shaders.levels.wgsl` (GPU)
+
+GIMP-style fine-tuning on the display-encoded output, after the output transform and every creative stage. Four channels — the Value master, then Red, Green, Blue — each mapping an input window onto an output window through a gamma:
+
+$$t = \mathrm{clamp}\!\left(\frac{x - l}{h - l},\ 0,\ 1\right), \qquad t \leftarrow t^{1/\gamma}, \qquad I_{out} = o_l + (o_h - o_l)\,t$$
+
+Bounds are 0-255 code values, $\gamma$ is 0.1 to 10.0 at 1.0. The master applies equally to all three channels first, then each per-channel curve trims on top. A degenerate window ($h \le l$) thresholds at the low marker. Identity by default, so an untouched edit renders exactly as before. Skipped under the Flat intent, which never encodes.
+

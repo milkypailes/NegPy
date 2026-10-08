@@ -279,6 +279,7 @@ class GPUEngine:
             "exposure": get_resource_path(os.path.join("negpy", "features", "exposure", "shaders", "exposure.wgsl")),
             "transfer": get_resource_path(os.path.join("negpy", "features", "transparency", "shaders", "transfer.wgsl")),
             "output_encode": get_resource_path(os.path.join("negpy", "features", "exposure", "shaders", "output_encode.wgsl")),
+            "levels": get_resource_path(os.path.join("negpy", "features", "exposure", "shaders", "levels.wgsl")),
             "autocrop": get_resource_path(os.path.join("negpy", "features", "geometry", "shaders", "autocrop.wgsl")),
             "clahe_hist": get_resource_path(os.path.join("negpy", "features", "lab", "shaders", "clahe_hist.wgsl")),
             "clahe_cdf": get_resource_path(os.path.join("negpy", "features", "lab", "shaders", "clahe_cdf.wgsl")),
@@ -319,6 +320,7 @@ class GPUEngine:
             "finish",
             "layout",
             "density_hist",
+            "levels",
         ]
         # Packed byte size per stage. A stage that exceeds the 256B dynamic-offset
         # alignment (exposure, 416B) occupies multiple aligned slots.
@@ -335,6 +337,7 @@ class GPUEngine:
             "finish": 60,
             "layout": 48,
             "density_hist": 16,
+            "levels": 80,
         }
         self._alignment = UNIFORM_ALIGNMENT_DEFAULT
         self._current_source_hash: Optional[str] = None
@@ -407,7 +410,11 @@ class GPUEngine:
             return 0
         if last.flatfield.apply != settings.flatfield.apply:
             return 0
-        if last.process != settings.process or last.exposure != settings.exposure:
+        # Levels runs on the encoded output in its own pass, so a levels-only edit
+        # re-runs nothing behind it.
+        from negpy.features.exposure.levels import without_levels
+
+        if last.process != settings.process or without_levels(last.exposure) != without_levels(settings.exposure):
             return 1
         # Retuned Auto Density/Grade targets live in EXPOSURE_CONSTANTS, invisible to the
         # config diff, but they reshape the print curve in the exposure pass.
@@ -1409,6 +1416,25 @@ class GPUEngine:
         self._dispatch_pass(enc, "output_encode", [(0, tex_final.view), (1, tex_output.view)], tex_final.width, tex_final.height)
         tex_final = tex_output
 
+        # Levels, last: display-referred fine-tuning on the encoded output. Always
+        # dispatched, like output_encode, so a levels-only edit re-runs just this.
+        # The metrics pass stays on the pre-levels content texture, so the panel
+        # draws the histogram the markers act on.
+        tex_levels = self._get_intermediate_texture(
+            tex_output.width,
+            tex_output.height,
+            wgpu.TextureUsage.STORAGE_BINDING | wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_SRC,
+            "levels",
+        )
+        self._dispatch_pass(
+            enc,
+            "levels",
+            [(0, tex_output.view), (1, tex_levels.view), (2, self._get_uniform_binding("levels"))],
+            tex_output.width,
+            tex_output.height,
+        )
+        tex_final = tex_levels
+
         device.queue.submit([enc.finish()])
         # The exact stretch the shader normalized with (mirrors the CPU "final_bounds").
         # The transfer path renders through the fixed window, not the measured one.
@@ -2074,9 +2100,22 @@ class GPUEngine:
         # ROI offset + crop dims for the density-histogram pass (tex_norm is uncropped).
         dh_data = struct.pack("IIII", crop_offset[0], crop_offset[1], crop_w, crop_h)
 
+        # Display-referred levels, over (value, red, green, blue); mirrors levels.py.
+        from negpy.features.exposure.levels import uniform_rows
+
+        _lv_lo, _lv_hi, _lv_inv, _lv_olo, _lv_ospan = uniform_rows(settings.exposure)
+        lv_data = (
+            struct.pack("ffff", *_lv_lo)
+            + struct.pack("ffff", *_lv_hi)
+            + struct.pack("ffff", *_lv_inv)
+            + struct.pack("ffff", *_lv_olo)
+            + struct.pack("ffff", *_lv_ospan)
+        )
+
         full_buffer = bytearray()
         for name, d in zip(
-            self._uniform_names, [g_data, n_data, e_data, tr_data, c_data, l_data, li_data, cy_data, t_data, f_data, y_data, dh_data]
+            self._uniform_names,
+            [g_data, n_data, e_data, tr_data, c_data, l_data, li_data, cy_data, t_data, f_data, y_data, dh_data, lv_data],
         ):
             full_buffer += d + b"\x00" * (self._slot_bytes(name) - len(d))
 

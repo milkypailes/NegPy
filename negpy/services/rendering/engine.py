@@ -12,6 +12,7 @@ from negpy.kernel.image.logic import working_oetf_encode
 from negpy.kernel.system.logging import get_logger
 from negpy.features.geometry.processor import GeometryProcessor, CropProcessor
 from negpy.features.exposure import models as exposure_models
+from negpy.features.exposure.levels import apply_levels, levels_active, without_levels
 from negpy.features.exposure.models import RenderIntent
 from negpy.features.exposure.processor import (
     NormalizationProcessor,
@@ -223,10 +224,12 @@ class DarkroomEngine:
             # it on a drag. Stays inside the flat intent below, being a capture fix, not a look.
             return apply_hue_trim(img_out, settings.process.hue_trim)
 
-        # Dodge/burn masks are print-exposure inputs, so they key this stage.
+        # Dodge/burn masks are print-exposure inputs, so they key this stage. Levels
+        # runs on the encoded output, so it stays out of the key and a levels-only
+        # edit re-runs just the final stage.
         current_img, pipeline_changed = self._run_stage(
             current_img,
-            (settings.exposure, settings.local, settings.process.hue_trim),
+            (without_levels(settings.exposure), settings.local, settings.process.hue_trim),
             "exposure",
             run_exposure,
             context,
@@ -277,6 +280,16 @@ class DarkroomEngine:
             current_img = FinishProcessor(settings.finish, settings.export.export_print_size, paper, tone).process(current_img, context)
             # Output transform: scene-linear -> display-encoded (flat master skips this).
             current_img = ensure_image(working_oetf_encode(current_img))
+            # Levels, last: display-referred fine-tuning on the encoded output. The
+            # input histogram is published first, so the panel draws the source the
+            # markers act on rather than the leveled result.
+            if levels_active(settings.exposure):
+                from negpy.features.exposure.analysis import output_histogram
+
+                pre_levels = output_histogram(current_img)
+                if pre_levels is not None:
+                    context.metrics["levels_input_histogram"] = pre_levels
+                current_img = apply_levels(current_img, settings.exposure)
 
         # No paper layout runs here, so the whole buffer is the picture. Reported rather
         # than left out: the controller merges each render's metrics into last_metrics, so

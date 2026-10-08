@@ -1048,3 +1048,251 @@ class MiniRGBHistogramWidget(QWidget):
             c.setAlpha(120)
             painter.setBrush(QBrush(c))
             painter.drawPath(path)
+
+
+class LevelsHistogramWidget(QWidget):
+    """GIMP-style levels editor: the selected channel's input histogram with
+    draggable low/mid/high markers, the gamma mapping strip, and the output
+    bar with its own low/high markers. Double-click resets the channel."""
+
+    inputChanged = pyqtSignal(int, float, int)
+    inputCommitted = pyqtSignal(int, float, int)
+    outputChanged = pyqtSignal(int, int)
+    outputCommitted = pyqtSignal(int, int)
+    resetRequested = pyqtSignal()
+
+    _HIT_PX = 8
+    _MARK_H = 9
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(118)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setMouseTracking(True)
+        self._counts: list = []
+        self._channel = 0
+        self._lo = 0
+        self._gamma = 1.0
+        self._hi = 255
+        self._olo = 0
+        self._ohi = 255
+        self._drag: str | None = None
+
+    def set_data(self, buffer: Any, channel: int = 0) -> None:
+        """Feed a (4, 256) [R, G, B, L] histogram; Value reads the L row."""
+        self._channel = int(channel)
+        row = None
+        if isinstance(buffer, np.ndarray) and buffer.shape == (4, 256):
+            idx = 3 if self._channel == 0 else self._channel - 1
+            vals = np.asarray(buffer[idx], dtype=float)
+            peak = float(vals.max())
+            row = (vals / peak).tolist() if peak > 0 else []
+        if row != self._counts:
+            self._counts = row or []
+            self.update()
+
+    def set_levels(self, in_low: int, gamma: float, in_high: int, out_low: int, out_high: int) -> None:
+        """Show these marker positions without emitting (parent drives)."""
+        changed = (
+            (in_low, gamma, in_high, out_low, out_high)
+            != (self._lo, self._gamma, self._hi, self._olo, self._ohi)
+        )
+        self._lo, self._gamma, self._hi, self._olo, self._ohi = int(in_low), float(gamma), int(in_high), int(out_low), int(out_high)
+        if changed:
+            self.update()
+
+    def _geom(self) -> tuple:
+        """(hist_h, out_y, out_h): input histogram height, output bar top/height."""
+        h = self.height()
+        out_h = 14
+        out_y = h - self._MARK_H - out_h
+        return out_y - self._MARK_H - 14, out_y, out_h
+
+    def _x(self, v: float, w: int) -> float:
+        return float(v) / 255.0 * max(1, w - 1)
+
+    def _mid_x(self, w: int) -> float | None:
+        """Mid marker position, GIMP's log placement between the end markers."""
+        if self._hi <= self._lo:
+            return None
+        lo_px, hi_px = self._x(self._lo, w), self._x(self._hi, w)
+        mid = (lo_px + hi_px) / 2.0
+        width = (hi_px - lo_px) / 2.0
+        return mid + width * float(np.log10(1.0 / max(self._gamma, 1e-3)))
+
+    def _marker_at(self, x: float, y: float, w: int) -> str | None:
+        hist_h, out_y, out_h = self._geom()
+        if y < hist_h + self._MARK_H:
+            cands = [("lo", self._x(self._lo, w)), ("hi", self._x(self._hi, w))]
+            mid = self._mid_x(w)
+            if mid is not None:
+                cands.append(("mid", mid))
+            near = [(m, abs(x - px)) for m, px in cands if abs(x - px) <= self._HIT_PX]
+            return min(near, key=lambda t: t[1])[0] if near else None
+        if y >= out_y:
+            for m, v in (("olo", self._olo), ("ohi", self._ohi)):
+                if abs(x - self._x(v, w)) <= self._HIT_PX:
+                    return m
+        return None
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            hit = self._marker_at(event.position().x(), event.position().y(), self.width())
+            if hit is not None:
+                self._drag = hit
+                self.setCursor(Qt.CursorShape.ClosedHandCursor)
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        x = event.position().x()
+        if self._drag is not None:
+            v = int(round(x / max(1, self.width() - 1) * 255))
+            if self._drag == "lo":
+                self._lo = min(max(v, 0), self._hi)
+                self.inputChanged.emit(self._lo, self._gamma, self._hi)
+            elif self._drag == "hi":
+                self._hi = min(max(v, self._lo), 255)
+                self.inputChanged.emit(self._lo, self._gamma, self._hi)
+            elif self._drag == "mid":
+                lo_px, hi_px = self._x(self._lo, self.width()), self._x(self._hi, self.width())
+                width = max((hi_px - lo_px) / 2.0, 1e-6)
+                mid = (lo_px + hi_px) / 2.0
+                self._gamma = float(min(max(1.0 / (10.0 ** ((x - mid) / width)), 0.1), 10.0))
+                self.inputChanged.emit(self._lo, self._gamma, self._hi)
+            elif self._drag == "olo":
+                self._olo = min(max(v, 0), 255)
+                self.outputChanged.emit(self._olo, self._ohi)
+            elif self._drag == "ohi":
+                self._ohi = min(max(v, 0), 255)
+                self.outputChanged.emit(self._olo, self._ohi)
+            self.update()
+            event.accept()
+            return
+        over = self._marker_at(x, event.position().y(), self.width()) is not None
+        self.setCursor(Qt.CursorShape.PointingHandCursor if over else Qt.CursorShape.ArrowCursor)
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if self._drag is not None and event.button() == Qt.MouseButton.LeftButton:
+            if self._drag in ("lo", "mid", "hi"):
+                self.inputCommitted.emit(self._lo, self._gamma, self._hi)
+            else:
+                self.outputCommitted.emit(self._olo, self._ohi)
+            self._drag = None
+            self.unsetCursor()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.resetRequested.emit()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+    def _mapping(self) -> list:
+        """Current channel's 0-255 output values, for the mapping strip."""
+        lo, hi, olo, ohi = self._lo / 255.0, self._hi / 255.0, self._olo, self._ohi
+        xs = np.arange(256, dtype=np.float64) / 255.0
+        t = (xs - lo) / (hi - lo) if hi > lo else xs - lo
+        t = np.clip(t, 0.0, 1.0)
+        if self._gamma != 1.0:
+            t = np.power(t, 1.0 / self._gamma)
+        return (np.clip(olo + (ohi - olo) * t, 0.0, 255.0) / 255.0).tolist()
+
+    def _triangle(self, painter: QPainter, x: float, y_top: float, size: float, fill: QColor, up: bool) -> None:
+        path = QPainterPath()
+        if up:
+            path.moveTo(x - size / 2, y_top + size)
+            path.lineTo(x + size / 2, y_top + size)
+            path.lineTo(x, y_top)
+        else:
+            path.moveTo(x - size / 2, y_top)
+            path.lineTo(x + size / 2, y_top)
+            path.lineTo(x, y_top + size)
+        path.closeSubpath()
+        painter.fillPath(path, QBrush(fill))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(QColor(240, 240, 240, 200), 1))
+        painter.drawPath(path)
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        painter.fillRect(self.rect(), QColor(THEME.canvas_bg_black))
+        painter.setPen(QPen(QColor(THEME.border_primary), 1))
+        painter.drawRect(self.rect().adjusted(0, 0, -1, -1))
+        if w < 10:
+            return
+        hist_h, out_y, out_h = self._geom()
+        colors = (THEME.text_secondary, THEME.channel_red, THEME.channel_green, THEME.channel_blue)
+        base = QColor(colors[self._channel] if 0 <= self._channel < 4 else colors[0])
+
+        if self._counts:
+            step = w / (len(self._counts) - 1)
+            path = QPainterPath()
+            path.moveTo(0, hist_h)
+            for i, v in enumerate(self._counts):
+                path.lineTo(i * step, hist_h - v * hist_h)
+            path.lineTo(w, hist_h)
+            path.closeSubpath()
+            fill = QColor(base)
+            fill.setAlpha(90)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QBrush(fill))
+            painter.drawPath(path)
+            line = QColor(base)
+            line.setAlpha(190)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(line, 1.0))
+            edge = QPainterPath()
+            edge.moveTo(0, hist_h - self._counts[0] * hist_h)
+            for i, v in enumerate(self._counts):
+                edge.lineTo(i * step, hist_h - v * hist_h)
+            painter.drawPath(edge)
+
+        # Gamma mapping strip under the histogram.
+        strip_y = hist_h + self._MARK_H
+        for i, v in enumerate(self._mapping()):
+            tone = int(v * 255)
+            if self._channel == 0:
+                c = QColor(tone, tone, tone)
+            elif self._channel == 1:
+                c = QColor(tone, 0, 0)
+            elif self._channel == 2:
+                c = QColor(0, tone, 0)
+            else:
+                c = QColor(0, 0, tone)
+            painter.fillRect(int(i / 255 * w), int(strip_y), max(1, int(w / 255) + 1), 14, c)
+
+        painter.setPen(Qt.PenStyle.NoPen)
+        self._triangle(painter, self._x(self._lo, w), hist_h, self._MARK_H - 2, QColor(20, 20, 20), True)
+        self._triangle(painter, self._x(self._hi, w), hist_h, self._MARK_H - 2, QColor(245, 245, 245), True)
+        mid = self._mid_x(w)
+        if mid is not None:
+            grey = QColor(150, 150, 150)
+            self._triangle(painter, float(np.clip(mid, self._x(self._lo, w), self._x(self._hi, w))), hist_h, self._MARK_H - 3, grey, True)
+
+        # Output bar in the channel color with its low/high markers.
+        for i in range(w):
+            f = i / max(1, w - 1)
+            tone = int(f * 255)
+            if self._channel == 0:
+                c = QColor(tone, tone, tone)
+            elif self._channel == 1:
+                c = QColor(tone, 0, 0)
+            elif self._channel == 2:
+                c = QColor(0, tone, 0)
+            else:
+                c = QColor(0, 0, tone)
+            painter.fillRect(i, int(out_y), 1, int(out_h), c)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(QColor(THEME.border_primary), 1))
+        painter.drawRect(0, int(out_y), w - 1, int(out_h) - 1)
+        painter.setPen(Qt.PenStyle.NoPen)
+        self._triangle(painter, self._x(self._olo, w), out_y + out_h, self._MARK_H - 2, QColor(20, 20, 20), True)
+        self._triangle(painter, self._x(self._ohi, w), out_y + out_h, self._MARK_H - 2, QColor(245, 245, 245), True)

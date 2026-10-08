@@ -1,18 +1,23 @@
 from dataclasses import replace
 
-from PyQt6.QtWidgets import QComboBox, QDialog, QHBoxLayout, QVBoxLayout
+from PyQt6.QtWidgets import QComboBox, QDialog, QDoubleSpinBox, QHBoxLayout, QSpinBox, QVBoxLayout
 
 from negpy.desktop.auto_sliders import shown_values, stored_value
 from negpy.desktop.view.shortcut_registry import tooltip_with_shortcut
 from negpy.desktop.view.sidebar.base import BaseSidebar
-from negpy.desktop.view.styles.templates import ICON_BUTTON_WIDTH, hint_label, header_row, section_subheader, wrap_tooltip
+from negpy.desktop.view.styles.templates import ICON_BUTTON_WIDTH, field_label, header_row, hint_label, section_subheader, wrap_tooltip
 from negpy.desktop.view.styles.theme import THEME
+from negpy.desktop.view.widgets.charts import LevelsHistogramWidget
 from negpy.desktop.view.widgets.choice_button import ChoiceButton, ToggleMenuButton
 from negpy.desktop.view.widgets.sliders import CompactSlider, SliderGroup
+from negpy.features.exposure.levels import LEVELS_CHANNELS
 from negpy.features.exposure.logic import per_channel_dye_separation
 from negpy.features.hdr.models import hdr_active
 from negpy.features.exposure.auto_sliders import NEUTRAL
 from negpy.features.exposure.models import EXPOSURE_CONSTANTS, TUNABLE_TARGETS, apply_targets
+
+_LEVELS_SUFFIX = ("", "_red", "_green", "_blue")
+_LEVELS_LABELS = ("Value", "Red", "Green", "Blue")
 
 _ISO_R_MIN = float(EXPOSURE_CONSTANTS["iso_r_min"])
 _ISO_R_MAX = float(EXPOSURE_CONSTANTS["iso_r_max"])
@@ -236,6 +241,66 @@ class ToneSidebar(BaseSidebar):
         self.layout.addWidget(self.sh_slider)
         self.layout.addWidget(SliderGroup(self.sh_w_slider, self.sh_w_trim_slider))
 
+        levels_header = section_subheader("LEVELS")
+        levels_header.setToolTip(
+            wrap_tooltip(
+                "Display-referred levels, GIMP-style, applied last after everything else for "
+                "fine-tuning the output. Each channel maps its input range onto the output "
+                "range through a gamma; higher gamma holds more high-level intensities."
+            )
+        )
+        self.layout.addWidget(levels_header)
+        self.levels_combo = QComboBox()
+        for label in _LEVELS_LABELS:
+            self.levels_combo.addItem(label)
+        self.levels_combo.setToolTip(
+            wrap_tooltip(
+                "Levels channel: Value edits the master curve on all channels, Red, Green "
+                "and Blue trim one channel on top of it"
+            )
+        )
+        self.layout.addWidget(self.levels_combo)
+        self.levels_hist = LevelsHistogramWidget()
+        self.levels_hist.setToolTip(
+            wrap_tooltip(
+                "The channel's input histogram. Drag the black, gray and white markers for "
+                "input low, mid and high; drag the output bar's markers for output low and "
+                "high. Double-click resets the channel."
+            )
+        )
+        self.layout.addWidget(self.levels_hist)
+        self.levels_in_low_spin = QSpinBox()
+        self.levels_in_low_spin.setRange(0, 255)
+        self.levels_in_high_spin = QSpinBox()
+        self.levels_in_high_spin.setRange(0, 255)
+        self.levels_out_low_spin = QSpinBox()
+        self.levels_out_low_spin.setRange(0, 255)
+        self.levels_out_high_spin = QSpinBox()
+        self.levels_out_high_spin.setRange(0, 255)
+        self.levels_gamma_spin = QDoubleSpinBox()
+        self.levels_gamma_spin.setRange(0.10, 10.0)
+        self.levels_gamma_spin.setDecimals(2)
+        self.levels_gamma_spin.setSingleStep(0.05)
+        levels_in_row = QHBoxLayout()
+        for label, spin, tip in (
+            ("Low", self.levels_in_low_spin, "Input shadows below this print at output low (0-255)"),
+            ("Mid", self.levels_gamma_spin, "Input midtone gamma (0.10-10.00): 1.00 is linear, higher holds more highlights"),
+            ("High", self.levels_in_high_spin, "Input highlights above this print at output high (0-255)"),
+        ):
+            spin.setToolTip(wrap_tooltip(f"{tip}, this channel"))
+            levels_in_row.addWidget(field_label(label))
+            levels_in_row.addWidget(spin, 1)
+        self.layout.addLayout(levels_in_row)
+        levels_out_row = QHBoxLayout()
+        for label, spin, tip in (
+            ("Out low", self.levels_out_low_spin, "Lowest output level (0-255): lifts blacks above this, this channel"),
+            ("Out high", self.levels_out_high_spin, "Highest output level (0-255): drops whites below this, this channel"),
+        ):
+            spin.setToolTip(wrap_tooltip(f"{tip}"))
+            levels_out_row.addWidget(field_label(label))
+            levels_out_row.addWidget(spin, 1)
+        self.layout.addLayout(levels_out_row)
+
         self.layout.addStretch()
 
         # Global-only controls, greyed while a channel page is active.
@@ -278,6 +343,61 @@ class ToneSidebar(BaseSidebar):
 
     def _channel_index(self) -> int:
         return self.ch_btn.currentIndex()
+
+    def _levels_channel(self) -> int:
+        return max(0, min(3, self.levels_combo.currentIndex()))
+
+    def _levels_values(self, conf) -> tuple:
+        from negpy.features.exposure.levels import channel_levels
+
+        lo, gamma, hi, olo, ohi = channel_levels(conf, LEVELS_CHANNELS[self._levels_channel()])
+        return int(lo), float(gamma), int(hi), int(olo), int(ohi)
+
+    def _write_levels(self, persist: bool, **values) -> None:
+        fields = {f"levels_{name}{_LEVELS_SUFFIX[self._levels_channel()]}": v for name, v in values.items()}
+        self.update_config_section("exposure", render=True, persist=persist, readback_metrics=True, **fields)
+
+    def _show_levels(self, lo: int, gamma: float, hi: int, olo: int, ohi: int) -> None:
+        for spin, v in (
+            (self.levels_in_low_spin, lo),
+            (self.levels_gamma_spin, gamma),
+            (self.levels_in_high_spin, hi),
+            (self.levels_out_low_spin, olo),
+            (self.levels_out_high_spin, ohi),
+        ):
+            spin.blockSignals(True)
+            spin.setValue(v)
+            spin.blockSignals(False)
+        self.levels_hist.set_levels(lo, gamma, hi, olo, ohi)
+
+    def _on_levels_input(self, lo: int, gamma: float, hi: int, persist: bool) -> None:
+        olo, ohi = self.levels_out_low_spin.value(), self.levels_out_high_spin.value()
+        self._show_levels(lo, gamma, hi, olo, ohi)
+        self._write_levels(persist, in_low=lo, gamma=gamma, in_high=hi)
+
+    def _on_levels_output(self, olo: int, ohi: int, persist: bool) -> None:
+        lo, gamma, hi = self.levels_in_low_spin.value(), self.levels_gamma_spin.value(), self.levels_in_high_spin.value()
+        self._show_levels(lo, gamma, hi, olo, ohi)
+        self._write_levels(persist, out_low=olo, out_high=ohi)
+
+    def _on_levels_spins(self, persist: bool) -> None:
+        lo = self.levels_in_low_spin.value()
+        gamma = self.levels_gamma_spin.value()
+        hi = self.levels_in_high_spin.value()
+        olo = self.levels_out_low_spin.value()
+        ohi = self.levels_out_high_spin.value()
+        self.levels_hist.set_levels(lo, gamma, hi, olo, ohi)
+        self._write_levels(persist, in_low=lo, gamma=gamma, in_high=hi, out_low=olo, out_high=ohi)
+
+    def _reset_levels_channel(self) -> None:
+        self._write_levels(True, in_low=0, gamma=1.0, in_high=255, out_low=0, out_high=255)
+
+    def _sync_levels_histogram(self) -> None:
+        metrics = self.controller.state.last_metrics
+        buf = metrics.get("levels_input_histogram")
+        if buf is None:
+            buf = metrics.get("histogram_raw")
+        self.levels_hist.set_data(buf, self._levels_channel())
 
     def _curve_field(self, base: str) -> str:
         idx = self._channel_index()
@@ -330,6 +450,21 @@ class ToneSidebar(BaseSidebar):
         # follow the controller rather than sync_ui.
         self.controller.test_strip_changed.connect(self._sync_test_strip_btn)
         self.ch_btn.currentChanged.connect(lambda _i: self.sync_ui())
+        self.levels_combo.currentIndexChanged.connect(lambda _i: self.sync_ui())
+        self.levels_hist.inputChanged.connect(lambda lo, g, hi: self._on_levels_input(lo, g, hi, False))
+        self.levels_hist.inputCommitted.connect(lambda lo, g, hi: self._on_levels_input(lo, g, hi, True))
+        self.levels_hist.outputChanged.connect(lambda olo, ohi: self._on_levels_output(olo, ohi, False))
+        self.levels_hist.outputCommitted.connect(lambda olo, ohi: self._on_levels_output(olo, ohi, True))
+        self.levels_hist.resetRequested.connect(self._reset_levels_channel)
+        for spin in (
+            self.levels_in_low_spin,
+            self.levels_gamma_spin,
+            self.levels_in_high_spin,
+            self.levels_out_low_spin,
+            self.levels_out_high_spin,
+        ):
+            spin.valueChanged.connect(lambda _v: self._on_levels_spins(False))
+            spin.editingFinished.connect(lambda: self._on_levels_spins(True))
 
         # White Point/Black Point live on ProcessConfig, not ExposureConfig like the rest of
         # this panel, so they write to a different config section than the loop below.
@@ -340,6 +475,7 @@ class ToneSidebar(BaseSidebar):
             slider.dragStarted.connect(lambda f=field: self.controller.tone_drag_changed.emit(f))
             slider.dragEnded.connect(lambda: self.controller.tone_drag_changed.emit(""))
         self.controller.image_updated.connect(self._sync_driven)
+        self.controller.image_updated.connect(self._sync_levels_histogram)
 
         for slider, field in (
             (self.toe_w_slider, "toe_width"),
@@ -493,6 +629,13 @@ class ToneSidebar(BaseSidebar):
             if is_bw:
                 self.ch_btn.setCurrentIndex(0)
             self.ch_btn.setVisible(not is_bw)
+            # Levels keeps its own channel selector; B&W has only the Value master.
+            if is_bw:
+                self.levels_combo.setCurrentIndex(0)
+            self.levels_combo.setVisible(not is_bw)
+            lo, gamma, hi, olo, ohi = self._levels_values(conf)
+            self._show_levels(lo, gamma, hi, olo, ohi)
+            self._sync_levels_histogram()
 
             idx = self._channel_index()
             global_mode = idx == 0
@@ -580,6 +723,13 @@ class ToneSidebar(BaseSidebar):
         for w in (
             self.paper_combo,
             self.ch_btn,
+            self.levels_combo,
+            self.levels_hist,
+            self.levels_in_low_spin,
+            self.levels_gamma_spin,
+            self.levels_in_high_spin,
+            self.levels_out_low_spin,
+            self.levels_out_high_spin,
             self.density_slider,
             self.grade_slider,
             self.grade_trim_slider,
