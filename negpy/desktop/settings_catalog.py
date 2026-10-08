@@ -204,6 +204,10 @@ CATALOG: list[tuple[str, tuple[SettingRow, ...]]] = [
             "levels_out_low_blue",
             "levels_out_high_blue",
         ),
+        _row("Curves Global", "exposure", *[f"curve_{i}" for i in range(8)]),
+        _row("Curves Red", "exposure", *[f"curve_{i}_red" for i in range(8)]),
+        _row("Curves Green", "exposure", *[f"curve_{i}_green" for i in range(8)]),
+        _row("Curves Blue", "exposure", *[f"curve_{i}_blue" for i in range(8)]),
         _row("Auto Density", "exposure", "auto_exposure", sticky=True),
         _row("Auto Grade", "exposure", "auto_normalize_contrast", sticky=True),
         _row("Paper Profile", "exposure", "paper_profile", sticky=True),
@@ -480,6 +484,7 @@ TONE_FIELDS = (
     "levels_in_high_blue",
     "levels_out_low_blue",
     "levels_out_high_blue",
+    *[f"curve_{i}{sfx}" for sfx in ("", "_red", "_green", "_blue") for i in range(8)],
 )
 
 # Frame cards whose settings can be pushed to other frames, and the fields each owns. A

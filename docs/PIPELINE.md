@@ -560,3 +560,8 @@ Bounds are 0-255 code values, $\gamma$ is 0.1 to 10.0 at 1.0. The master applies
 
 **Auto** (`auto_input_window`) stretches one channel like GIMP's Auto Input Levels: gamma 1, full output range, input bounds at the first bin past a 0.6% tail each end, identity on a degenerate frame.
 
+### Curves
+**Code**: `negpy.features.exposure.curves` (CPU bake + apply) / `negpy.features.exposure.shaders.curves.wgsl` (GPU)
+
+Per-channel tone maps on the display-encoded output, after Levels. Four channels — the Global master, then Red, Green, Blue — each holding eight control points as offsets from the identity line. The offsets bake through a monotone cubic (Fritsch-Carlson PCHIP, hand-rolled: no scipy) into a 256-entry table, held monotone so the map never folds; both engines apply the table by integer indexing (`u32(clamp(x*255+0.5))`), so parity holds by construction. Identity lanes are skipped through an active mask: even an identity table would quantize to 8 bits. Skipped under the Flat intent with everything else past the output transform.
+

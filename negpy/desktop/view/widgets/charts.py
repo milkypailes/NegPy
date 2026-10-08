@@ -1296,3 +1296,169 @@ class LevelsHistogramWidget(QWidget):
         painter.setPen(Qt.PenStyle.NoPen)
         self._triangle(painter, self._x(self._olo, w), out_y + out_h, self._MARK_H - 2, QColor(20, 20, 20), True)
         self._triangle(painter, self._x(self._ohi, w), out_y + out_h, self._MARK_H - 2, QColor(245, 245, 245), True)
+
+
+class CurvesWidget(QWidget):
+    """GIMP-style curve editor over the selected channel's input histogram: the
+    channel's baked curve with one draggable node per fixed grid position.
+    Nodes move vertically only, clamped between their neighbours so the curve
+    can never fold. Double-click resets the channel."""
+
+    nodesChanged = pyqtSignal(list)
+    nodesCommitted = pyqtSignal(list)
+    resetRequested = pyqtSignal()
+
+    _HIT_PX = 9
+    _NODE_R = 4.5
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(132)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setMouseTracking(True)
+        self._counts: list = []
+        self._channel = 0
+        self._nodes: list = [0, 36, 73, 109, 146, 182, 219, 255]
+        self._curve: list = [i / 255 for i in range(256)]
+        self._drag: int | None = None
+
+    def set_data(self, buffer: Any, channel: int = 0) -> None:
+        """Feed a (4, 256) [R, G, B, L] histogram; Global reads the L row."""
+        self._channel = int(channel)
+        row = None
+        if isinstance(buffer, np.ndarray) and buffer.shape == (4, 256):
+            idx = 3 if self._channel == 0 else self._channel - 1
+            vals = np.asarray(buffer[idx], dtype=float)
+            peak = float(vals.max())
+            row = (vals / peak).tolist() if peak > 0 else []
+        if row != self._counts:
+            self._counts = row or []
+            self.update()
+
+    def set_nodes(self, outputs: Any) -> None:
+        """Show these node outputs (0-255 per grid position) without emitting."""
+        nodes = [min(max(int(round(v)), 0), 255) for v in list(outputs)]
+        if nodes != self._nodes:
+            self._nodes = nodes
+            self._update_curve()
+            self.update()
+
+    def _update_curve(self) -> None:
+        from negpy.features.exposure.curves import CURVE_INPUTS, bake_channel_lut
+
+        offsets = [o - x for o, x in zip(self._nodes, CURVE_INPUTS)]
+        self._curve = (np.asarray(bake_channel_lut(offsets), dtype=float) * 255.0).tolist()
+
+    def _x(self, i: int, w: int) -> float:
+        return float(i) / 7.0 * max(1, w - 1)
+
+    def _y(self, v: float, hist_h: int) -> float:
+        return hist_h - float(v) / 255.0 * hist_h
+
+    def _node_at(self, x: float, y: float, w: int, hist_h: int) -> int | None:
+        near = [
+            (i, abs(x - self._x(i, w)) + abs(y - self._y(v, hist_h)))
+            for i, v in enumerate(self._nodes)
+            if abs(x - self._x(i, w)) <= self._HIT_PX and abs(y - self._y(v, hist_h)) <= self._HIT_PX + 4
+        ]
+        return min(near, key=lambda t: t[1])[0] if near else None
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            hist_h = self.height() - 12
+            hit = self._node_at(event.position().x(), event.position().y(), self.width(), hist_h)
+            if hit is not None:
+                self._drag = hit
+                self.setCursor(Qt.CursorShape.ClosedHandCursor)
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        x, y = event.position().x(), event.position().y()
+        hist_h = self.height() - 12
+        if self._drag is not None:
+            v = int(round((hist_h - y) / max(1, hist_h) * 255))
+            lo = self._nodes[self._drag - 1] if self._drag > 0 else 0
+            hi = self._nodes[self._drag + 1] if self._drag < 7 else 255
+            self._nodes[self._drag] = min(max(v, lo), hi)
+            self._update_curve()
+            self.nodesChanged.emit(list(self._nodes))
+            self.update()
+            event.accept()
+            return
+        over = self._node_at(x, y, self.width(), hist_h) is not None
+        self.setCursor(Qt.CursorShape.PointingHandCursor if over else Qt.CursorShape.ArrowCursor)
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if self._drag is not None and event.button() == Qt.MouseButton.LeftButton:
+            self.nodesCommitted.emit(list(self._nodes))
+            self._drag = None
+            self.unsetCursor()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.resetRequested.emit()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        painter.fillRect(self.rect(), QColor(THEME.canvas_bg_black))
+        painter.setPen(QPen(QColor(THEME.border_primary), 1))
+        painter.drawRect(self.rect().adjusted(0, 0, -1, -1))
+        if w < 10:
+            return
+        hist_h = h - 12
+        colors = (THEME.text_secondary, THEME.channel_red, THEME.channel_green, THEME.channel_blue)
+        base = QColor(colors[self._channel] if 0 <= self._channel < 4 else colors[0])
+
+        painter.setPen(QPen(QColor(THEME.border_input), 1))
+        for i in range(1, 4):
+            gy = int(i / 4 * hist_h)
+            painter.drawLine(0, gy, w, gy)
+        for i in range(8):
+            gx = int(self._x(i, w))
+            painter.drawLine(gx, 0, gx, hist_h)
+
+        if self._counts:
+            step = w / (len(self._counts) - 1)
+            path = QPainterPath()
+            path.moveTo(0, hist_h)
+            for i, v in enumerate(self._counts):
+                path.lineTo(i * step, hist_h - v * hist_h)
+            path.lineTo(w, hist_h)
+            path.closeSubpath()
+            fill = QColor(base)
+            fill.setAlpha(70)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QBrush(fill))
+            painter.drawPath(path)
+
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(QColor(THEME.bg_menu_selected), 1, Qt.PenStyle.DashLine))
+        painter.drawLine(0, hist_h, w, 0)
+
+        line = QColor(base)
+        line.setAlpha(230)
+        painter.setPen(QPen(QColor(240, 240, 240, 200) if self._channel == 0 else line, 1.5))
+        curve_path = QPainterPath()
+        curve_path.moveTo(0, self._y(self._curve[0], hist_h))
+        for i, v in enumerate(self._curve):
+            curve_path.lineTo(i / 255 * w, self._y(v, hist_h))
+        painter.drawPath(curve_path)
+
+        painter.setPen(QPen(QColor(240, 240, 240, 220), 1))
+        for i, v in enumerate(self._nodes):
+            c = QColor(base)
+            c.setAlpha(255)
+            painter.setBrush(QBrush(c))
+            r = self._NODE_R + (1.5 if i == self._drag else 0.0)
+            painter.drawEllipse(QPointF(self._x(i, w), self._y(v, hist_h)), r, r)

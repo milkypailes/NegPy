@@ -36,6 +36,8 @@ TRANSFER = (
         for suffix in ("", "_red", "_green", "_blue")
         for name in ("in_low", "gamma", "in_high", "out_low", "out_high")
     }
+    # Display-referred curves run after levels on every path, for the same reason.
+    | {f"curve_{i}{suffix}" for suffix in ("", "_red", "_green", "_blue") for i in range(8)}
 )
 # Meter the frame on a raw slide and on a Positive frame alike; a slide starts with both off.
 METERS = {"auto_exposure", "auto_normalize_contrast"}
@@ -109,7 +111,8 @@ def _config(positive: bool):
 
 def _render(cfg) -> np.ndarray:
     """Base + exposure stages, then the engine tail (finish, output transform,
-    levels), so end-of-pipeline controls like levels read a delta too."""
+    levels, curves), so end-of-pipeline controls read a delta too."""
+    from negpy.features.exposure.curves import apply_curves
     from negpy.features.exposure.levels import apply_levels
     from negpy.features.finish.processor import FinishProcessor
     from negpy.kernel.image.logic import working_oetf_encode
@@ -120,7 +123,7 @@ def _render(cfg) -> np.ndarray:
     lin = np.asarray(exposure_processor(cfg).process(norm, ctx), dtype=np.float32)
     finished = np.asarray(FinishProcessor(cfg.finish, cfg.export.export_print_size, (1.0, 1.0, 1.0), None).process(lin, ctx))
     encoded = np.asarray(working_oetf_encode(finished))
-    return np.asarray(apply_levels(encoded, cfg.exposure), dtype=np.float64)
+    return np.asarray(apply_curves(apply_levels(encoded, cfg.exposure), cfg.exposure), dtype=np.float64)
 
 
 def _delta(field: str, positive: bool) -> float:

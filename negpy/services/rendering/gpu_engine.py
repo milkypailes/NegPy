@@ -280,6 +280,7 @@ class GPUEngine:
             "transfer": get_resource_path(os.path.join("negpy", "features", "transparency", "shaders", "transfer.wgsl")),
             "output_encode": get_resource_path(os.path.join("negpy", "features", "exposure", "shaders", "output_encode.wgsl")),
             "levels": get_resource_path(os.path.join("negpy", "features", "exposure", "shaders", "levels.wgsl")),
+            "curves": get_resource_path(os.path.join("negpy", "features", "exposure", "shaders", "curves.wgsl")),
             "autocrop": get_resource_path(os.path.join("negpy", "features", "geometry", "shaders", "autocrop.wgsl")),
             "clahe_hist": get_resource_path(os.path.join("negpy", "features", "lab", "shaders", "clahe_hist.wgsl")),
             "clahe_cdf": get_resource_path(os.path.join("negpy", "features", "lab", "shaders", "clahe_cdf.wgsl")),
@@ -321,6 +322,7 @@ class GPUEngine:
             "layout",
             "density_hist",
             "levels",
+            "curves",
         ]
         # Packed byte size per stage. A stage that exceeds the 256B dynamic-offset
         # alignment (exposure, 416B) occupies multiple aligned slots.
@@ -338,6 +340,7 @@ class GPUEngine:
             "layout": 48,
             "density_hist": 16,
             "levels": 80,
+            "curves": 16,
         }
         self._alignment = UNIFORM_ALIGNMENT_DEFAULT
         self._current_source_hash: Optional[str] = None
@@ -410,11 +413,15 @@ class GPUEngine:
             return 0
         if last.flatfield.apply != settings.flatfield.apply:
             return 0
-        # Levels runs on the encoded output in its own pass, so a levels-only edit
-        # re-runs nothing behind it.
+        # Levels and curves run on the encoded output in their own passes, so an
+        # edit to either re-runs nothing behind them.
+        from negpy.features.exposure.curves import without_curves
         from negpy.features.exposure.levels import without_levels
 
-        if last.process != settings.process or without_levels(last.exposure) != without_levels(settings.exposure):
+        def _print_key(exposure: Any) -> Any:
+            return without_curves(without_levels(exposure))
+
+        if last.process != settings.process or _print_key(last.exposure) != _print_key(settings.exposure):
             return 1
         # Retuned Auto Density/Grade targets live in EXPOSURE_CONSTANTS, invisible to the
         # config diff, but they reshape the print curve in the exposure pass.
@@ -525,6 +532,9 @@ class GPUEngine:
         )
         # Sharpen blur taps (gaussian_kernel_1d): 1024 f32 covers radius <= 511.
         self._buffers["sharpen_k"] = GPUBuffer(4096, wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST)
+        # Curves tables: 256 vec4<f32> over (global, red, green, blue), re-baked
+        # per frame while a node is off the line.
+        self._buffers["curves_lut"] = GPUBuffer(4096, wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST)
         # Filed-carrier jitter profiles are a fixed table, so upload once.
         self._buffers["carrier_s"] = GPUBuffer(carrier_profiles().nbytes, wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST)
         self._buffers["carrier_s"].upload(np.ascontiguousarray(carrier_profiles().ravel(), dtype=np.float32))
@@ -1435,6 +1445,34 @@ class GPUEngine:
         )
         tex_final = tex_levels
 
+        # Curves, after levels: its own pass only while a node is off the line, like
+        # the alternative-process stage. The metrics pass stays on the pre-levels
+        # content texture, and the panel reads its post-levels input histogram from
+        # the CPU engine's curves_input_histogram instead.
+        from negpy.features.exposure.curves import bake_config_luts, curves_active
+
+        if curves_active(settings.exposure):
+            self._buffers["curves_lut"].upload(np.ascontiguousarray(bake_config_luts(settings.exposure).T, dtype=np.float32))
+            tex_curves = self._get_intermediate_texture(
+                tex_levels.width,
+                tex_levels.height,
+                wgpu.TextureUsage.STORAGE_BINDING | wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_SRC,
+                "curves",
+            )
+            self._dispatch_pass(
+                enc,
+                "curves",
+                [
+                    (0, tex_levels.view),
+                    (1, tex_curves.view),
+                    (2, self._get_uniform_binding("curves")),
+                    (3, self._buffers["curves_lut"]),
+                ],
+                tex_levels.width,
+                tex_levels.height,
+            )
+            tex_final = tex_curves
+
         device.queue.submit([enc.finish()])
         # The exact stretch the shader normalized with (mirrors the CPU "final_bounds").
         # The transfer path renders through the fixed window, not the measured one.
@@ -2112,10 +2150,15 @@ class GPUEngine:
             + struct.pack("ffff", *_lv_ospan)
         )
 
+        # Curves apply flags over the same lanes; the tables ride a storage buffer.
+        from negpy.features.exposure.curves import active_mask
+
+        cv_data = struct.pack("IIII", *active_mask(settings.exposure))
+
         full_buffer = bytearray()
         for name, d in zip(
             self._uniform_names,
-            [g_data, n_data, e_data, tr_data, c_data, l_data, li_data, cy_data, t_data, f_data, y_data, dh_data, lv_data],
+            [g_data, n_data, e_data, tr_data, c_data, l_data, li_data, cy_data, t_data, f_data, y_data, dh_data, lv_data, cv_data],
         ):
             full_buffer += d + b"\x00" * (self._slot_bytes(name) - len(d))
 

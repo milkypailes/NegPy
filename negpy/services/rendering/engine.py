@@ -12,6 +12,7 @@ from negpy.kernel.image.logic import working_oetf_encode
 from negpy.kernel.system.logging import get_logger
 from negpy.features.geometry.processor import GeometryProcessor, CropProcessor
 from negpy.features.exposure import models as exposure_models
+from negpy.features.exposure.curves import apply_curves, curves_active, without_curves
 from negpy.features.exposure.levels import apply_levels, levels_active, without_levels
 from negpy.features.exposure.models import RenderIntent
 from negpy.features.exposure.processor import (
@@ -225,11 +226,11 @@ class DarkroomEngine:
             return apply_hue_trim(img_out, settings.process.hue_trim)
 
         # Dodge/burn masks are print-exposure inputs, so they key this stage. Levels
-        # runs on the encoded output, so it stays out of the key and a levels-only
-        # edit re-runs just the final stage.
+        # and curves run on the encoded output, so they stay out of the key and an
+        # edit to either re-runs just the final stages.
         current_img, pipeline_changed = self._run_stage(
             current_img,
-            (without_levels(settings.exposure), settings.local, settings.process.hue_trim),
+            (without_curves(without_levels(settings.exposure)), settings.local, settings.process.hue_trim),
             "exposure",
             run_exposure,
             context,
@@ -290,6 +291,16 @@ class DarkroomEngine:
                 if pre_levels is not None:
                     context.metrics["levels_input_histogram"] = pre_levels
                 current_img = apply_levels(current_img, settings.exposure)
+            # Curves, after levels: the panel draws the post-levels input, so a
+            # histogram is published whenever either stage runs.
+            if curves_active(settings.exposure) or levels_active(settings.exposure):
+                from negpy.features.exposure.analysis import output_histogram
+
+                pre_curves = output_histogram(current_img)
+                if pre_curves is not None:
+                    context.metrics["curves_input_histogram"] = pre_curves
+            if curves_active(settings.exposure):
+                current_img = apply_curves(current_img, settings.exposure)
 
         # No paper layout runs here, so the whole buffer is the picture. Reported rather
         # than left out: the controller merges each render's metrics into last_metrics, so

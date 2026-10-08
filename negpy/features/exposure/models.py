@@ -128,6 +128,42 @@ class ExposureConfig:
     levels_in_high_blue: int = 255
     levels_out_low_blue: int = 0
     levels_out_high_blue: int = 255
+    # Display-referred curves (see curves.py), after levels: per-channel control
+    # points as offsets from the identity line in code values, shadows to
+    # highlights. The Global master first, then one curve per channel. All zero
+    # is identity, so an untouched edit renders exactly as before.
+    curve_0: float = 0.0
+    curve_1: float = 0.0
+    curve_2: float = 0.0
+    curve_3: float = 0.0
+    curve_4: float = 0.0
+    curve_5: float = 0.0
+    curve_6: float = 0.0
+    curve_7: float = 0.0
+    curve_0_red: float = 0.0
+    curve_1_red: float = 0.0
+    curve_2_red: float = 0.0
+    curve_3_red: float = 0.0
+    curve_4_red: float = 0.0
+    curve_5_red: float = 0.0
+    curve_6_red: float = 0.0
+    curve_7_red: float = 0.0
+    curve_0_green: float = 0.0
+    curve_1_green: float = 0.0
+    curve_2_green: float = 0.0
+    curve_3_green: float = 0.0
+    curve_4_green: float = 0.0
+    curve_5_green: float = 0.0
+    curve_6_green: float = 0.0
+    curve_7_green: float = 0.0
+    curve_0_blue: float = 0.0
+    curve_1_blue: float = 0.0
+    curve_2_blue: float = 0.0
+    curve_3_blue: float = 0.0
+    curve_4_blue: float = 0.0
+    curve_5_blue: float = 0.0
+    curve_6_blue: float = 0.0
+    curve_7_blue: float = 0.0
 
     def __post_init__(self) -> None:
         """

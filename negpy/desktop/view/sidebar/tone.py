@@ -9,7 +9,7 @@ from negpy.desktop.view.shortcut_registry import tooltip_with_shortcut
 from negpy.desktop.view.sidebar.base import BaseSidebar
 from negpy.desktop.view.styles.templates import ICON_BUTTON_WIDTH, field_label_qss, header_row, hint_label, section_subheader, wrap_tooltip
 from negpy.desktop.view.styles.theme import THEME
-from negpy.desktop.view.widgets.charts import LevelsHistogramWidget
+from negpy.desktop.view.widgets.charts import LevelsHistogramWidget, CurvesWidget
 from negpy.desktop.view.widgets.choice_button import ChoiceButton, ToggleMenuButton
 from negpy.desktop.view.widgets.sliders import CompactSlider, SliderGroup
 from negpy.features.exposure.levels import LEVELS_CHANNELS
@@ -18,7 +18,7 @@ from negpy.features.hdr.models import hdr_active
 from negpy.features.exposure.auto_sliders import NEUTRAL
 from negpy.features.exposure.models import EXPOSURE_CONSTANTS, TUNABLE_TARGETS, apply_targets
 
-_LEVELS_SUFFIX = ("", "_red", "_green", "_blue")
+_CHANNEL_SUFFIX = ("", "_red", "_green", "_blue")
 _LEVELS_LABELS = ("Global", "Red", "Green", "Blue")
 
 
@@ -363,6 +363,34 @@ class ToneSidebar(BaseSidebar):
             levels_out_grid.addWidget(_levels_pair(label, spin), 0, col, align)
         self.layout.addLayout(levels_out_grid)
 
+        curves_header = section_subheader("CURVES")
+        curves_header.setToolTip(
+            wrap_tooltip(
+                "Display-referred curves, GIMP-style, applied after Levels as the last step. "
+                "Each channel holds eight nodes; drag one vertically to reshape the tone map. "
+                "Nodes clamp against their neighbours, so the curve can never fold."
+            )
+        )
+        self.layout.addWidget(curves_header)
+        self.curves_combo = QComboBox()
+        for label in _LEVELS_LABELS:
+            self.curves_combo.addItem(label)
+        self.curves_combo.setToolTip(
+            wrap_tooltip(
+                "Curves channel: Global edits the master curve on all channels, Red, Green "
+                "and Blue trim one channel on top of it"
+            )
+        )
+        self.layout.addWidget(self.curves_combo)
+        self.curves_widget = CurvesWidget()
+        self.curves_widget.setToolTip(
+            wrap_tooltip(
+                "The channel's input histogram with its tone curve. Drag a node vertically; "
+                "double-click resets the channel."
+            )
+        )
+        self.layout.addWidget(self.curves_widget)
+
         self.layout.addStretch()
 
         # Global-only controls, greyed while a channel page is active.
@@ -416,7 +444,7 @@ class ToneSidebar(BaseSidebar):
         return int(lo), float(gamma), int(hi), int(olo), int(ohi)
 
     def _write_levels(self, persist: bool, **values) -> None:
-        fields = {f"levels_{name}{_LEVELS_SUFFIX[self._levels_channel()]}": v for name, v in values.items()}
+        fields = {f"levels_{name}{_CHANNEL_SUFFIX[self._levels_channel()]}": v for name, v in values.items()}
         self.update_config_section("exposure", render=True, persist=persist, readback_metrics=True, **fields)
 
     def _show_levels(self, lo: int, gamma: float, hi: int, olo: int, ohi: int) -> None:
@@ -476,6 +504,40 @@ class ToneSidebar(BaseSidebar):
             buf = metrics.get("histogram_raw")
         self.levels_hist.set_data(buf, self._levels_channel())
 
+    def _curves_channel(self) -> int:
+        return max(0, min(3, self.curves_combo.currentIndex()))
+
+    def _curves_outputs(self, conf) -> tuple:
+        from negpy.features.exposure.curves import grid_outputs
+
+        return grid_outputs(conf, LEVELS_CHANNELS[self._curves_channel()])
+
+    def _write_curves(self, persist: bool, outputs) -> None:
+        from negpy.features.exposure.curves import CURVE_NODES
+
+        sfx = _CHANNEL_SUFFIX[self._curves_channel()]
+        fields = {f"curve_{i}{sfx}": float(outputs[i]) - i * 255.0 / (CURVE_NODES - 1) for i in range(CURVE_NODES)}
+        self.update_config_section("exposure", render=True, persist=persist, readback_metrics=True, **fields)
+
+    def _show_curves(self, outputs) -> None:
+        self.curves_widget.set_nodes(outputs)
+
+    def _on_curves(self, outputs, persist: bool) -> None:
+        self._show_curves(outputs)
+        self._write_curves(persist, outputs)
+
+    def _reset_curves_channel(self) -> None:
+        from negpy.features.exposure.curves import CURVE_NODES
+
+        self._write_curves(True, [i * 255.0 / (CURVE_NODES - 1) for i in range(CURVE_NODES)])
+
+    def _sync_curves_histogram(self) -> None:
+        metrics = self.controller.state.last_metrics
+        buf = metrics.get("curves_input_histogram")
+        if buf is None:
+            buf = metrics.get("histogram_raw")
+        self.curves_widget.set_data(buf, self._curves_channel())
+
     def _curve_field(self, base: str) -> str:
         idx = self._channel_index()
         return base if idx == 0 else f"{base}_trim_{_CH_SUFFIX[idx - 1]}"
@@ -534,6 +596,10 @@ class ToneSidebar(BaseSidebar):
         self.levels_hist.outputCommitted.connect(lambda olo, ohi: self._on_levels_output(olo, ohi, True))
         self.levels_hist.resetRequested.connect(self._reset_levels_channel)
         self.levels_auto_btn.clicked.connect(self._auto_levels)
+        self.curves_combo.currentIndexChanged.connect(lambda _i: self.sync_ui())
+        self.curves_widget.nodesChanged.connect(lambda nodes: self._on_curves(nodes, False))
+        self.curves_widget.nodesCommitted.connect(lambda nodes: self._on_curves(nodes, True))
+        self.curves_widget.resetRequested.connect(self._reset_curves_channel)
         for spin in (
             self.levels_in_low_spin,
             self.levels_gamma_spin,
@@ -554,6 +620,7 @@ class ToneSidebar(BaseSidebar):
             slider.dragEnded.connect(lambda: self.controller.tone_drag_changed.emit(""))
         self.controller.image_updated.connect(self._sync_driven)
         self.controller.image_updated.connect(self._sync_levels_histogram)
+        self.controller.image_updated.connect(self._sync_curves_histogram)
 
         for slider, field in (
             (self.toe_w_slider, "toe_width"),
@@ -714,6 +781,12 @@ class ToneSidebar(BaseSidebar):
             lo, gamma, hi, olo, ohi = self._levels_values(conf)
             self._show_levels(lo, gamma, hi, olo, ohi)
             self._sync_levels_histogram()
+            # Curves keeps its own channel selector; B&W has only the Global master.
+            if is_bw:
+                self.curves_combo.setCurrentIndex(0)
+            self.curves_combo.setVisible(not is_bw)
+            self._show_curves(self._curves_outputs(conf))
+            self._sync_curves_histogram()
 
             idx = self._channel_index()
             global_mode = idx == 0
@@ -804,6 +877,8 @@ class ToneSidebar(BaseSidebar):
             self.levels_combo,
             self.levels_hist,
             self.levels_auto_btn,
+            self.curves_combo,
+            self.curves_widget,
             self.levels_in_low_spin,
             self.levels_gamma_spin,
             self.levels_in_high_spin,
