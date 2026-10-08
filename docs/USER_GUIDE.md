@@ -452,9 +452,9 @@ In R/G/B mode these become per-layer trims: **Grade** (±30 ISO-R), **Toe** / **
 
 **Levels**, last on the panel and last in the pipeline:
 
-*   **Global / Red / Green / Blue** picks the channel GIMP-style fine-tuning acts on: Global is the master curve on all channels, the others trim one channel on top. Each channel shows its input histogram with draggable markers for **Input low / mid / high** (0-255, mid is a gamma at 1.00) and **Output low / high** fields (0-255) for the darkest and brightest output; double-click the histogram resets the channel. **Auto** (wand, in the LEVELS header) stretches the shown channel like GIMP's Auto Input Levels: gamma back to 1.00, full output range, input window at the 0.6% clip points — on Global it reads luminance, so hues don't move.
+*   **Global / Red / Green / Blue** picks the channel GIMP-style fine-tuning acts on: Global is the master curve on all channels, the others trim one channel on top. Each channel shows its input histogram with draggable markers for **Input low / mid / high** (0-255, mid is a gamma at 1.00) and **Output low / high** fields (0-255) for the darkest and brightest output; double-click the histogram resets the channel. **Auto** (wand, in the LEVELS header) stretches the shown channel like GIMP's Auto Input Levels: gamma back to 1.00, full output range, input window at the 0.6% clip points — on Global it reads luminance, so hues don't move. The header's undo arrow resets every channel.
 
-**Curves**, after Levels and last of all: per-channel tone maps over the finished output. **Global / Red / Green / Blue** picks the channel; Global is the master curve, the others trim one channel on top. Each channel shows its input histogram with its curve: eight nodes, dragged vertically (they clamp against their neighbours, so the curve never folds); double-click resets the channel.
+**Curves**, after Levels and last of all: per-channel tone maps over the finished output. **Global / Red / Green / Blue** picks the channel; Global is the master curve, the others trim one channel on top. Each channel shows its input histogram with its curve: eight nodes, dragged vertically (they clamp against their neighbours, so the curve never folds); double-click resets the channel. The header's undo arrow resets every channel.
 
 <!-- panel:local -->
 ### 5.3 Dodge & Burn: local exposure

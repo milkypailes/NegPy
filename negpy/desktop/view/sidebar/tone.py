@@ -274,7 +274,11 @@ class ToneSidebar(BaseSidebar):
             "Auto Levels: stretch this channel's input range onto the output range at the 0.6% clip points, "
             "like GIMP's Auto Input Levels. With Global selected the stretch reads luminance, so hues don't move",
         )
-        self.layout.addLayout(header_row(levels_header, self.levels_auto_btn))
+        self.levels_reset_btn = self._icon_action(
+            "fa5s.undo",
+            "Reset Levels: every channel back to identity",
+        )
+        self.layout.addLayout(header_row(levels_header, self.levels_auto_btn, self.levels_reset_btn))
         self.levels_combo = QComboBox()
         for label in _LEVELS_LABELS:
             self.levels_combo.addItem(label)
@@ -371,7 +375,11 @@ class ToneSidebar(BaseSidebar):
                 "Nodes clamp against their neighbours, so the curve can never fold."
             )
         )
-        self.layout.addWidget(curves_header)
+        self.curves_reset_btn = self._icon_action(
+            "fa5s.undo",
+            "Reset Curves: every channel back to the identity line",
+        )
+        self.layout.addLayout(header_row(curves_header, self.curves_reset_btn))
         self.curves_combo = QComboBox()
         for label in _LEVELS_LABELS:
             self.curves_combo.addItem(label)
@@ -482,6 +490,11 @@ class ToneSidebar(BaseSidebar):
     def _reset_levels_channel(self) -> None:
         self._write_levels(True, in_low=0, gamma=1.0, in_high=255, out_low=0, out_high=255)
 
+    def _reset_levels_all(self) -> None:
+        from negpy.features.exposure.levels import levels_defaults
+
+        self.update_config_section("exposure", render=True, persist=True, readback_metrics=True, **levels_defaults())
+
     def _auto_levels(self) -> None:
         """GIMP Auto Input Levels on the shown channel: gamma 1, full output range,
         input window at the 0.6% clip points of the input histogram the panel draws."""
@@ -530,6 +543,11 @@ class ToneSidebar(BaseSidebar):
         from negpy.features.exposure.curves import CURVE_NODES
 
         self._write_curves(True, [i * 255.0 / (CURVE_NODES - 1) for i in range(CURVE_NODES)])
+
+    def _reset_curves_all(self) -> None:
+        from negpy.features.exposure.curves import curves_fields
+
+        self.update_config_section("exposure", render=True, persist=True, readback_metrics=True, **{f: 0.0 for f in curves_fields()})
 
     def _sync_curves_histogram(self) -> None:
         metrics = self.controller.state.last_metrics
@@ -596,10 +614,12 @@ class ToneSidebar(BaseSidebar):
         self.levels_hist.outputCommitted.connect(lambda olo, ohi: self._on_levels_output(olo, ohi, True))
         self.levels_hist.resetRequested.connect(self._reset_levels_channel)
         self.levels_auto_btn.clicked.connect(self._auto_levels)
+        self.levels_reset_btn.clicked.connect(self._reset_levels_all)
         self.curves_combo.currentIndexChanged.connect(lambda _i: self.sync_ui())
         self.curves_widget.nodesChanged.connect(lambda nodes: self._on_curves(nodes, False))
         self.curves_widget.nodesCommitted.connect(lambda nodes: self._on_curves(nodes, True))
         self.curves_widget.resetRequested.connect(self._reset_curves_channel)
+        self.curves_reset_btn.clicked.connect(self._reset_curves_all)
         for spin in (
             self.levels_in_low_spin,
             self.levels_gamma_spin,
@@ -877,8 +897,10 @@ class ToneSidebar(BaseSidebar):
             self.levels_combo,
             self.levels_hist,
             self.levels_auto_btn,
+            self.levels_reset_btn,
             self.curves_combo,
             self.curves_widget,
+            self.curves_reset_btn,
             self.levels_in_low_spin,
             self.levels_gamma_spin,
             self.levels_in_high_spin,

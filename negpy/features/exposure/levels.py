@@ -40,6 +40,19 @@ def levels_fields() -> tuple[str, ...]:
     return tuple(f for ch in LEVELS_CHANNELS for f in _channel_fields(ch))
 
 
+def levels_defaults() -> dict[str, Any]:
+    """Identity value per levels field. Single source for resets and cache keys."""
+    defaults: dict[str, Any] = {}
+    for f in levels_fields():
+        if "gamma" in f:
+            defaults[f] = 1.0
+        elif "high" in f:
+            defaults[f] = 255
+        else:
+            defaults[f] = 0
+    return defaults
+
+
 def channel_levels(config: Any, channel: str) -> tuple[float, float, float, float, float]:
     """Clamped (in_low, gamma, in_high, out_low, out_high) for `channel`."""
     in_low_f, gamma_f, in_high_f, out_low_f, out_high_f = _channel_fields(channel)
@@ -98,16 +111,8 @@ def without_levels(config: Any) -> Any:
     re-runs just the final stage instead of the exposure cache behind it."""
     from dataclasses import replace
 
-    defaults = {}
-    for f in levels_fields():
-        if "gamma" in f:
-            defaults[f] = 1.0
-        elif "high" in f:
-            defaults[f] = 255
-        else:
-            defaults[f] = 0
     try:
-        return replace(config, **defaults)
+        return replace(config, **levels_defaults())
     except TypeError:
         return config
 

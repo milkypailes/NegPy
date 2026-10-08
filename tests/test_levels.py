@@ -44,6 +44,11 @@ class TestLevelsMath(unittest.TestCase):
             else:
                 self.assertEqual(default, 0)
 
+    def test_defaults_match_the_dataclass(self) -> None:
+        from negpy.features.exposure.levels import levels_defaults
+
+        self.assertEqual(levels_defaults(), {f: getattr(ExposureConfig(), f) for f in levels_fields()})
+
     def test_input_window_stretches(self) -> None:
         conf = replace(ExposureConfig(), levels_in_low=51, levels_in_high=204)
         out = np.asarray(apply_levels(_gray(0.2, 0.5, 0.8), conf))[0, :, 0]
