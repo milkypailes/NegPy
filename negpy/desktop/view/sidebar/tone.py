@@ -1,6 +1,6 @@
 from dataclasses import replace
 
-from PyQt6.QtWidgets import QComboBox, QDialog, QDoubleSpinBox, QHBoxLayout, QSpinBox, QVBoxLayout
+from PyQt6.QtWidgets import QAbstractSpinBox, QComboBox, QDialog, QDoubleSpinBox, QHBoxLayout, QSpinBox, QStyle, QVBoxLayout
 
 from negpy.desktop.auto_sliders import shown_values, stored_value
 from negpy.desktop.view.shortcut_registry import tooltip_with_shortcut
@@ -281,7 +281,22 @@ class ToneSidebar(BaseSidebar):
         self.levels_gamma_spin.setRange(0.10, 10.0)
         self.levels_gamma_spin.setDecimals(2)
         self.levels_gamma_spin.setSingleStep(0.05)
+        # Buttonless, content-width entries like the slider values: the markers are
+        # the mouse path, these are for exact entry (typing, arrow keys when focused).
+        for spin, sample in (
+            (self.levels_in_low_spin, "255"),
+            (self.levels_in_high_spin, "255"),
+            (self.levels_out_low_spin, "255"),
+            (self.levels_out_high_spin, "255"),
+            (self.levels_gamma_spin, "10.00"),
+        ):
+            spin.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+            text = spin.fontMetrics().horizontalAdvance(sample)
+            frame = 2 * spin.style().pixelMetric(QStyle.PixelMetric.PM_DefaultFrameWidth)
+            spin.setFixedWidth(text + frame + 4)
         levels_in_row = QHBoxLayout()
+        levels_in_row.setContentsMargins(0, 0, 0, 0)
+        levels_in_row.setSpacing(THEME.space_sm)
         for label, spin, tip in (
             ("Low", self.levels_in_low_spin, "Input shadows below this print at output low (0-255)"),
             ("Mid", self.levels_gamma_spin, "Input midtone gamma (0.10-10.00): 1.00 is linear, higher holds more highlights"),
@@ -289,16 +304,18 @@ class ToneSidebar(BaseSidebar):
         ):
             spin.setToolTip(wrap_tooltip(f"{tip}, this channel"))
             levels_in_row.addWidget(field_label(label))
-            levels_in_row.addWidget(spin, 1)
+            levels_in_row.addWidget(spin)
         self.layout.addLayout(levels_in_row)
         levels_out_row = QHBoxLayout()
+        levels_out_row.setContentsMargins(0, 0, 0, 0)
+        levels_out_row.setSpacing(THEME.space_sm)
         for label, spin, tip in (
             ("Out low", self.levels_out_low_spin, "Lowest output level (0-255): lifts blacks above this, this channel"),
             ("Out high", self.levels_out_high_spin, "Highest output level (0-255): drops whites below this, this channel"),
         ):
             spin.setToolTip(wrap_tooltip(f"{tip}"))
             levels_out_row.addWidget(field_label(label))
-            levels_out_row.addWidget(spin, 1)
+            levels_out_row.addWidget(spin)
         self.layout.addLayout(levels_out_row)
 
         self.layout.addStretch()
