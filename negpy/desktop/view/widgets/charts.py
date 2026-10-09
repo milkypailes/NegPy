@@ -1222,7 +1222,7 @@ class LevelsHistogramWidget(QWidget):
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        w, h = self.width(), self.height()
+        w = self.width()
         painter.fillRect(self.rect(), QColor(THEME.canvas_bg_black))
         painter.setPen(QPen(QColor(THEME.border_primary), 1))
         painter.drawRect(self.rect().adjusted(0, 0, -1, -1))
