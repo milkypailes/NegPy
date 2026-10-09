@@ -24,6 +24,7 @@ from negpy.desktop.view.confirm import (
     confirm_delete_named,
     confirm_delete_several,
     confirm_load_roll,
+    confirm_relocate_roll,
     warn_invalid_roll_name,
 )
 from negpy.desktop.view.widgets.rename_roll_dialog import RenameRollDialog
@@ -341,7 +342,7 @@ class LibraryTree(QWidget):
         item.setForeground(1, QColor(self._count_color(item)))
         if missing:
             item.setToolTip(0, f"Folder not found on disk: {folder_path}")
-            item.setToolTip(1, "Folder not found on disk — move it back, or delete the roll")
+            item.setToolTip(1, "Folder not found on disk — move it back, relocate the roll, or delete the roll")
         else:
             item.setToolTip(0, folder_path if is_folder else "Built from a search or a hand-picked set of frames")
         return item
@@ -420,6 +421,11 @@ class LibraryTree(QWidget):
                 analyze_action.setToolTip(BATCH_ANALYSIS_TOOLTIP if is_active else BATCH_ANALYSIS_DISABLED_TOOLTIP)
                 analyze_action.triggered.connect(self.controller.request_batch_normalization)
                 menu.addAction("Rename…").triggered.connect(lambda: self._rename_roll(roll_id, name))
+                entry = rolls.roll_for_id(self.repo, roll_id)
+                if entry is not None and entry.get("kind") == "folder":
+                    relocate_action = menu.addAction("Relocate…")
+                    relocate_action.setToolTip(wrap_tooltip("Point this roll at its folder's new location, after moving it on disk"))
+                    relocate_action.triggered.connect(lambda: self._relocate_roll(roll_id, name))
                 menu.addAction("Delete…").triggered.connect(lambda: self._delete_roll(roll_id, name))
             menu.addSeparator()
         menu.addAction("Import Folder as a Roll…").triggered.connect(self.prompt_import_folder)
@@ -456,6 +462,46 @@ class LibraryTree(QWidget):
                 return
         rolls.rename_roll(self.repo, roll_id, f"{prefix}{rolls.ROLL_PATH_SEP}{name}" if prefix else name)
 
+        self.reload()
+        self.rolls_changed.emit()
+
+    def _relocate_roll(self, roll_id: str, name: str) -> None:
+        """Repoint a folder roll at its folder's new location, picked in a file browser.
+
+        A repoint, not a move: the folder must already sit at the new location.
+        Edits follow image content, so every frame keeps its edit, marks and roll settings.
+        """
+        entry = rolls.roll_for_id(self.repo, roll_id)
+        if entry is None or entry.get("kind") != "folder":
+            return
+        old_path = entry.get("folder_path", "")
+        start = old_path if os.path.isdir(old_path) else self.repo.get_global_setting("last_open_folder", "") or ""
+        new_path = QFileDialog.getExistingDirectory(self, "Relocate Roll to a New Folder", start)
+        if not new_path:
+            return
+        self.repo.save_global_setting("last_open_folder", new_path)
+        new_path = os.path.normpath(new_path)
+        if os.path.normcase(new_path) == os.path.normcase(os.path.normpath(old_path)):
+            self.controller.set_status("That is already the roll's folder", 3000)
+            return
+        claimed = rolls.folder_roll_id_for_path(self.repo, new_path)
+        if claimed is not None and claimed != roll_id:
+            QMessageBox.warning(
+                self,
+                "Relocate Roll",
+                "Another roll already points at that folder — pick an empty location, or delete that roll first.",
+            )
+            return
+        new_count, _ = folder_counts(new_path)
+        if not new_count:
+            QMessageBox.warning(self, "Relocate Roll", "That folder holds no images — pick the folder the scans moved to.")
+            return
+        old_count, _ = folder_counts(old_path)
+        if not confirm_relocate_roll(self, name, old_path, new_path, old_count, new_count):
+            return
+        if not self.controller.request_relocate_roll(roll_id, new_path):
+            QMessageBox.warning(self, "Relocate Roll", "Could not relocate the roll — check the folder is still on disk.")
+            return
         self.reload()
         self.rolls_changed.emit()
 

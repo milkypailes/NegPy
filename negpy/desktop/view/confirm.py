@@ -1,3 +1,4 @@
+import os
 from typing import Optional
 
 from PyQt6.QtWidgets import QCheckBox, QMessageBox
@@ -271,6 +272,28 @@ def confirm_undiptych(parent) -> bool:
         "Both halves' edits are deleted. Splitting the scan again starts from defaults.",
         "Unsplit",
     )
+
+
+def confirm_relocate_roll(parent, name: str, old_path: str, new_path: str, old_count: int, new_count: int) -> bool:
+    """Ask before a folder roll is repointed at its folder's new location.
+
+    A repoint, not a move: NegPy touches nothing on disk, so the folder must
+    already sit at the new location. Enter confirms; Esc cancels.
+    """
+    box = QMessageBox(parent)
+    box.setIcon(QMessageBox.Icon.Question)
+    box.setWindowTitle("Relocate Roll")
+    box.setText(f"Point roll “{name}” at its new folder?")
+    old_line = f"{count_of(old_count, 'photo')} — {old_path}" if os.path.isdir(old_path) else f"folder missing — {old_path}"
+    box.setInformativeText(
+        "NegPy moves nothing on disk — move or copy the folder yourself first. "
+        f"Edits, marks and roll settings follow the images and stay in place.\n\nFrom: {old_line}\nTo: {count_of(new_count, 'photo')} — {new_path}"
+    )
+    relocate = box.addButton("Relocate", QMessageBox.ButtonRole.AcceptRole)
+    box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+    box.setDefaultButton(relocate)
+    box.exec()
+    return box.clickedButton() is relocate
 
 
 def warn_invalid_roll_name(parent, title: str) -> None:
