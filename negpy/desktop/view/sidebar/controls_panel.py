@@ -770,6 +770,13 @@ class ControlsPanel(QWidget):
                 ["preflash_inc", "preflash_dec"],
             )
         )
+        exp.levels_auto_btn.setToolTip(
+            tooltip_with_shortcut(
+                "Auto Levels: stretch this channel's input range onto the output range at the 0.6% clip points, "
+                "like GIMP's Auto Input Levels. With Global selected the stretch reads luminance, so hues don't move",
+                "auto_levels",
+            )
+        )
         lab.clahe_slider.setToolTip(
             tooltip_with_shortcut(
                 "Local contrast (CLAHE) without blowing global highlights or crushing shadows. Use sparingly — near 1.0 can look cartoonish",

@@ -104,6 +104,101 @@ class ExposureConfig:
     # logic.separation_damping_gain). Inert at dye_separation 1.0: it only
     # redistributes that slider's push.
     separation_damping: float = 0.0
+    # Display-referred levels (see levels.py), the last pipeline step: the Global
+    # master first, then one curve per channel. In/out bounds are 0-255 ints,
+    # gamma 0.1-10.0 at 1.0. Identity by default, so an untouched edit renders
+    # exactly as before.
+    levels_in_low: int = 0
+    levels_gamma: float = 1.0
+    levels_in_high: int = 255
+    levels_out_low: int = 0
+    levels_out_high: int = 255
+    levels_in_low_red: int = 0
+    levels_gamma_red: float = 1.0
+    levels_in_high_red: int = 255
+    levels_out_low_red: int = 0
+    levels_out_high_red: int = 255
+    levels_in_low_green: int = 0
+    levels_gamma_green: float = 1.0
+    levels_in_high_green: int = 255
+    levels_out_low_green: int = 0
+    levels_out_high_green: int = 255
+    levels_in_low_blue: int = 0
+    levels_gamma_blue: float = 1.0
+    levels_in_high_blue: int = 255
+    levels_out_low_blue: int = 0
+    levels_out_high_blue: int = 255
+    # Display-referred curves (see curves.py), after levels: per-channel control
+    # points as offsets from the identity line in code values, shadows to
+    # highlights. The Global master first, then one curve per channel. All zero
+    # is identity, so an untouched edit renders exactly as before.
+    curve_0: float = 0.0
+    curve_1: float = 0.0
+    curve_2: float = 0.0
+    curve_3: float = 0.0
+    curve_4: float = 0.0
+    curve_5: float = 0.0
+    curve_6: float = 0.0
+    curve_7: float = 0.0
+    curve_0_red: float = 0.0
+    curve_1_red: float = 0.0
+    curve_2_red: float = 0.0
+    curve_3_red: float = 0.0
+    curve_4_red: float = 0.0
+    curve_5_red: float = 0.0
+    curve_6_red: float = 0.0
+    curve_7_red: float = 0.0
+    curve_0_green: float = 0.0
+    curve_1_green: float = 0.0
+    curve_2_green: float = 0.0
+    curve_3_green: float = 0.0
+    curve_4_green: float = 0.0
+    curve_5_green: float = 0.0
+    curve_6_green: float = 0.0
+    curve_7_green: float = 0.0
+    curve_0_blue: float = 0.0
+    curve_1_blue: float = 0.0
+    curve_2_blue: float = 0.0
+    curve_3_blue: float = 0.0
+    curve_4_blue: float = 0.0
+    curve_5_blue: float = 0.0
+    curve_6_blue: float = 0.0
+    curve_7_blue: float = 0.0
+    # Curves node positions matching the offsets above, in code values. Dragging
+    # a node horizontally moves its input; order is held at the panel and the
+    # bake, so the curve can never fold.
+    curve_x_0: int = 0
+    curve_x_1: int = 36
+    curve_x_2: int = 73
+    curve_x_3: int = 109
+    curve_x_4: int = 146
+    curve_x_5: int = 182
+    curve_x_6: int = 219
+    curve_x_7: int = 255
+    curve_x_0_red: int = 0
+    curve_x_1_red: int = 36
+    curve_x_2_red: int = 73
+    curve_x_3_red: int = 109
+    curve_x_4_red: int = 146
+    curve_x_5_red: int = 182
+    curve_x_6_red: int = 219
+    curve_x_7_red: int = 255
+    curve_x_0_green: int = 0
+    curve_x_1_green: int = 36
+    curve_x_2_green: int = 73
+    curve_x_3_green: int = 109
+    curve_x_4_green: int = 146
+    curve_x_5_green: int = 182
+    curve_x_6_green: int = 219
+    curve_x_7_green: int = 255
+    curve_x_0_blue: int = 0
+    curve_x_1_blue: int = 36
+    curve_x_2_blue: int = 73
+    curve_x_3_blue: int = 109
+    curve_x_4_blue: int = 146
+    curve_x_5_blue: int = 182
+    curve_x_6_blue: int = 219
+    curve_x_7_blue: int = 255
 
     def __post_init__(self) -> None:
         """

@@ -547,3 +547,21 @@ Post-crop print finishing in scene-linear, before the output transform. Order: e
 
 *   **Preview paper size**: an interactive render sizes the paper from the preview long edge (`preview_render_size`) instead of the export DPI, and resamples the content to fit, never above its own resolution, because the canvas quotes zoom against the pipeline's buffer and an upscale would make 1:1 read closer than one scan pixel per device pixel. The display shader magnifies instead.
 
+---
+
+## 10. Levels
+**Code**: `negpy.features.exposure.levels` (CPU) / `negpy.features.exposure.shaders.levels.wgsl` (GPU)
+
+GIMP-style fine-tuning on the display-encoded output, after the output transform and every creative stage. Four channels — the Global master, then Red, Green, Blue — each mapping an input window onto an output window through a gamma:
+
+$$t = \mathrm{clamp}\!\left(\frac{x - l}{h - l},\ 0,\ 1\right), \qquad t \leftarrow t^{1/\gamma}, \qquad I_{out} = o_l + (o_h - o_l)\,t$$
+
+Bounds are 0-255 code values, $\gamma$ is 0.1 to 10.0 at 1.0. The master applies equally to all three channels first, then each per-channel curve trims on top. A degenerate window ($h \le l$) thresholds at the low marker. Identity by default, so an untouched edit renders exactly as before. Skipped under the Flat intent, which never encodes.
+
+**Auto** (`auto_input_window`) stretches one channel like GIMP's Auto Input Levels: gamma 1, full output range, input bounds at the first bin past a 0.6% tail each end, identity on a degenerate frame.
+
+### Curves
+**Code**: `negpy.features.exposure.curves` (CPU bake + apply) / `negpy.features.exposure.shaders.curves.wgsl` (GPU)
+
+Per-channel tone maps on the display-encoded output, after Levels. Four channels — the Global master, then Red, Green, Blue — each holding eight control points: offsets from the identity line at movable input positions, ordered and held monotone so the map never folds. The offsets bake through a monotone cubic (Fritsch-Carlson PCHIP, hand-rolled: no scipy) into a 256-entry table; both engines apply the table by integer indexing (`u32(clamp(x*255+0.5))`), so parity holds by construction. Identity lanes are skipped through an active mask: even an identity table would quantize to 8 bits. Skipped under the Flat intent with everything else past the output transform.
+

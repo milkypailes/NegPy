@@ -29,6 +29,16 @@ TRANSFER = (
     | {f"{zone}_{dye}" for zone in ("shadow", "highlight") for dye in ("cyan", "magenta", "yellow")}
     | _with_trims("toe", "shoulder", "toe_width", "shoulder_width", "dye_separation")
     | {"separation_damping"}
+    # Display-referred levels run after the output transform on every path, so they
+    # move a slide exactly like a print.
+    | {
+        f"levels_{name}{suffix}"
+        for suffix in ("", "_red", "_green", "_blue")
+        for name in ("in_low", "gamma", "in_high", "out_low", "out_high")
+    }
+    # Display-referred curves run after levels on every path, for the same reason.
+    | {f"curve_{i}{suffix}" for suffix in ("", "_red", "_green", "_blue") for i in range(8)}
+    | {f"curve_x_{i}{suffix}" for suffix in ("", "_red", "_green", "_blue") for i in range(8)}
 )
 # Meter the frame on a raw slide and on a Positive frame alike; a slide starts with both off.
 METERS = {"auto_exposure", "auto_normalize_contrast"}
@@ -64,6 +74,18 @@ def _moved(field: str, value):
         return not value
     if field == "paper_profile":
         return "kodak_endura"
+    if field.startswith("curve_x_"):
+        # Integer 0-255 positions: ±5 stays in range and off the end clamps.
+        return value - 5.0 if value > 128 else value + 5.0
+    if field.startswith("curve_"):
+        # Offsets read through holds, clips and downstream lanes, so the move is
+        # sized to survive all three: up, except off the top end.
+        return value - 20.0 if field.split("_")[1] == "7" else value + 20.0
+    if field.startswith("levels_"):
+        # Integer 0-255 bounds: ±25 stays in range and off the clamp for both ends.
+        if "gamma" in field:
+            return value + 2.0
+        return value - 25.0 if "high" in field else value + 25.0
     if "grade" in field:
         return value + 15.0
     if field in ("toe_width", "shoulder_width", "mask_spacer"):
@@ -81,8 +103,11 @@ def _image() -> np.ndarray:
 
 
 def _config(positive: bool):
-    """Toe, Shoulder and Dye Separation off neutral, so their widths, trims and damping bite."""
+    """Toe, Shoulder and Dye Separation off neutral, so their widths, trims and damping bite.
+    A pinned-ends S-curve on every curves channel, so each offset and position move reshapes
+    live, nonlinear mapping rather than an identity the holds and clips swallow."""
     cfg = DEFAULT_WORKSPACE_CONFIG
+    s_curve = (0.0, 12.0, -14.0, 22.0, -18.0, 16.0, -12.0, 0.0)
     exposure = replace(
         cfg.exposure,
         cast_removal_strength=cast_removal_for_mode(ProcessMode.E6, cfg.exposure.cast_removal_strength),
@@ -91,15 +116,26 @@ def _config(positive: bool):
         dye_separation=1.3,
         auto_exposure=False,
         auto_normalize_contrast=False,
+        **{f"curve_{i}{sfx}": v for sfx in ("", "_red", "_green", "_blue") for i, v in enumerate(s_curve)},
     )
     return replace(cfg, process=replace(cfg.process, process_mode=ProcessMode.E6, positive_source=positive), exposure=exposure)
 
 
 def _render(cfg) -> np.ndarray:
+    """Base + exposure stages, then the engine tail (finish, output transform,
+    levels, curves), so end-of-pipeline controls read a delta too."""
+    from negpy.features.exposure.curves import apply_curves
+    from negpy.features.exposure.levels import apply_levels
+    from negpy.features.finish.processor import FinishProcessor
+    from negpy.kernel.image.logic import working_oetf_encode
+
     img = _image()
     ctx = PipelineContext(original_size=img.shape[:2], scale_factor=1.0, process_mode=ProcessMode.E6, wants_uv_grid=False)
     norm = base_processor(cfg).process(img, ctx)
-    return np.asarray(exposure_processor(cfg).process(norm, ctx), dtype=np.float64)
+    lin = np.asarray(exposure_processor(cfg).process(norm, ctx), dtype=np.float32)
+    finished = np.asarray(FinishProcessor(cfg.finish, cfg.export.export_print_size, (1.0, 1.0, 1.0), None).process(lin, ctx))
+    encoded = np.asarray(working_oetf_encode(finished))
+    return np.asarray(apply_curves(apply_levels(encoded, cfg.exposure), cfg.exposure), dtype=np.float64)
 
 
 def _delta(field: str, positive: bool) -> float:
