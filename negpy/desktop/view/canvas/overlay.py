@@ -72,7 +72,7 @@ _CROP_REDRAW_SLOP_PX = 16.0
 _ROT_HANDLE_RADIUS_PX = 11.0  # hit + draw radius of the edge rotation handles
 _ROT_HANDLE_OFFSET_PX = 24.0  # gap between crop edge and handle center (outside the box)
 _ROT_FINE_SENSITIVITY = 0.2  # Shift-drag sensitivity, like the crop-move fine drag
-_ROTATION_GRID_DIVISIONS = 10
+_ROTATION_GRID_DIVISIONS = 20
 _GRID_ALPHA = 70
 _MASK_RASTER_MAX = 384  # px cap for feathered overlay rasters
 
@@ -440,6 +440,7 @@ class CanvasOverlay(QWidget):
         self._buffer_hide_timer.timeout.connect(self._hide_buffer_overlay)
 
         self._rotation_grid_visible: bool = False
+        self._rotation_grid_dragging: bool = False
         self._rotation_grid_timer = QTimer(self)
         self._rotation_grid_timer.setSingleShot(True)
         self._rotation_grid_timer.timeout.connect(self._hide_rotation_grid)
@@ -514,10 +515,20 @@ class CanvasOverlay(QWidget):
         self._buffer_overlay_visible = False
         self.update()
 
+    def set_rotation_grid_dragging(self, dragging: bool) -> None:
+        """Hold the grid while the slider is pressed; a stationary press fires no
+        valueChanged to keep restarting the hide timer."""
+        self._rotation_grid_dragging = dragging
+        if dragging:
+            self._rotation_grid_timer.stop()
+        elif self._rotation_grid_visible:
+            self._rotation_grid_timer.start(1000)
+
     def show_rotation_grid(self) -> None:
         """Show the rule-of-thirds alignment grid while Fine Rot is adjusted; lingers 1s."""
         self._rotation_grid_visible = True
-        self._rotation_grid_timer.start(1000)
+        if not self._rotation_grid_dragging:
+            self._rotation_grid_timer.start(1000)
         self.update()
 
     def _hide_rotation_grid(self) -> None:
