@@ -429,6 +429,46 @@ def rename_folder_roll_disk(repo: Any, roll_id: str, new_name: str) -> Optional[
     return new_path
 
 
+def relocate_folder_roll(repo: Any, roll_id: str, new_path: str) -> Optional[str]:
+    """Point a folder roll at *new_path* after its folder was moved on disk.
+
+    Nothing on disk is touched: the caller moves or copies the files first, then
+    hands over the new location. Returns the old path, or None (and nothing is
+    touched) when the roll is not a folder roll, *new_path* is not a directory,
+    or another roll already points there. The same folder is a no-op success.
+    Edits need no migration: they are keyed by content hash, which a move keeps.
+    """
+    store = _read(repo)
+    entry = store.get(roll_id)
+    if entry is None or entry.get("kind") != "folder":
+        return None
+    new_path = os.path.normpath(new_path)
+    if not new_path or not os.path.isdir(new_path):
+        return None
+    old_path = entry.get("folder_path", "")
+    if _folder_key(new_path) == _folder_key(old_path):
+        return old_path
+    if folder_roll_id_for_path(repo, new_path) is not None:
+        return None
+    dismissed = _dismissed_folders(repo)
+    kept = [p for p in dismissed if _folder_key(p) != _folder_key(new_path)]
+    if kept != dismissed:
+        repo.save_global_setting(DISMISSED_FOLDERS_KEY, kept)
+    entry["folder_path"] = new_path
+    old_prefix, new_prefix = old_path.rstrip("/\\"), new_path
+    if old_prefix:
+        entry["extra_paths"] = [_rehome_path(p, old_prefix, new_prefix) for p in entry.get("extra_paths", [])]
+    _write(repo, store)
+    return old_path
+
+
+def _rehome_path(path: str, old_prefix: str, new_prefix: str) -> str:
+    """*path* rewritten from *old_prefix* to *new_prefix*, else unchanged."""
+    if path == old_prefix or path.startswith(old_prefix + os.sep):
+        return new_prefix + path[len(old_prefix) :]
+    return path
+
+
 def delete_roll(repo: Any, roll_id: str) -> None:
     """Forget a roll. A deleted folder roll is not recognized again by a Library refresh."""
     store = _read(repo)

@@ -729,3 +729,123 @@ def test_deleting_a_folder_row_forgets_every_roll_under_it(widget, tree_dirs, mo
     widget._delete_folder(str(tree_dirs), "scans")
 
     assert _names(widget) == ["portra"]
+
+
+# --- relocating ---------------------------------------------------------------
+
+
+def _menu_labels(widget, item, monkeypatch) -> list:
+    menu = MagicMock()
+    monkeypatch.setattr("negpy.desktop.view.sidebar.library_tree.QMenu", lambda *a, **k: menu)
+    monkeypatch.setattr(widget.tree, "itemAt", lambda pos: item)
+    widget._show_context_menu(QPoint(0, 0))
+    return [call.args[0] for call in menu.addAction.call_args_list]
+
+
+def test_right_click_on_a_folder_roll_offers_relocate(widget, tree_dirs, monkeypatch):
+    recognize_folder(widget.repo, str(tree_dirs / "roll_a"))
+    widget.reload()
+
+    assert "Relocate…" in _menu_labels(widget, widget.tree.topLevelItem(0), monkeypatch)
+
+
+def test_right_click_on_a_virtual_roll_offers_no_relocate(widget, monkeypatch):
+    create_virtual_roll(widget.repo, "Portra", [])
+    widget.reload()
+
+    assert "Relocate…" not in _menu_labels(widget, widget.tree.topLevelItem(0), monkeypatch)
+
+
+def _relocate_target(tree_dirs, name="roll_c") -> str:
+    target = tree_dirs / name
+    target.mkdir()
+    (target / "c1.NEF").write_bytes(b"4")
+    return str(target)
+
+
+def test_relocate_roll_repoints_and_reloads(widget, tree_dirs, monkeypatch):
+    roll_id = recognize_folder(widget.repo, str(tree_dirs / "roll_a"))
+    target = _relocate_target(tree_dirs)
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory", staticmethod(lambda *a, **k: target))
+    monkeypatch.setattr("negpy.desktop.view.sidebar.library_tree.confirm_relocate_roll", lambda *a, **k: True)
+    widget.controller.request_relocate_roll.return_value = True
+    changed = []
+    widget.rolls_changed.connect(lambda: changed.append(True))
+
+    widget._relocate_roll(roll_id, "roll_a")
+
+    widget.controller.request_relocate_roll.assert_called_once_with(roll_id, target)
+    assert changed == [True]
+
+
+def test_cancelling_the_relocate_picker_repoints_nothing(widget, tree_dirs, monkeypatch):
+    roll_id = recognize_folder(widget.repo, str(tree_dirs / "roll_a"))
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory", staticmethod(lambda *a, **k: ""))
+
+    widget._relocate_roll(roll_id, "roll_a")
+
+    widget.controller.request_relocate_roll.assert_not_called()
+    assert roll_for_id(widget.repo, roll_id)["folder_path"] == str(tree_dirs / "roll_a")
+
+
+def test_relocate_roll_to_its_own_folder_only_reports_status(widget, tree_dirs, monkeypatch):
+    roll_id = recognize_folder(widget.repo, str(tree_dirs / "roll_a"))
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory", staticmethod(lambda *a, **k: str(tree_dirs / "roll_a")))
+
+    widget._relocate_roll(roll_id, "roll_a")
+
+    widget.controller.set_status.assert_called_once()
+    widget.controller.request_relocate_roll.assert_not_called()
+
+
+def test_relocate_roll_to_an_empty_folder_warns(widget, tree_dirs, monkeypatch):
+    roll_id = recognize_folder(widget.repo, str(tree_dirs / "roll_a"))
+    empty = tree_dirs / "empty"
+    empty.mkdir()
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory", staticmethod(lambda *a, **k: str(empty)))
+    warned = []
+    monkeypatch.setattr(QMessageBox, "warning", staticmethod(lambda *a, **k: warned.append(a)))
+
+    widget._relocate_roll(roll_id, "roll_a")
+
+    assert len(warned) == 1
+    widget.controller.request_relocate_roll.assert_not_called()
+
+
+def test_relocate_roll_to_another_rolls_folder_warns(widget, tree_dirs, monkeypatch):
+    roll_id = recognize_folder(widget.repo, str(tree_dirs / "roll_a"))
+    recognize_folder(widget.repo, str(tree_dirs / "roll_b"))
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory", staticmethod(lambda *a, **k: str(tree_dirs / "roll_b")))
+    warned = []
+    monkeypatch.setattr(QMessageBox, "warning", staticmethod(lambda *a, **k: warned.append(a)))
+
+    widget._relocate_roll(roll_id, "roll_a")
+
+    assert len(warned) == 1
+    widget.controller.request_relocate_roll.assert_not_called()
+
+
+def test_relocate_roll_declined_at_the_confirm_repoints_nothing(widget, tree_dirs, monkeypatch):
+    roll_id = recognize_folder(widget.repo, str(tree_dirs / "roll_a"))
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory", staticmethod(lambda *a, **k: _relocate_target(tree_dirs)))
+    monkeypatch.setattr("negpy.desktop.view.sidebar.library_tree.confirm_relocate_roll", lambda *a, **k: False)
+
+    widget._relocate_roll(roll_id, "roll_a")
+
+    widget.controller.request_relocate_roll.assert_not_called()
+
+
+def test_relocate_roll_failure_warns_and_does_not_reload(widget, tree_dirs, monkeypatch):
+    roll_id = recognize_folder(widget.repo, str(tree_dirs / "roll_a"))
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory", staticmethod(lambda *a, **k: _relocate_target(tree_dirs)))
+    monkeypatch.setattr("negpy.desktop.view.sidebar.library_tree.confirm_relocate_roll", lambda *a, **k: True)
+    widget.controller.request_relocate_roll.return_value = False
+    warned = []
+    monkeypatch.setattr(QMessageBox, "warning", staticmethod(lambda *a, **k: warned.append(a)))
+    reloaded = []
+    monkeypatch.setattr(widget, "reload", lambda: reloaded.append(True))
+
+    widget._relocate_roll(roll_id, "roll_a")
+
+    assert len(warned) == 1
+    assert reloaded == []

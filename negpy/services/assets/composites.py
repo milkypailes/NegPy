@@ -10,6 +10,7 @@ content hash (``stitch_hash`` / ``hdr_hash``), which is derived from the parts, 
 re-forming the same composite finds its edit again.
 """
 
+import os
 from typing import Any, Dict, Optional
 
 from negpy.features.hdr.models import ANCHOR_EV_UNSET
@@ -100,6 +101,28 @@ def forget_composite(repo: Any, primary_path: Optional[str]) -> None:
     if primary_path in store:
         del store[primary_path]
         repo.save_global_setting(COMPOSITES_KEY, store)
+
+
+def rehome_composites(repo: Any, old_prefix: str, new_prefix: str) -> None:
+    """Repoint composite keys and part paths after a roll folder moved."""
+    old_prefix = old_prefix.rstrip("/\\")
+    if not old_prefix or old_prefix == new_prefix:
+        return
+
+    def swapped(path: str) -> str:
+        if path == old_prefix or path.startswith(old_prefix + os.sep):
+            return new_prefix + path[len(old_prefix) :]
+        return path
+
+    store = saved_composites(repo)
+    rebuilt = {}
+    for primary, entry in store.items():
+        record = dict(entry)
+        record["paths"] = [swapped(p) for p in entry.get("paths") or ()]
+        record["triplets"] = [[swapped(p) for p in pair] for pair in entry.get("triplets") or ()]
+        rebuilt[swapped(primary)] = record
+    if rebuilt != store:
+        repo.save_global_setting(COMPOSITES_KEY, rebuilt)
 
 
 def part_paths(entries: Any) -> set:

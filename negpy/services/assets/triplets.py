@@ -3,6 +3,7 @@
 Each record holds the three content hashes: a file changed on disk since the grouping does not re-attach.
 """
 
+import os
 from typing import Any, Dict
 
 from negpy.services.assets.rolls import unforked_hash
@@ -40,3 +41,20 @@ def remember_triplets(repo: Any, assets: Any) -> None:
         updated[asset["path"]] = record
     if updated != store:
         repo.save_global_setting(TRIPLETS_KEY, updated)
+
+
+def rehome_triplets(repo: Any, old_prefix: str, new_prefix: str) -> None:
+    """Repoint triplet keys and member paths after a roll folder moved."""
+    old_prefix = old_prefix.rstrip("/\\")
+    if not old_prefix or old_prefix == new_prefix:
+        return
+
+    def swapped(path: str) -> str:
+        if path == old_prefix or path.startswith(old_prefix + os.sep):
+            return new_prefix + path[len(old_prefix) :]
+        return path
+
+    store = saved_triplets(repo)
+    rebuilt = {swapped(red): [swapped(record[0]), swapped(record[1]), *record[2:]] for red, record in store.items()}
+    if rebuilt != store:
+        repo.save_global_setting(TRIPLETS_KEY, rebuilt)

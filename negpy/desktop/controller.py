@@ -101,8 +101,9 @@ from negpy.domain.models import (
     preset_from_export_config,
     resolve_preset_export,
 )
-from negpy.services.assets.composites import forget_composite, restore_maps
-from negpy.services.assets.triplets import saved_triplets
+from negpy.services.assets.composites import forget_composite, rehome_composites, restore_maps
+from negpy.services.assets.library import folder_label
+from negpy.services.assets.triplets import rehome_triplets, saved_triplets
 from negpy.services.assets import rolls
 from negpy.services.assets.sensor import SensorProfiles
 from negpy.services.export.contact_sheet_layout import ContactSheetSettings
@@ -1708,6 +1709,46 @@ class AppController(QObject):
                 self.session.rehome_folder_paths(old_path, new_path)
         rolls.rename_roll(self.session.repo, roll_id, new_name)
         return True
+
+    def request_relocate_roll(self, roll_id: str, new_path: str) -> bool:
+        """Point a folder roll at its folder's new location after the user moved it
+        on disk. Nothing is copied or moved here; only the stored locations change,
+        so edits, marks and roll settings (all keyed by content hash) stay in place.
+        """
+        repo = self.session.repo
+        entry = rolls.roll_for_id(repo, roll_id)
+        if entry is None or entry.get("kind") != "folder":
+            return False
+        old_path = entry.get("folder_path", "")
+        new_path = os.path.normpath(new_path)
+        if not new_path or not os.path.isdir(new_path):
+            return False
+        if rolls.relocate_folder_roll(repo, roll_id, new_path) is None:
+            return False
+        relocated = rolls.roll_for_id(repo, roll_id)
+        if relocated is None:
+            return False
+        new_path = relocated["folder_path"]
+        repo.rehome_file_paths(old_path, new_path)
+        self._rehome_path_setting("library_roots", old_path, new_path)
+        self._rehome_path_setting(rolls.IMPORT_SOURCES_KEY, old_path, new_path)
+        rehome_composites(repo, old_path, new_path)
+        rehome_triplets(repo, old_path, new_path)
+        self.session.rehome_folder_paths(old_path, new_path)
+        self.invalidate_library_walk()
+        self.set_status(f"Roll “{entry.get('name', '')}” now points at “{folder_label(new_path)}”", 3000)
+        return True
+
+    def _rehome_path_setting(self, key: str, old_prefix: str, new_prefix: str) -> None:
+        """Rewrite stored paths under *old_prefix* to *new_prefix* in one list setting."""
+        old_prefix = old_prefix.rstrip("/\\")
+        if not old_prefix or old_prefix == new_prefix:
+            return
+        saved = self.session.repo.get_global_setting(key, []) or []
+        paths = [p for p in saved if isinstance(p, str)]
+        swapped = [new_prefix + p[len(old_prefix) :] if p == old_prefix or p.startswith(old_prefix + os.sep) else p for p in paths]
+        if swapped != paths:
+            self.session.repo.save_global_setting(key, swapped)
 
     def invalidate_library_walk(self) -> None:
         """Drop the cached traversal so the next search re-reads the folders."""

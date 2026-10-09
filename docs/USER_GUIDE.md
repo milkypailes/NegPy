@@ -146,6 +146,7 @@ Right-click a roll for:
 
 *   **Close Roll…** (**loaded** roll only): empties the Film Strip and returns to the Library. Asks first; edits stay saved.
 *   **Rename…**: renames the roll. A folder roll also offers **Also rename the folder on disk** (off by default). In a cloud-sync folder (Dropbox, iCloud, OneDrive) the sync can treat that rename as a delete and re-upload.
+*   **Relocate…** (folder roll only): points the roll at its folder's new location, after you move the folder on disk yourself (network drive to internal drive, for one). Pick the new folder in the file browser; edits, marks and roll settings stay in place.
 *   **Delete…**: forgets the roll only; folder, images and edits stay. **Import Folder as a Roll…** brings it back. **Clear Library** in *Manage Database* forgets all rolls.
 *   **Roll Analysis** (**loaded** roll only): runs Roll Analysis ([§10.5](#105-roll-analysis)) and stores the roll's baseline.
 
