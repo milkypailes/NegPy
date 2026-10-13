@@ -130,6 +130,15 @@ def test_the_film_format_reaches_discovery() -> None:
     assert module.opened[-1].discoveries == ["66"]
 
 
+def test_a_film_format_change_measures_the_film_again() -> None:
+    backend, module = make_backend()
+    _scan(backend, ScanParams(dpi=1000, depth=16, capture_ir=False, film_format="135"))
+    _scan(backend, ScanParams(dpi=1000, depth=16, capture_ir=False, film_format="66"))
+    assert [d for s in module.opened for d in s.discoveries] == ["135", "66"]
+    assert backend.detect_frames(DEVICE_ID, film_format="66") == len(FRAMES)
+    assert [d for s in module.opened for d in s.discoveries] == ["135", "66"]
+
+
 def test_an_unknown_film_format_is_refused_before_the_unit_moves() -> None:
     backend, module = make_backend()
     with pytest.raises(RuntimeError, match="Unknown film format"):

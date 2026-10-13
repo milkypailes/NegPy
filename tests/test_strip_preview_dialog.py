@@ -1435,3 +1435,10 @@ def test_a_returned_strip_not_back_in_waits_for_detect_frames() -> None:
     controller.deliver_all((1, 2, 3, 4, 5))
 
     assert dialog.selected_frames() == (1, 2, 3, 4, 5)
+
+
+def test_a_measured_strip_is_asked_for_a_half_frame_rolls_worth() -> None:
+    controller = _FakeController()
+    dialog = StripPreviewDialog(controller, _discovery_device())
+    dialog._on_preview_all()
+    assert set(range(1, 81)) <= set(controller.preview_reqs[0].slots)

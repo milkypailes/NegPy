@@ -94,6 +94,9 @@ def _context_cancel(controller, window) -> None:
     if controller.state.embedded_peek:
         controller.toggle_embedded_peek(force=False)
         return
+    if controller.state.flatfield_peek:
+        controller.toggle_flatfield_peek(force=False)
+        return
     if controller.state.flat_peek:
         controller.toggle_flat_peek(force=False)
         return
@@ -118,7 +121,11 @@ def _toggle_tool_button(window, tab_key: str, button) -> None:
     on switches, so activating a tool while its tab is hidden would leave it live
     with its controls off-screen."""
     window.right_panel.show_tab_by_key(tab_key)
-    button.toggle()
+    # toggle() bypasses the enabled state: a gated tool must not arm, but an armed one always goes down.
+    if button.isChecked() or (button.isEnabled() and not hidden_by_gating(button)):
+        button.toggle()
+    else:
+        window.controller.set_status(f"{button.text().strip()} not available", 1500, kind="warning")
 
 
 def _slider_name(slider: object, group: SliderShortcutGroup) -> str:
@@ -294,8 +301,11 @@ class ShortcutManager:
         actions: dict[str, Callable[[], None]] = {
             "prev_file": controller.session.prev_file,
             "next_file": controller.session.next_file,
+            "first_file": controller.session.first_file,
+            "last_file": controller.session.last_file,
             "toggle_keep": lambda: controller.session.toggle_mark("keeper"),
             "toggle_scene_overlay": lambda: self.window.session_panel.file_browser.scenes_btn.click(),
+            "toggle_advance_after_mark": lambda: self.window.session_panel.file_browser.act_advance_after_mark.toggle(),
             "hdr_merge": controller.request_hdr_merge_selected,
             "hdr_unmerge": controller.request_unmerge_hdr,
             # The view method, not the controller's: it carries the confirm the deletion needs.
@@ -341,7 +351,8 @@ class ShortcutManager:
             "keystone_lines": lambda: controls.geometry_sidebar.keystone_lines_btn.toggle(),
             "crop_guide_next": lambda: controls.geometry_sidebar.cycle_guide(),
             "crop_guide_orient": controller.cycle_crop_guide_orientation,
-            "auto_crop": lambda: controls.geometry_sidebar.reset_crop_btn.toggle(),
+            "auto_crop": lambda: controls.autocrop_sidebar.auto_frame_btn.toggle(),
+            "auto_crop_square": lambda: controls.autocrop_sidebar.square_btn.toggle(),
             "crop_to_valid": lambda: controls.geometry_sidebar.crop_to_valid_btn.toggle(),
             "lens_distortion_from_metadata": lambda: controls.lens_sidebar.metadata_distortion_btn.click(),
             "lens_ca_from_metadata": lambda: controls.lens_sidebar.metadata_ca_btn.click(),
@@ -353,15 +364,20 @@ class ShortcutManager:
             "local_oval": lambda: _toggle_tool_button(self.window, "tone", controls.local_sidebar.oval_btn),
             "local_gradient": lambda: _toggle_tool_button(self.window, "tone", controls.local_sidebar.gradient_btn),
             "analysis_draw": lambda: _toggle_tool_button(self.window, "roll", controls.process_sidebar.analysis_region_btn),
+            "open_tools_menu": lambda: self.window.toolbar.open_tools_menu(),
             "toggle_flat_peek": controller.toggle_flat_peek,
             "toggle_negative_peek": controller.toggle_negative_peek,
             "toggle_embedded_peek": controller.toggle_embedded_peek,
+            "toggle_flatfield_peek": controller.toggle_flatfield_peek,
             "toggle_zones": controller.toggle_zones_overlay,
+            "toggle_clipping_overlay": controller.toggle_clipping_overlay,
+            "toggle_zone_hover_highlight": controller.toggle_zone_hover_highlight,
             "toggle_test_strip": controller.toggle_test_strip,
             "toggle_ring_around": controller.toggle_ring_around,
             "toggle_grain_focuser": controller.toggle_grain_focuser,
             "toggle_lith": controller.toggle_lith,
             "toggle_cyanotype": controller.toggle_cyanotype,
+            "toggle_sabattier": controller.toggle_sabattier,
             "toggle_printing_notes": controller.toggle_printing_notes,
             "toggle_soft_proof": lambda: controller.set_soft_proof(not controller.state.soft_proof_enabled),
             "cancel_tool": lambda: _context_cancel(controller, self.window),
@@ -410,6 +426,7 @@ class ShortcutManager:
             "reset_tab": lambda: _fire_tab_header(right, "reset"),
             "reset_tab_to_roll": lambda: _fire_tab_header(right, "revert"),
             "reset_to_roll": controller.revert_frame_to_roll,
+            "undo_roll_push": controller.undo_roll_push,
             "load_sidecar": lambda: load_edit_from_sidecar(self.window, controller),
             "apply_tab": lambda: _fire_tab_header(right, "apply"),
             "toggle_tab_cards": lambda: _fire_tab_header(right, "cards"),
@@ -438,8 +455,8 @@ class ShortcutManager:
             "show_analysis_help": self.window.right_panel.show_analysis_help,
             "check_for_updates": lambda: self.window.session_panel.check_for_updates(),
             "show_about": self.window.show_about,
+            "toggle_hq": controller.toggle_hq_preview,
             # Button clicks, so the shortcut runs the same gating and toast the mouse gets.
-            "toggle_hq": toolbar.btn_hq.click,
             "toggle_optical_removal": controls.retouch_sidebar.auto_dust_btn.click,
             "toggle_right_click_excludes": controls.retouch_sidebar.right_click_btn.click,
             "toggle_ir_removal": controls.retouch_sidebar.ir_dust_btn.click,

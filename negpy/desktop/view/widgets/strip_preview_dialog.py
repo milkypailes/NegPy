@@ -27,7 +27,7 @@ from PyQt6.QtWidgets import (
 
 from negpy.kernel.system.text import count_of, plural
 from negpy.desktop.converters import ImageConverter
-from negpy.desktop.view.styles.templates import EditedDot, StatusStrip, pin_dialog_default
+from negpy.desktop.view.styles.templates import EditedDot, StatusStrip, header_button, pin_dialog_default
 from negpy.desktop.view.styles.theme import THEME
 from negpy.desktop.view.widgets.dialog_geometry import remember_dialog_geometry
 from negpy.desktop.view.widgets.scan_preview_common import RollPreviewSignalsMixin, preview_positive
@@ -52,9 +52,9 @@ _TILE_H_MIN, _TILE_H_MAX = 90, 340  # what the size slider spans
 _GRID_MARGIN = 36  # dialog width the strip grid does not get: frame, scrollbar, padding
 _TILE_SLIDER_H = 18  # the per-frame offset slider under each tile
 _TILES_PER_ROW = 6  # columns assumed before the grid has a width to measure
-# A transport that measures the strip reports its frame count only as previews arrive, so ask
-# for a roll's worth and keep the tiles it answers with.
-_DISCOVERY_SLOTS = 40
+# A measuring transport reports its frame count only as previews arrive, so ask for a roll's
+# worth (80 half frames on a 40-exposure roll) and keep the tiles it answers with.
+_DISCOVERY_SLOTS = 100
 # Pause after an offset moves before its tiles are re-cut, so one drag makes one request.
 _RECUT_DELAY_MS = 250
 
@@ -232,10 +232,7 @@ class StripPreviewDialog(RollPreviewSignalsMixin, QDialog):
         self.help_lbl.setStyleSheet(f"color: {THEME.text_secondary}; font-size: {THEME.font_size_small}px;")
         help_row.addWidget(self.help_lbl)
         help_row.addStretch()
-        self.help_btn = QPushButton(qta.icon("fa5s.info-circle", color=THEME.text_muted), "")
-        self.help_btn.setToolTip("Offset, Drift and cropping, in full")
-        self.help_btn.setFlat(True)
-        self.help_btn.setFixedSize(24, 22)
+        self.help_btn = header_button(qta.icon("fa5s.info-circle", color=THEME.text_muted), "Offset, Drift and cropping, in full")
         self.help_btn.setVisible(has_guide(_GUIDE_KEY))
         self.help_btn.clicked.connect(lambda: SectionHelpDialog(_GUIDE_KEY, "Strip preview", self, repo=self._repo).exec())
         help_row.addWidget(self.help_btn)
@@ -438,10 +435,7 @@ class StripPreviewDialog(RollPreviewSignalsMixin, QDialog):
         checkbox.setChecked(checked)
         checkbox.setToolTip(f"Scan frame {frame}")
         oh.addWidget(checkbox)
-        preview_btn = QPushButton(qta.icon("fa5s.eye", color=THEME.text_secondary), "")
-        preview_btn.setToolTip(f"Preview frame {frame}")
-        preview_btn.setFlat(True)
-        preview_btn.setFixedSize(24, 20)
+        preview_btn = header_button(qta.icon("fa5s.eye", color=THEME.text_secondary), f"Preview frame {frame}")
         preview_btn.clicked.connect(lambda _checked=False, f=frame: self._on_preview_one(f))
         preview_btn.setVisible(not self._caps.strip_pass)
         oh.addWidget(preview_btn)
@@ -887,4 +881,4 @@ class StripPreviewDialog(RollPreviewSignalsMixin, QDialog):
             return
         self._previewing = False
         self._set_previewing(False)
-        self.status_strip.set_message("Preview cancelled.")
+        self.status_strip.set_message("Preview canceled")

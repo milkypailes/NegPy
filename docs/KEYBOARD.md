@@ -18,6 +18,8 @@ Actions with no default key are not listed; every one of them can still be bound
 |-----|--------|
 | `Left` | Previous file |
 | `Right` | Next file |
+| `Home` | First file |
+| `End` | Last file |
 | `Ctrl + L` | Open the library |
 | `Ctrl + K` | Find a control, card or action |
 | `Ctrl + F` | Focus the film strip search box |
@@ -64,7 +66,7 @@ Actions with no default key are not listed; every one of them can still be bound
 | `L` | Toggle straighten line tool |
 | `O` | Next crop guide overlay |
 | `Shift + O` | Rotate crop guide orientation |
-| `Shift + A` | Toggle autocrop |
+| `Shift + A` | Toggle Auto Crop |
 
 ## View
 | Key | Action |
@@ -140,7 +142,7 @@ Actions with no default key are not listed; every one of them can still be bound
 | `Alt + H` / `Alt + Shift + H` | Increase / decrease **Shadow hue** (default step 0.01) |
 | `Alt + G` / `Alt + Shift + G` | Increase / decrease **Shadow strength** (default step 0.01) |
 | `Alt + L` / `Alt + Shift + L` | Increase / decrease **Highlight hue** (default step 0.01) |
-| `Alt + Semicolon` / `Alt + Shift + Semicolon` | Increase / decrease **Highlight strength** (default step 0.01) |
+| `Alt + ;` / `Alt + Shift + ;` | Increase / decrease **Highlight strength** (default step 0.01) |
 
 ## Finishing
 | Key | Action |
@@ -168,6 +170,9 @@ Actions with no default key are not listed; every one of them can still be bound
 |-----|--------|
 | `S` | Scan, or stop the capture |
 | `R` | Retake the current frame |
+| `M` | Meter: set the shutter from one RAW probe |
+| `H` | Show the live histogram |
+| `Z` | Show clipping zebras |
 
 ## Help
 | Key | Action |

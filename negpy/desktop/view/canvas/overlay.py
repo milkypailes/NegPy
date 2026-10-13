@@ -18,6 +18,7 @@ from negpy.desktop.converters import ImageConverter
 from negpy.desktop.session import UNCROPPED_PREVIEW_TOOLS, AppState, ToolMode
 from negpy.desktop.view.canvas.crop_guides import CropGuide, guide_shapes
 from negpy.desktop.view.canvas.printing_notes import notes_outline, notes_sheet, paint_card, paint_map
+from negpy.desktop.view.styles.color_vision import palette_for
 from negpy.desktop.view.styles.theme import THEME
 from negpy.desktop.view.widgets.stats import PIN_COLORS
 from negpy.domain.types import LUMA_B, LUMA_G, LUMA_R
@@ -26,6 +27,7 @@ from negpy.features.exposure.analysis import (
     STRIP_DENSITIES,
     STRIP_GRADES,
     STRIP_GRID,
+    clip_masks,
     loupe_acutance,
     proof_grid,
     ring_cc,
@@ -35,6 +37,7 @@ from negpy.features.exposure.analysis import (
     strip_cell_at,
     strip_nearest_cell,
     zone_grid,
+    zone_mask,
     zone_region_labels,
 )
 from negpy.features.exposure.densitometer import zone_roman
@@ -49,6 +52,7 @@ from negpy.features.exposure.logic import tone_key_weight_np
 from negpy.features.exposure.placement import key_edges
 from negpy.features.local.logic import limited_indices, min_points, outline_points, overlapping_masks, rasterise
 from negpy.features.local.models import MaskShape
+from negpy.features.process.path import RenderPath, render_path
 from negpy.features.retouch.models import HEAL_SIZE_REF
 from negpy.features.retouch.logic import trace_scratch
 from negpy.services.view.coordinate_mapping import CoordinateMapping
@@ -84,11 +88,20 @@ _SHAPE_FOR_TOOL = {
 }
 _LOCAL_TOOLS = (ToolMode.NONE, *_SHAPE_FOR_TOOL)
 
-# Dust-overlay marker colors: bright, and distinct from the muted accent of manual heals, so
-# auto-detected and IR spots are told apart at a glance.
-_DUST_MARK_LUMA = QColor(57, 255, 20)  # neon: a mark has to read over any film, so it is not a palette colour
-_DUST_MARK_IR = QColor(255, 0, 255)  # neon magenta — IR detection
-_IR_CORRECTED_ALPHA = 55  # dim magenta wash over IR-division-corrected regions
+_IR_CORRECTED_ALPHA = 55  # dim wash over repaired regions
+_CLIP_WASH_ALPHA = 200  # clipped pixels must read as marks over any print
+_ZONE_HIGHLIGHT_ALPHA = 150
+
+
+def _tint_qimage(layers: List[Tuple[np.ndarray, QColor]], alpha: int) -> QImage:
+    """Premultiplied wash: each boolean mask in its color, later layers over earlier ones."""
+    gh, gw = layers[0][0].shape[:2]
+    buf = np.zeros((gh, gw, 4), dtype=np.uint8)
+    a = alpha / 255.0
+    for mask, color in layers:
+        buf[mask] = (int(color.red() * a), int(color.green() * a), int(color.blue() * a), alpha)
+    return QImage(buf.data, gw, gh, gw * 4, QImage.Format.Format_RGBA8888_Premultiplied).copy()
+
 
 _ZONE_LINE_ALPHA = 150
 _ZONE_LINE_SHADOW_ALPHA = 110  # dark underlay so the white edges hold over blown highlights
@@ -388,6 +401,8 @@ class CanvasOverlay(QWidget):
         self._host_qimage_cache: Optional[Tuple[tuple, QImage]] = None
         self._zone_cells: Optional[np.ndarray] = None
         self._zone_labels: List[Tuple[int, int, int]] = []
+        # Clipping Overlay and zone-highlight washes for the displayed frame, keyed by what they mark.
+        self._frame_washes: Dict[tuple, Optional[QImage]] = {}
 
         # Test strip mosaic, converted once and keyed by the buffer it came from.
         self._strip_cache: Optional[Tuple[tuple, QImage]] = None
@@ -681,6 +696,7 @@ class CanvasOverlay(QWidget):
         self._gpu_texture = gpu_texture
         self._host_qimage_cache = None
         self._zone_cells = None  # rebuilt lazily on the next zones paint
+        self._frame_washes = {}
         # Kept so a strip mosaic gets the same display transform as this buffer did.
         self._display_cs = color_space
         self._monitor_icc_bytes = monitor_icc_bytes
@@ -704,6 +720,8 @@ class CanvasOverlay(QWidget):
         """Repaint the split after the stashed baseline frame changed (or went away)."""
         self._compare_qimage_cache = None
         self._split_dragging = False
+        if not self._compare_split_active() and self.cursor().shape() == Qt.CursorShape.SplitHCursor:
+            self.unsetCursor()
         self.update()
 
     def drop_gpu_texture(self) -> None:
@@ -794,6 +812,12 @@ class CanvasOverlay(QWidget):
             self._scratch_pts = [remap(p) for p in self._scratch_pts]
         if self._heal_drag_pts:
             self._heal_drag_pts = [remap(p) for p in self._heal_drag_pts]
+        if self._exclude_drag_pts:
+            self._exclude_drag_pts = [remap(p) for p in self._exclude_drag_pts]
+        if self._rotate_center is not None:
+            self._rotate_center = remap(self._rotate_center)
+        if self._rotate_press is not None:
+            self._rotate_press = remap(self._rotate_press)
         if self._local_edit_verts is not None:
             self._local_edit_verts = [remap(p) for p in self._local_edit_verts]
         if self._straighten_p1 is not None:
@@ -1029,9 +1053,9 @@ class CanvasOverlay(QWidget):
             self._buffer_overlay_visible
             and self._buffer_overlay_ratio > 1e-4
             and self._tool_mode not in UNCROPPED_PREVIEW_TOOLS
-            and not self.state.last_metrics.get("crop_preview_full")
+            and not self.state.canvas_value("crop_preview_full")
         ):
-            d = visible_rect
+            d = self._content_view_rect()
             margin_w = d.width() * self._buffer_overlay_ratio
             margin_h = d.height() * self._buffer_overlay_ratio
             inner = QRectF(d.x() + margin_w, d.y() + margin_h, d.width() - 2 * margin_w, d.height() - 2 * margin_h)
@@ -1066,6 +1090,10 @@ class CanvasOverlay(QWidget):
 
         if self.state.config.local.masks and (self.state.local_masks_shown or self._tool_mode in _SHAPE_FOR_TOOL):
             self._draw_local_masks(painter)
+        else:
+            # Hit-testing reads these, so a hidden mask keeps no handle to grab.
+            self._local_mask_screen_polys = []
+            self._local_mask_screen_ctrl = []
         if self._tool_mode == ToolMode.LOCAL_DRAW:
             self._draw_lasso_in_progress(painter)
         if self._tool_mode in (ToolMode.LOCAL_OVAL, ToolMode.LOCAL_GRADIENT):
@@ -1100,14 +1128,21 @@ class CanvasOverlay(QWidget):
         content_aligned = (
             not self.state.flat_peek
             and not self.state.negative_peek
+            and not self.state.flatfield_peek
             and self._tool_mode not in UNCROPPED_PREVIEW_TOOLS
-            and not self.state.last_metrics.get("crop_preview_full")
+            and not self.state.canvas_value("crop_preview_full")
         )
         if self.state.test_strip and content_aligned:
             # Takes the content rect over from the zone grid: both would claim it.
             self._draw_test_strip(painter)
         elif self.state.zones_overlay and content_aligned:
             self._draw_zone_grid(painter)
+
+        if content_aligned and not self.state.test_strip:
+            if self.state.clipping_overlay:
+                self._draw_clipping_overlay(painter)
+            if self.state.zone_highlight is not None:
+                self._draw_zone_highlight(painter)
 
         # Pins are content-anchored, so they hide with the strip (whose mosaic
         # replaces the frame) and in the uncropped tool views.
@@ -1123,7 +1158,7 @@ class CanvasOverlay(QWidget):
             self._draw_rotation_grid(painter, visible_rect)
 
         if self._crop_preview_visible and self._crop_preview_rect:
-            self._draw_crop_preview(painter, visible_rect)
+            self._draw_crop_preview(painter, self._content_view_rect())
 
         # Keyed off the stashed baseline, not state.compare_mode: the toggle flips before its
         # render lands, and half a split with no before frame is just the edit.
@@ -1131,7 +1166,7 @@ class CanvasOverlay(QWidget):
             self._draw_compare_split(painter)
 
         # Exclusive with the split above, so the two badges cannot land on each other.
-        if self.state.negative_peek or self.state.embedded_peek or self.state.flat_peek:
+        if self.state.negative_peek or self.state.embedded_peek or self.state.flat_peek or self.state.flatfield_peek:
             self._draw_peek_badge(painter)
 
         # Last: the glass sits over everything else and claims no content rect, so it stays out
@@ -1257,7 +1292,14 @@ class CanvasOverlay(QWidget):
 
     def _draw_peek_badge(self, painter: QPainter) -> None:
         """Name the peek on the canvas. Otherwise only the toolbar says the view is on."""
-        text = "NEGATIVE" if self.state.negative_peek else ("EMBEDDED" if self.state.embedded_peek else "FLAT SCAN")
+        if self.state.negative_peek:
+            text = "NEGATIVE"
+        elif self.state.embedded_peek:
+            text = "EMBEDDED"
+        elif self.state.flatfield_peek:
+            text = "FLAT FIELD"
+        else:
+            text = "FLAT SCAN"
         rect = self._content_view_rect()
         if rect.isEmpty():
             return
@@ -1280,9 +1322,28 @@ class CanvasOverlay(QWidget):
         painter.drawEllipse(self._mouse_pos, radius, radius)
 
     def _brush_screen_radius(self, size: float) -> float:
+        """A heal's footprint is a fraction of the whole source frame, not of the crop."""
+        scale = self._screen_per_raw_px()
+        h_raw, w_raw = self.state.original_res
+        if scale is None:
+            rect = self._content_view_rect()
+            return (size / (2.0 * HEAL_SIZE_REF)) * max(rect.width(), rect.height())
+        return (size / (2.0 * HEAL_SIZE_REF)) * max(w_raw, h_raw) * scale
+
+    def _screen_per_raw_px(self) -> Optional[float]:
+        """Screen pixels per source pixel, read off the uv grid of the shown render."""
+        with self.state.metrics_lock:
+            uv = self.state.last_metrics.get("uv_grid")
+        h_raw, w_raw = self.state.original_res
         rect = self._content_view_rect()
-        max_screen_dim = max(rect.width(), rect.height())
-        return (size / (2.0 * HEAL_SIZE_REF)) * max_screen_dim
+        if uv is None or uv.ndim != 3 or uv.shape[1] < 2 or not (h_raw and w_raw) or rect.isEmpty():
+            return None
+        row = uv.shape[0] // 2
+        du, dv = (uv[row, 1] - uv[row, 0])[:2]
+        raw_per_grid = float(np.hypot(du * w_raw, dv * h_raw))
+        if raw_per_grid <= 0.0:
+            return None
+        return rect.width() / uv.shape[1] / raw_per_grid
 
     def _preview_curve_path(self, pts: List[QPointF]) -> QPainterPath:
         """Smoothed path through the placed points plus the live cursor."""
@@ -1482,6 +1543,48 @@ class CanvasOverlay(QWidget):
         painter.drawEllipse(p2, 3.0, 3.0)
         painter.setBrush(Qt.BrushStyle.NoBrush)
 
+    def _content_host_buffer(self) -> Optional[np.ndarray]:
+        """The displayed frame's image content as NumPy, border padding cut away."""
+        src = self._host_buffer()
+        if src is not None and self._content_rect is not None:
+            ox, oy, cw, ch = self._content_rect
+            src = src[oy : oy + ch, ox : ox + cw]
+        return src
+
+    def _frame_wash(self, key: tuple, build) -> Optional[QImage]:
+        if key not in self._frame_washes:
+            src = self._content_host_buffer()
+            self._frame_washes[key] = None if src is None else build(src)
+        return self._frame_washes[key]
+
+    def _draw_clipping_overlay(self, painter: QPainter) -> None:
+        """Pixels at paper black and paper white, in the Color vision pair."""
+        shadow, highlight = palette_for(self.state.color_vision).pair
+
+        def build(src: np.ndarray) -> Optional[QImage]:
+            masks = clip_masks(src)
+            if masks is None:
+                return None
+            low, high = masks
+            return _tint_qimage([(low, QColor(shadow)), (high, QColor(highlight))], _CLIP_WASH_ALPHA)
+
+        img = self._frame_wash(("clip", shadow, highlight), build)
+        if img is not None:
+            painter.drawImage(self._content_view_rect(), img)
+
+    def _draw_zone_highlight(self, painter: QPainter) -> None:
+        """The zone the strip's hover names, washed over the pixels that print in it."""
+        zone = int(self.state.zone_highlight)
+        color = palette_for(self.state.color_vision).spot
+
+        def build(src: np.ndarray) -> Optional[QImage]:
+            mask = zone_mask(src, zone)
+            return None if mask is None else _tint_qimage([(mask, QColor(color))], _ZONE_HIGHLIGHT_ALPHA)
+
+        img = self._frame_wash(("zone", zone, color), build)
+        if img is not None:
+            painter.drawImage(self._content_view_rect(), img)
+
     def _draw_zone_grid(self, painter: QPainter) -> None:
         """Adams-zone map over the image content: a fixed grid whose internal edges are
         drawn only where the zone changes, so neighbouring cells of the same zone merge
@@ -1492,12 +1595,9 @@ class CanvasOverlay(QWidget):
         instead of reflowing under the cursor while panning; zoom deep enough and you're
         inside one cell. Rebuild from the visible sub-rect if that ever matters."""
         if self._zone_cells is None:
-            src = self._host_buffer()
+            src = self._content_host_buffer()
             if src is None:
                 return
-            if self._content_rect is not None:
-                ox, oy, cw, ch = self._content_rect
-                src = src[oy : oy + ch, ox : ox + cw]
             self._zone_cells = zone_grid(src)
             if self._zone_cells is None:
                 return
@@ -1914,8 +2014,8 @@ class CanvasOverlay(QWidget):
 
     def _draw_dust_overlay(self, painter: QPainter) -> None:
         """Display-only visualization of the auto/IR dust-detection set. Modes:
-        'marked' (neon markers over the image), 'ir' (the geometry-aligned raw IR
-        channel, no markers)."""
+        'marked' (washes over the image), 'ir' (the geometry-aligned raw IR channel, no
+        markers)."""
         mode = self.state.dust_overlay_mode
         if mode == "ir":
             img = self._ir_layer_qimage()
@@ -1923,9 +2023,8 @@ class CanvasOverlay(QWidget):
                 painter.drawImage(self._content_view_rect(), img)
             return
 
-        # Dim wash over every repaired region. No source emits capsules any more, since they are
-        # all masks by the time they reach the render, so color tells them apart: green for
-        # optically detected specks, magenta for IR and inpainted defects.
+        # Dim wash over every repaired region. Every source reaches the render as a mask, so the
+        # Color vision pair tells them apart: optically detected specks, then IR and inpainted defects.
         for mask, color in self._corrected_masks():
             wash = self._mask_wash_qimage(mask, color)
             if wash is not None:
@@ -1962,16 +2061,18 @@ class CanvasOverlay(QWidget):
     def _corrected_masks(self) -> List[Tuple[np.ndarray, QColor]]:
         """Repaired-region masks to wash, with the color that names their source."""
         with self.state.metrics_lock:
+            # Detected dust and IR repairs are told apart by hue alone.
+            luma_color, ir_color = (QColor(c) for c in palette_for(self.state.color_vision).pair)
             masks: List[Tuple[np.ndarray, QColor]] = []
             luma = self.state.last_metrics.get("detected_dust_mask")
             if luma is not None:
-                masks.append((luma, _DUST_MARK_LUMA))
+                masks.append((luma, luma_color))
             corr = self.state.last_metrics.get("ir_corrected_mask")
             if corr is not None:
-                masks.append((corr, _DUST_MARK_IR))
+                masks.append((corr, ir_color))
             hairs = self.state.last_metrics.get("hair_inpaint_masks")
             if hairs:
-                masks.extend((h, _DUST_MARK_IR) for h in hairs)
+                masks.extend((h, ir_color) for h in hairs)
         return masks
 
     def _mask_wash_qimage(self, mask: np.ndarray, color: QColor) -> Optional[QImage]:
@@ -1989,14 +2090,7 @@ class CanvasOverlay(QWidget):
         map_x = (uv_grid[..., 0] * (w_m - 1)).astype(np.float32)
         map_y = (uv_grid[..., 1] * (h_m - 1)).astype(np.float32)
         remapped = cv2.remap(np.ascontiguousarray(mask, dtype=np.float32), map_x, map_y, interpolation=cv2.INTER_NEAREST)
-        gh, gw = remapped.shape[:2]
-        af = (remapped > 0.5).astype(np.float32) * (_IR_CORRECTED_ALPHA / 255.0)
-        buf = np.empty((gh, gw, 4), dtype=np.uint8)
-        buf[..., 0] = (color.red() * af).astype(np.uint8)
-        buf[..., 1] = (color.green() * af).astype(np.uint8)
-        buf[..., 2] = (color.blue() * af).astype(np.uint8)
-        buf[..., 3] = (af * 255.0).astype(np.uint8)
-        img = QImage(buf.data, gw, gh, gw * 4, QImage.Format.Format_RGBA8888_Premultiplied).copy()
+        img = _tint_qimage([(remapped > 0.5, color)], _IR_CORRECTED_ALPHA)
         if len(self._wash_cache) > 8:  # drop stale ids from prior frames
             self._wash_cache.clear()
         self._wash_cache[id(mask)] = (key, img)
@@ -2323,7 +2417,8 @@ class CanvasOverlay(QWidget):
         masks = self.state.config.local.masks
         self._local_mask_screen_polys = []
         self._local_mask_screen_ctrl = []
-        if not masks:
+        # A slide prints no masks, so it draws no tint and no handle to grab.
+        if not masks or render_path(self.state.config.process) is not RenderPath.PRINT:
             return
 
         with self.state.metrics_lock:
@@ -2335,6 +2430,7 @@ class CanvasOverlay(QWidget):
         selected = getattr(self.state, "local_selected_mask", -1)
         limited = limited_indices(self.state.config.local)
         fresh_cache: Dict[tuple, QImage] = {}
+        dodge_burn = palette_for(self.state.color_vision).dodge_burn
         for i, mask in enumerate(masks):
             is_selected = i == selected
             if len(mask.vertices) < min_points(mask.shape):
@@ -2350,14 +2446,19 @@ class CanvasOverlay(QWidget):
 
             if not mask.enabled or i in getattr(self.state, "local_hidden_masks", ()):
                 continue
-            outline = QColor(THEME.burn) if mask.stops > 0 else QColor(THEME.dodge)
+            outline = QColor(dodge_burn[1] if mask.stops > 0 else dodge_burn[0])
             max_alpha = 70 if is_selected else 32
 
             # A vertex drag skips the feathered fill; it re-rasters every frame. A gesture on
             # the selected mask drops its fill and the fills it overlaps, so the change under
             # them stays visible.
             if working is None and i not in self._local_muted_masks:
-                sigma_screen = mask.feather * min(self._view_rect.width(), self._view_rect.height())
+                # The engine feathers by the whole frame's short side, not the padded view's.
+                scale = self._screen_per_raw_px()
+                content = self._content_view_rect()
+                sigma_screen = mask.feather * (
+                    min(self.state.original_res) * scale if scale is not None else min(content.width(), content.height())
+                )
                 pad = 3.0 * sigma_screen + 2.0
                 # A gradient has no boundary, and an inverted mask applies outside its own.
                 # Rasterise both on the full frame, not on a padded bounding box.
@@ -2488,7 +2589,7 @@ class CanvasOverlay(QWidget):
             for i, (mask, ctrl) in enumerate(zip(self.state.config.local.masks, self._local_mask_screen_ctrl))
             if mask.enabled and len(ctrl) >= min_points(mask.shape)
         ]
-        paint_map(painter, polys)
+        paint_map(painter, polys, palette_for(self.state.color_vision).dodge_burn)
         paint_card(painter, QPointF(rect.x() + _NOTES_CARD_INSET_PX, rect.y() + _NOTES_CARD_TOP_PX), self._recipe_lines())
 
     def printing_notes_sheet(self) -> Optional[QImage]:
@@ -2505,7 +2606,13 @@ class CanvasOverlay(QWidget):
         if uv_grid is None and self.state.config.local.masks:
             return None
         return notes_sheet(
-            img, self._content_rect, self.state.config.local, uv_grid, self._recipe_lines(), self.state.config.exposure.grade
+            img,
+            self._content_rect,
+            self.state.config.local,
+            uv_grid,
+            self._recipe_lines(),
+            palette_for(self.state.color_vision).dodge_burn,
+            self.state.config.exposure.grade,
         )
 
     def _draw_local_handles(self, painter: QPainter, shape: MaskShape, ctrl_pts: List[QPointF], color: QColor) -> None:
@@ -3025,6 +3132,8 @@ class CanvasOverlay(QWidget):
         """The selected mask and its screen control points, or None."""
         idx = getattr(self.state, "local_selected_mask", -1)
         masks = self.state.config.local.masks
+        if render_path(self.state.config.process) is not RenderPath.PRINT:
+            return None
         if 0 <= idx < len(masks) and idx < len(self._local_mask_screen_ctrl):
             pts = self._local_mask_screen_ctrl[idx]
             if len(pts) >= min_points(masks[idx].shape):
@@ -3199,6 +3308,10 @@ class CanvasOverlay(QWidget):
             self.crop_confirmed.emit()
         elif self._tool_mode == ToolMode.ZONE_PLACE and self.state.zone_pins:
             self.zone_placement_confirmed.emit()
+
+    def finish_in_progress(self) -> None:
+        """What Enter does: close the scratch, lasso, crop or zone pins being drawn."""
+        self._finish_draw_if_active()
 
     def has_scratch_points(self) -> bool:
         return bool(self._scratch_pts)

@@ -1,8 +1,6 @@
-"""The Auto Density / Auto Grade slider conversion for the open frame: its render path's
-inverse, fed by the meters of the frame's last plain render.
-
-The meters are kept per file because last_metrics outlives a frame switch and a
-navigate-back memo paint shows a frame before its own render lands.
+"""Auto Density / Auto Grade slider conversion for the open frame: its render path's inverse,
+fed by the meters of the frame's last plain render. Meters are kept per file: last_metrics
+outlives a frame switch, and a memo paint shows a frame before its own render lands.
 """
 
 from typing import Any, Dict, Mapping

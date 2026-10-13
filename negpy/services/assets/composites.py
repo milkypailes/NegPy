@@ -11,9 +11,10 @@ re-forming the same composite finds its edit again.
 """
 
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 from negpy.features.hdr.models import ANCHOR_EV_UNSET
+from negpy.services.assets.rolls import unforked_hash
 
 COMPOSITES_KEY = "composites_by_path"
 
@@ -33,13 +34,16 @@ def saved_composites(repo: Any) -> Dict[str, dict]:
     store = _read(repo)
     if store:
         return store
+    found = False
     for key in _LEGACY_KEYS:
         legacy = repo.get_global_setting(key, default=None)
         if isinstance(legacy, dict):
+            found = True
             kind = "stitch" if key == "session_stitches" else "hdr"
             store.update({path: {**entry, "kind": kind} for path, entry in legacy.items() if isinstance(entry, dict)})
-    if store:
-        repo.save_global_setting(COMPOSITES_KEY, store)
+    if found:
+        # Cleared with the promotion: an emptied store must not promote them again.
+        repo.save_global_settings({COMPOSITES_KEY: store, **{key: None for key in _LEGACY_KEYS}})
     return store
 
 
@@ -53,9 +57,8 @@ def restore_maps(repo: Any) -> tuple:
 
 
 def composite_entry(asset: dict) -> Optional[dict]:
-    """The storable record of an asset's composite membership, or None when it is a
-    plain frame. Settings that ride on the asset (align, render exposure) are part of
-    the record: they are the composite's, not the edit's."""
+    """The storable record of an asset's composite membership, or None for a plain frame. Settings on the asset (align,
+    render exposure) are the composite's, not the edit's. The hash is the shared one, as a roll fork belongs to its roll."""
     if asset.get("stitch_paths"):
         return {
             "kind": "stitch",
@@ -65,7 +68,7 @@ def composite_entry(asset: dict) -> Optional[dict]:
             "sizes": [list(s) for s in asset["stitch_sizes"]],
             "triplets": [list(t) for t in asset.get("stitch_triplets") or ()],
             "align": bool(asset.get("stitch_align", True)),
-            "hash": asset["hash"],
+            "hash": unforked_hash(asset["hash"]),
             "process_mode": asset.get("process_mode", ""),
         }
     if asset.get("hdr_paths"):
@@ -76,7 +79,7 @@ def composite_entry(asset: dict) -> Optional[dict]:
             "align": bool(asset.get("hdr_align", True)),
             "anchor": str(asset.get("hdr_anchor", "") or ""),
             "anchor_ev": float(asset.get("hdr_anchor_ev", ANCHOR_EV_UNSET)),
-            "hash": asset["hash"],
+            "hash": unforked_hash(asset["hash"]),
             "process_mode": asset.get("process_mode", ""),
         }
     return None
@@ -136,3 +139,31 @@ def part_paths(entries: Any) -> set:
         out.update(p for p in entry.get("paths") or () if p)
         out.update(p for t in entry.get("triplets") or () for p in t if p)
     return out
+
+
+def rehome_paths(repo: Any, move: Callable[[str], str]) -> None:
+    """Pass every primary and part path of every composite through *move*."""
+    saved = saved_composites(repo)
+    moved = {}
+    for primary, entry in saved.items():
+        entry = dict(entry)
+        entry["paths"] = [move(p) for p in entry.get("paths") or ()]
+        if entry.get("triplets"):
+            entry["triplets"] = [[move(p) if p else p for p in t] for t in entry["triplets"]]
+        if entry.get("anchor"):
+            entry["anchor"] = move(entry["anchor"])
+        moved[move(primary)] = entry
+    if moved != saved:
+        repo.save_global_setting(COMPOSITES_KEY, moved)
+
+
+def frame_count(paths: Any, composites: Dict[str, dict], triplets: Dict[str, list]) -> int:
+    """How many frames ``paths`` open as: a remembered stitch, HDR merge or triplet whose
+    primary is among them is one frame. No file is hashed, so a part changed on disk
+    still counts as attached."""
+    files = set(paths)
+    parts = part_paths(entry for primary, entry in composites.items() if primary in files)
+    for red, record in triplets.items():
+        if red in files:
+            parts.update(record[:2])
+    return len(files - parts)

@@ -258,6 +258,30 @@ class TestRenderScanFilename:
             with pytest.raises(ValueError, match="different basename"):
                 service.write_result(result, tmpdir, "fixed_name", "TIFF")
 
+    def test_a_pattern_ending_in_tif_never_overwrites_an_earlier_scan(self, tmp_path) -> None:
+        result = ScanResult(rgb=np.zeros((4, 4, 3), dtype=np.uint16), ir=None, dpi=300, device_model="Test")
+        service = ScannerService()
+        service._backend = FakeBackend()
+        pattern = '{{ date }}_{{ "%03d" % seq }}.tif'
+
+        first = service.write_result(result, str(tmp_path), pattern, "TIFF")
+        second = service.write_result(result, str(tmp_path), pattern, "TIFF")
+
+        assert first != second
+        assert not first.endswith(".tif.tif")
+        assert len(list(tmp_path.glob("*.tif"))) == 2
+
+    def test_a_leftover_ir_companion_takes_the_name(self, tmp_path) -> None:
+        result = ScanResult(rgb=np.zeros((4, 4, 3), dtype=np.uint16), ir=None, dpi=300, device_model="Test")
+        service = ScannerService()
+        service._backend = FakeBackend()
+        (tmp_path / "scan_001_ir.TIF").write_bytes(b"")
+        (tmp_path / "scan_002_IR_VALID.tif").write_bytes(b"")
+
+        path = service.write_result(result, str(tmp_path), 'scan_{{ "%03d" % seq }}', "TIFF")
+
+        assert os.path.basename(path) == "scan_003.tif"
+
 
 class _NativeRollBackend(FakeBackend):
     """A backend that reaches a whole strip itself, so the service must not wrap it."""

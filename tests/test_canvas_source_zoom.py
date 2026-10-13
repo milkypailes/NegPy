@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from types import SimpleNamespace
+from negpy.desktop.session import AppState
 
 from negpy.desktop.view.canvas.widget import ImageCanvas
 
@@ -20,7 +20,7 @@ class _Canvas:
         self.zoom_level = 1.0
         self.pan_offset = None
         self._fs = fit_scale
-        self.state = SimpleNamespace(
+        self.state = AppState(
             last_metrics={"render_long_edge": render_long_edge},
             original_res=original_res,
             hq_preview=False,

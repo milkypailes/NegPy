@@ -541,7 +541,7 @@ class ScanSidebar(QWidget):
             self.debug_log_btn.blockSignals(True)
             self.debug_log_btn.setCurrentIndex(0)
             self.debug_log_btn.blockSignals(False)
-            self.status_strip.set_message("nkscan is not installed, so there is no debug log to write.")
+            self.status_strip.set_message("nkscan is not installed, so there is no debug log to write")
         if level != self._settings.nkscan_log_level:
             self.settings = replace(self._settings, nkscan_log_level=level)
 
@@ -960,13 +960,25 @@ class ScanSidebar(QWidget):
         self._update_settings_from_ui()
 
     def _frame_spec(self) -> tuple[int, ...] | None:
-        """The typed frame selection, or None where the text cannot be read."""
+        """The typed frame selection, or None where the text cannot be read or names a
+        frame past the holder's last slot."""
         from negpy.infrastructure.scanners.settings import parse_frame_spec
 
         try:
-            return parse_frame_spec(self.frame_spec_edit.text())
+            spec = parse_frame_spec(self.frame_spec_edit.text())
         except ValueError:
             return None
+        capacity = self._slot_capacity()
+        if capacity is not None and any(f > capacity for f in spec):
+            return None
+        return spec
+
+    def _slot_capacity(self) -> int | None:
+        """The holder's slot count, where frame numbers past it cannot be reached."""
+        device = self._current_device()
+        if device is None or device.capabilities.roll_discovery:
+            return None
+        return device.capabilities.adapter_frame_capacity
 
     def _sync_frame_spec(self) -> None:
         """Write the stored selection into the box, which the strip dialog also sets."""
@@ -1134,15 +1146,19 @@ class ScanSidebar(QWidget):
             film_format=self._film_format(),
             film_type=self._film_type(),
         )
-        self.set_scanning(True)
-        self.controller.start_meter(
-            MeterRequest(
-                device_id=device.id,
-                params=params,
-                frame_offset_modifier_mm=self._settings.frame_offset_modifier_mm,
-                frame_offsets=self._settings.frame_offsets,
+        try:
+            self.controller.start_meter(
+                MeterRequest(
+                    device_id=device.id,
+                    params=params,
+                    frame_offset_modifier_mm=self._settings.frame_offset_modifier_mm,
+                    frame_offsets=self._settings.frame_offsets,
+                )
             )
-        )
+        except RuntimeError as e:
+            self.status_strip.set_message(f"Scanner busy: {e}")
+            return
+        self.set_scanning(True)
 
     @pyqtSlot(object, int)
     def _on_exposure_metered(self, exposures: dict, frame: int) -> None:
@@ -1200,13 +1216,13 @@ class ScanSidebar(QWidget):
         self.cards_changed.emit()
 
     def _dpi(self) -> int:
-        """The resolution the next scan runs at: the picked stop, else the typed value,
+        """The resolution the next scan runs at: the value in the box, typed or picked,
         else the finest the device offers."""
         device = self._current_device()
         supported = device.capabilities.supported_dpi if device else ()
         fallback = max(supported) if supported else 3600
         try:
-            return int(self.dpi_combo.currentData() or self.dpi_combo.currentText())
+            return int(self.dpi_combo.currentText() or self.dpi_combo.currentData())
         except (ValueError, TypeError):
             return fallback
 
@@ -1224,7 +1240,8 @@ class ScanSidebar(QWidget):
         caps = device.capabilities
         spec = self._frame_spec()
         if spec is None:
-            self.status_strip.set_summary("Frames: cannot read that")
+            capacity = self._slot_capacity()
+            self.status_strip.set_summary(f"Frames: the holder has {capacity} slots" if capacity else "Frames: cannot read that")
             self.scan_btn.setEnabled(False)
             return
         if not self._scanning:
@@ -1284,6 +1301,11 @@ class ScanSidebar(QWidget):
             self.output.browse()
             if not self.output.folder():
                 return
+        folder = self.output.folder()
+        if not (os.path.isabs(folder) and os.path.isdir(folder)):
+            # The writer's makedirs would resolve it against the working directory.
+            self.status_strip.set_message(f"Output folder does not exist: {folder}")
+            return
         output_folder = self.output.target_folder()
         if output_folder is None:
             self.status_strip.set_message('Roll name must be a single safe name (not "." or "..", and no path separators).')
@@ -1302,6 +1324,14 @@ class ScanSidebar(QWidget):
         auto_exposure = self._caps_auto_exposure and self.ae_btn.isChecked()
         pattern = self.pattern_edit.text().strip() or '{{ date }}_{{ "%03d" % seq }}'
         fmt = str(self.fmt_btn.currentData())
+        # Before the scan, or a finished scan is discarded when its file cannot be named.
+        try:
+            from negpy.services.scanning.templating import require_sequence_varying_scan_filename
+
+            require_sequence_varying_scan_filename(pattern, "20000101")
+        except ValueError:
+            self.status_strip.set_message("Filename pattern must include the sequence number ({{ seq }})")
+            return
 
         if self._frame_spec() is None:
             return
@@ -1407,7 +1437,7 @@ class ScanSidebar(QWidget):
         self.status_strip.set_message(f"Error: {text}")
         # Unsupported pyOpticfilm models: status alone is easy to miss.
         if "cannot scan with pyOpticfilm" in text:
-            QMessageBox.warning(self, "Scan Failed", text)
+            QMessageBox.warning(self, "Scan", text)
 
     @pyqtSlot(bool)
     def _on_ejected(self, triggered: bool) -> None:

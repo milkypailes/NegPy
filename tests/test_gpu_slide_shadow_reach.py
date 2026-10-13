@@ -1,6 +1,5 @@
 """Shadow Reach on a slide reads the metered anchor whatever Auto Density says, so the GPU
-must meter it for Auto Grade alone. Preview renders read metrics back and always metered
-it; an export does not, and printed the slide without Shadow Reach."""
+meters it for Auto Grade alone, also in an export that reads no metrics back."""
 
 import unittest
 from dataclasses import replace

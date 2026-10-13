@@ -67,7 +67,7 @@ class NkscanRollSession:
         # Only the fallback meters, and one strip is one exposure decision.
         self._exposures: dict[str, int] | None = None
         self._closed = False
-        self.slot_count = len(backend.frames(device.id))
+        self.slot_count = len(backend.measured_frames(device.id, film_format))
         # An absolute rect can be re-addressed backwards, unlike a within-frame offset.
         self.offset_range = (-1.0, 1.0)
         self.supports_single_slot_preview = True
@@ -133,7 +133,7 @@ class NkscanRollSession:
         return _stack_rgb(result.colors)
 
     def _ensure_frames(self, cancel: threading.Event) -> list[tuple[int, int, int, int]]:
-        frames = self._backend.frames(self._device.id)
+        frames = self._backend.measured_frames(self._device.id, self._film_format)
         if not frames:
             self._backend.discover_frames(
                 self._session,

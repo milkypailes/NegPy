@@ -147,6 +147,8 @@ class ScannerService:
         """
         from datetime import date as dt_date
 
+        from negpy.infrastructure.loaders.constants import SUPPORTED_TIFF_EXTENSIONS
+        from negpy.infrastructure.loaders.tiff_loader import _ir_suffixes
         from negpy.infrastructure.scanners.settings import MONO_TIFF
         from negpy.services.scanning.writer import write_tiff_16bit
 
@@ -154,15 +156,21 @@ class ScannerService:
 
         fmt = output_format.upper()
         date_str = dt_date.today().strftime("%Y%m%d")
-        ext = ".tif"
 
         require_sequence_varying_scan_filename(filename_pattern, date_str)
 
+        # The loader finds IR companions by name in any case, so a leftover one takes the name too.
+        taken_suffixes = tuple(sorted(SUPPORTED_TIFF_EXTENSIONS)) + _ir_suffixes("_ir") + _ir_suffixes("_ir_valid")
+        listings: dict[str, set[str]] = {}
         current = 1 if seq is None else seq
         while True:
             basename = render_scan_filename(filename_pattern, date_str, current)
             rgb_path = os.path.join(output_folder, basename)
-            if not os.path.exists(rgb_path + ext):
+            folder = os.path.dirname(rgb_path)
+            if folder not in listings:
+                listings[folder] = {n.lower() for n in os.listdir(folder)} if os.path.isdir(folder) else set()
+            stem = os.path.basename(rgb_path).lower()
+            if not any(stem + s in listings[folder] for s in taken_suffixes):
                 break
             current += 1
 

@@ -226,9 +226,8 @@ class GPUCanvasWidget(QWidget):
 
     def event(self, event) -> bool:
         if event.type() == QEvent.Type.DevicePixelRatioChange:
-            # A move to a screen with another scale factor delivers no resize, and
-            # only the render widget's resizeEvent recomputes its physical size
-            # (it ignores its event argument): re-run it, then reconfigure debounced.
+            # A move to a screen with another scale factor delivers no resize, and only the render
+            # widget's resizeEvent (which ignores its argument) recomputes its physical size.
             subwidget = getattr(self.canvas, "_subwidget", None)
             if subwidget is not None:
                 subwidget.resizeEvent(None)

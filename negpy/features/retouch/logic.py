@@ -617,12 +617,12 @@ def trace_scratch(img: ImageBuffer, nx: float, ny: float, threshold: float = 0.5
     # ridge are needed, and the frame is a full-resolution buffer on hover.
     reach = max_half + int(math.ceil(_SCRATCH_SLOPE_MAX * w)) + 2
     z, z0 = _scratch_ridge_rows(img, y0 - reach, y1 + reach)
-    band = np.ascontiguousarray(z[y0 - z0 : y1 - z0])
     pull = np.exp(-0.5 * ((np.arange(y0, y1) - cy) / _SCRATCH_CLICK_PULL) ** 2)
 
     best: Optional[Tuple[float, float, int, np.ndarray]] = None
     for slope in np.arange(-_SCRATCH_SLOPE_MAX, _SCRATCH_SLOPE_MAX + 1e-9, _SCRATCH_SLOPE_STEP):
-        sheared = _shear_rows(band, float(slope), cx, w)
+        # Sheared with its reach, then cut: a line leaves the search rows across a wide frame.
+        sheared = _shear_rows(z, float(slope), cx, w)[y0 - z0 : y1 - z0]
         strength = np.abs(sheared.mean(axis=1)) * pull
         k = int(np.argmax(strength))
         if best is None or strength[k] > best[0]:
@@ -823,7 +823,7 @@ def downsample_ir(plane: np.ndarray, target_long_edge: int, dims: Optional[Tuple
     if dims == (w, h):
         return np.ascontiguousarray(plane)
     # Erode by the resample footprint: a 1.25x downsample must not fatten by a 4.5x kernel.
-    k = max(1, int(round(long_edge / target_long_edge)) | 1)
+    k = max(1, int(round(long_edge / max(dims))) | 1)
     if k > 1:
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
         if plane.nbytes > _IR_DOWNSAMPLE_WORK_BYTES:

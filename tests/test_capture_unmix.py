@@ -109,8 +109,6 @@ def test_legacy_default_crosstalk_profile_name_migrates():
 
 
 def test_portra_crosstalk_profile_names_migrate_to_ektacolor_pro():
-    """The Portra gallery profiles carry Kodak's Ektacolor Pro rebrand in their display
-    names; a saved edit naming the old row must select the renamed one."""
     from negpy.domain.models import WorkspaceConfig
     from negpy.services.assets.crosstalk import CrosstalkProfiles
 
@@ -124,8 +122,7 @@ def test_portra_crosstalk_profile_names_migrate_to_ektacolor_pro():
 
 
 def test_renamed_crosstalk_profile_coerces_on_every_construction():
-    """A roll default overlays crosstalk_profile raw through dataclasses.replace,
-    outside any flat-config load, so the rename must run in __post_init__."""
+    """A roll default overlays crosstalk_profile through dataclasses.replace, so the rename runs in __post_init__."""
     from dataclasses import replace
 
     from negpy.features.process.models import ProcessConfig

@@ -25,15 +25,12 @@ class CanvasHud(QWidget):
     Fully mouse-transparent so canvas pan/zoom/tools work underneath.
     """
 
-    # Clears the floating toolbar pill anchored to the canvas bottom.
-    _BOTTOM_MARGIN = 72
-
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
 
         layout = QGridLayout(self)
-        layout.setContentsMargins(THEME.space_xl, THEME.space_xl, THEME.space_xl, self._BOTTOM_MARGIN)
+        layout.setContentsMargins(THEME.space_xl, THEME.space_xl, THEME.space_xl, THEME.space_xl)
 
         self.lbl_top_left = QLabel()
         self.lbl_top_right = QLabel()
@@ -69,9 +66,6 @@ class CanvasHud(QWidget):
         )
         self.progress.hide()
 
-        self._file_pos = ""
-        self._zoom_note = ""
-
         self._toast_timer = QTimer(self)
         self._toast_timer.setSingleShot(True)
         self._toast_timer.timeout.connect(self.toast.hide)
@@ -83,28 +77,25 @@ class CanvasHud(QWidget):
         # label grows to the canvas. Short toasts still size to content.
         self.toast.setMaximumWidth(max(_TOAST_MIN_WIDTH, int(self.width() * _TOAST_WIDTH_RATIO)))
 
+    def set_bottom_clearance(self, px: int) -> None:
+        """Keeps the bottom pills above the floating toolbar, whatever height it lays out at."""
+        m = self.layout().contentsMargins()
+        if m.bottom() != px:
+            self.layout().setContentsMargins(m.left(), m.top(), m.right(), px)
+
     @staticmethod
     def _set_pill(lbl: QLabel, text: str) -> None:
         lbl.setText(text)
         lbl.setVisible(bool(text))
 
-    def update_info(self, filename: str, res: str, mode: str, edits: str, tool: str, file_pos: str) -> None:
+    def update_info(self, filename: str, res: str, mode: str, edits: str) -> None:
         self._set_pill(self.lbl_top_left, " · ".join(s for s in (filename, res) if s))
         self._set_pill(self.lbl_top_right, mode)
-        self._set_pill(self.lbl_bottom_left, " · ".join(s for s in (edits, tool) if s))
-        self._file_pos = file_pos
-        self._refresh_bottom_right()
+        self._set_pill(self.lbl_bottom_left, edits)
 
     def set_zoom_note(self, note: str) -> None:
-        """Qualifier for what the canvas shows at this zoom. It shares the bottom-right
-        pill with the file position, which changes on a different schedule."""
-        if note == self._zoom_note:
-            return
-        self._zoom_note = note
-        self._refresh_bottom_right()
-
-    def _refresh_bottom_right(self) -> None:
-        self._set_pill(self.lbl_bottom_right, " · ".join(s for s in (self._zoom_note, self._file_pos) if s))
+        """Qualifier for what the canvas shows at this zoom."""
+        self._set_pill(self.lbl_bottom_right, note)
 
     def showMessage(self, text: str, timeout: int = 0, kind: str = "info") -> None:
         """kind: "info" | "warning" | "error" — a failure must not read like a progress note."""

@@ -67,6 +67,15 @@ class TestGpuTiledParity(unittest.TestCase):
         diff = float(np.abs(self._tiled(settings) - self._tiled(_base())).mean())
         self.assertGreater(diff, tol, msg)
 
+    def test_a_wide_chroma_denoise_leaves_no_tile_seam(self):
+        """Its taps reach past the fixed tile halo at a large radius."""
+        rng = np.random.default_rng(6)
+        self.img = np.clip(self.img + rng.normal(0, 0.03, self.img.shape).astype(np.float32), 1e-4, 1.0)
+        settings = replace(_base(), lab=replace(_base().lab, chroma_denoise=25.0))
+        tiled, direct = self._tiled(settings), self._direct(settings)
+        per_column = np.abs(tiled - direct).mean(axis=(0, 2))
+        self.assertLess(float(per_column[2030:2070].max()), 1e-4)
+
     def test_tiled_applies_keystone(self):
         base = _base()
         settings = replace(base, geometry=replace(base.geometry, converge_v=8.0, converge_h=-5.0))
@@ -78,6 +87,27 @@ class TestGpuTiledParity(unittest.TestCase):
         settings = replace(base, exposure=replace(base.exposure, contrast_mask=0.4))
         self._assert_changes_export(settings, "Contrast Mask did nothing to the tiled export")
         self._assert_parity(settings, "Tiled export dropped the Contrast Mask")
+
+    def test_tiled_applies_sabattier(self):
+        """The Mackie-line blur is the alt stage's one spatial term: the halo must cover it."""
+        from negpy.features.altprocess.models import AltProcess
+
+        base = _base()
+        settings = replace(
+            base,
+            process=replace(base.process, process_mode="B&W"),
+            altproc=replace(base.altproc, alt_process=AltProcess.SABATTIER, sabattier_agitation=0.0),
+        )
+        self._assert_changes_export(settings, "Sabattier did nothing to the tiled export")
+        self._assert_parity(settings, "Tiled export seamed the Mackie lines")
+
+    def test_tiled_applies_diffusion(self):
+        base = _base()
+        settings = replace(base, exposure=replace(base.exposure, diffusion=1.0))
+        # Diffusion moves the print at its edges only, so its mean change on a smooth frame is small;
+        # the parity tolerance sits well under it, so a dropped plane fails both.
+        self._assert_changes_export(settings, "Diffusion did nothing to the tiled export", tol=1e-4)
+        self._assert_parity(settings, "Tiled export dropped the Diffusion", tol=1e-5)
 
     def test_tiled_local_mask_follows_keystone(self):
         base = _base()

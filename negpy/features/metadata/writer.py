@@ -57,15 +57,12 @@ def _parse_exposure_str(text: str) -> dict:
 
     m_shutter = re.search(r"(\d+(?:/\d+)?(?:\.\d+)?)\s*s", text)
     if m_shutter:
-        val = m_shutter.group(1)
-        if "/" in val:
-            num_str, den_str = val.split("/")
-            result[piexif.ExifIFD.ExposureTime] = (int(num_str), int(den_str))
-        elif "." in val:
-            f = Fraction(val)
+        num, _, den = m_shutter.group(1).partition("/")
+        try:
+            f = Fraction(num) / Fraction(den or 1)
             result[piexif.ExifIFD.ExposureTime] = (f.numerator, f.denominator)
-        else:
-            result[piexif.ExifIFD.ExposureTime] = (int(val), 1)
+        except ZeroDivisionError:
+            pass
 
     m_aperture = re.search(r"f/\s*(\d+(?:\.\d+)?)", text)
     if m_aperture:
@@ -149,7 +146,10 @@ def _build_custom_exif(payload: MetadataPayload) -> dict:
             exif[piexif.ExifIFD.FocalLength] = _rational_tuple(payload.focal_length_mm)
         if payload.max_aperture is not None:
             exif[piexif.ExifIFD.FNumber] = _rational_tuple(payload.max_aperture)
-            exif[piexif.ExifIFD.MaxApertureValue] = _rational_tuple(_apex_from_f_number(payload.max_aperture))
+            # MaxApertureValue is an unsigned rational, so a lens faster than f/1.0 (negative
+            # APEX) has no value for it; writing one fails the whole EXIF block.
+            if payload.max_aperture >= 1.0:
+                exif[piexif.ExifIFD.MaxApertureValue] = _rational_tuple(_apex_from_f_number(payload.max_aperture))
 
     if flags.film_iso and payload.iso is not None:
         exif[piexif.ExifIFD.ISOSpeedRatings] = payload.iso

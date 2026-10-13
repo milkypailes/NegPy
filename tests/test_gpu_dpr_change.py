@@ -1,9 +1,6 @@
-"""A device-pixel-ratio change refreshes the GPU surface.
-
-A window dragged to a screen with another scale factor changes the surface size
-in device pixels without a resize event, so the render widget's physical size
-must be recomputed and the swapchain reconfigured through the resize debounce.
-"""
+"""A device-pixel-ratio change refreshes the GPU surface. A move to a screen with another scale
+factor changes the device-pixel size without a resize event, so the widget's physical size is
+recomputed and the swapchain reconfigured through the resize debounce."""
 
 from unittest.mock import MagicMock
 

@@ -72,7 +72,7 @@ class CalibrationWindow(QDialog):
         self.capture_btn = ChoiceButton(CAPTURE_MODES, CAPTURE_MODE_TOOLTIP)
         name_row.addWidget(self.capture_btn)
         self._sensor_profile_wanted = True  # the operator's pick, kept while Triplet shows the toggle off
-        self.sensor_profile_btn = labeled_toggle("fa5s.vials", " Sensor Profile", True, SENSOR_PROFILE_TOOLTIP)
+        self.sensor_profile_btn = labeled_toggle("fa5s.vials", " Create Sensor Profile", True, SENSOR_PROFILE_TOOLTIP)
         _reserve_checked_width(self.sensor_profile_btn)
         self.sensor_profile_btn.clicked.connect(self._on_sensor_profile_clicked)
         self.capture_btn.currentChanged.connect(lambda _i: self._sync_sensor_profile())
@@ -118,7 +118,7 @@ class CalibrationWindow(QDialog):
         self.progress.setVisible(False)
         layout.addWidget(self.progress)
 
-        self.status = hint_label("Click the clear film base (crosshair), name the stock, then Calibrate & Save.")
+        self.status = hint_label("Click the clear film base (crosshair), name the stock, then Calibrate & Save")
         layout.addWidget(self.status)
 
         self._running = False
@@ -141,9 +141,9 @@ class CalibrationWindow(QDialog):
         return self.capture_btn.currentIndex() == 1 and self._sensor_profile_wanted
 
     def set_inputs_locked(self, locked: bool) -> None:
-        """Freeze the calibration inputs while a run is in progress: the film-stock name, the capture mode, the Sensor Profile toggle, the base
-        ROI (clicking the image must not move the patch being metered), and the ISO/aperture the
-        base is metered at. Re-enabled at any terminal outcome so a failed run can be retried."""
+        """Freeze the calibration inputs while a run is in progress: film-stock name, capture mode,
+        Create Sensor Profile toggle, base ROI (a click must not move the patch being metered) and the
+        base ISO/aperture. Re-enabled at any terminal outcome so a failed run can be retried."""
         self._running = locked
         self.name_edit.setEnabled(not locked)
         self.capture_btn.setEnabled(not locked)
@@ -169,7 +169,7 @@ class CalibrationWindow(QDialog):
         self.image.clear_frame()
         self.image.set_loading(True)
         self.progress.setVisible(False)
-        self.set_status("Click the clear film base (crosshair), name the stock, then Calibrate & Save.")
+        self.set_status("Click the clear film base (crosshair), name the stock, then Calibrate & Save")
         self.show()
         self.raise_()
 

@@ -251,6 +251,7 @@ class NkscanBackend:
         self._frames: dict[str, list[tuple[int, int, int, int]]] = {}
         self._strips: dict[str, np.ndarray] = {}
         self._columns: dict[str, float] = {}
+        self._formats: dict[str, str | None] = {}  # the film format each device's rects were measured for
         # Unreported strip returns, kept apart from the rects so a failed load or eject keeps the return.
         self._returned: set[str] = set()
         self._last_contact = time.monotonic()  # end of the last command to any unit
@@ -510,6 +511,7 @@ class NkscanBackend:
         if discovery.thumbnail_complete is False:
             raise TransientScanError(f"The thumbnail pass ended early: {discovery.thumbnail_blocks} blocks arrived")
         self._frames[device_id] = [tuple(int(v) for v in rect) for rect in discovery.frames]
+        self._formats[device_id] = film_format
         thumbnail = getattr(discovery, "thumbnail", None)
         if thumbnail:
             self._strips[device_id] = _stack_rgb(thumbnail)
@@ -522,7 +524,7 @@ class NkscanBackend:
 
         A strip previewed a moment ago is already measured, so this usually costs nothing.
         """
-        known = self._frames.get(device_id)
+        known = self.measured_frames(device_id, film_format)
         if known:
             return len(known)
         with self._lock:
@@ -543,6 +545,12 @@ class NkscanBackend:
     def frames(self, device_id: str) -> list[tuple[int, int, int, int]]:
         return list(self._frames.get(device_id, ()))
 
+    def measured_frames(self, device_id: str, film_format: str | None) -> list[tuple[int, int, int, int]]:
+        """The cached rects, if they were measured for this film format; else none, and the cache is dropped."""
+        if device_id in self._frames and self._formats.get(device_id) != film_format:
+            self.forget_frames(device_id)
+        return self.frames(device_id)
+
     def strip_pass(self, device_id: str) -> np.ndarray | None:
         """The whole-strip read the frames were measured on, where the mechanism took one."""
         return self._strips.get(device_id)
@@ -562,6 +570,7 @@ class NkscanBackend:
         self._frames.pop(device_id, None)
         self._strips.pop(device_id, None)
         self._columns.pop(device_id, None)
+        self._formats.pop(device_id, None)
 
     def _resolve_frame(
         self,
@@ -570,7 +579,7 @@ class NkscanBackend:
         params: ScanParams,
         report: Callable[..., bool],
     ) -> tuple[int, int, int, int]:
-        frames = self._frames.get(device_id)
+        frames = self.measured_frames(device_id, params.film_format)
         if not frames:
             self.discover_frames(
                 session,

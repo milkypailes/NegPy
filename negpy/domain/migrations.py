@@ -101,10 +101,8 @@ DROPPED_KEYS: frozenset[str] = frozenset(
 # 16-bit master, so a saved DNG preset keeps its bit depth instead of 8-bit JPEG.
 RETIRED_EXPORT_FORMATS: Dict[str, str] = {"DNG": "TIFF"}
 
-# Renamed crosstalk profile display names, old -> current. The Portra entries follow
-# Kodak's 2026 rebrand of the line to Ektacolor Pro; the datasheets were not re-issued,
-# so the old name stays in the display name. Applied in ProcessConfig.__post_init__,
-# not here: roll defaults overlay the field raw, outside any flat-config load.
+# Crosstalk profile display names, old -> current; Portra stays in the name, its datasheets were not re-issued.
+# Applied in ProcessConfig.__post_init__, not migrate_flat_config: roll defaults overlay the field raw.
 CROSSTALK_PROFILE_RENAMES: Dict[str, str] = {
     "Default": "Generic C41",
     "Kodak Portra 160 (approx)": "Kodak Ektacolor Pro 160 / Portra 160 (approx)",

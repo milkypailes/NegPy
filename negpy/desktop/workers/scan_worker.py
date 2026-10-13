@@ -163,6 +163,7 @@ class ScanWorker(QObject):
             self._request_prepared = False
             self._scanning = True
 
+        assertion = acquire_unattended_power_assertion("NegPy film scan")
         outcome: tuple[str, str | None] | None = None
         returned: StripReturned | None = None
         try:
@@ -208,6 +209,7 @@ class ScanWorker(QObject):
             logger.exception("Could not initialize scanner service")
             outcome = ("error", str(error))
         finally:
+            assertion.release()
             with self._state_lock:
                 self._scanning = False
 
@@ -374,6 +376,8 @@ class ScanWorker(QObject):
     def run_prescan(self, req: PrescanRequest) -> None:
         """Full-window color preview at prescan_dpi; emit RGB without writing a file."""
         if req.prescan_dpi <= 0:
+            with self._state_lock:
+                self._request_prepared = False
             self.prescan_error.emit("Device does not support Prescan")
             return
 
