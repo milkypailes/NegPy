@@ -360,6 +360,7 @@ class ShortcutManager:
             "pick_scratch": lambda: _toggle_tool_button(self.window, "finish", controls.retouch_sidebar.pick_scratch_btn),
             "clone_tool": lambda: _toggle_tool_button(self.window, "finish", controls.retouch_sidebar.clone_btn),
             "pick_scratch_line": lambda: _toggle_tool_button(self.window, "finish", controls.retouch_sidebar.pick_line_btn),
+            "erase_heals": lambda: _toggle_tool_button(self.window, "finish", controls.retouch_sidebar.pick_erase_btn),
             "local_draw": lambda: _toggle_tool_button(self.window, "tone", controls.local_sidebar.draw_btn),
             "local_oval": lambda: _toggle_tool_button(self.window, "tone", controls.local_sidebar.oval_btn),
             "local_gradient": lambda: _toggle_tool_button(self.window, "tone", controls.local_sidebar.gradient_btn),

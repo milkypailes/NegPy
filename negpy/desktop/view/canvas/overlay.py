@@ -310,6 +310,7 @@ class CanvasOverlay(QWidget):
     scratch_completed = pyqtSignal(list)
     clone_stroke_completed = pyqtSignal(list)  # viewport-normalized points
     clone_source_picked = pyqtSignal(float, float)  # viewport-normalized x, y
+    heal_erase_rect = pyqtSignal(list)  # two viewport-normalized corners of the deletion rect
     dust_exclusion_painted = pyqtSignal(list)  # viewport-normalized points of a right-drag
     local_mask_selected = pyqtSignal(int)
     local_mask_edited = pyqtSignal(int, list)  # (mask index, viewport-normalized vertices)
@@ -370,6 +371,9 @@ class CanvasOverlay(QWidget):
         # Scratch heal (open polyline) interaction state
         self._scratch_pts: List[QPointF] = []
         self._heal_drag_pts: List[QPointF] = []
+        # Erase-tool rubber band: opposite corners of the deletion rect, viewport px.
+        self._erase_p1: Optional[QPointF] = None
+        self._erase_p2: Optional[QPointF] = None
         # Right-drag path painting an optical-removal exclusion. Non-empty from the press to
         # the release, which is also what holds the context menu back (contextMenuEvent).
         self._exclude_drag_pts: List[QPointF] = []
@@ -588,6 +592,9 @@ class CanvasOverlay(QWidget):
             self._shape_draw_p2 = None
         if mode != ToolMode.SCRATCH_PICK:
             self._scratch_pts = []
+        if mode != ToolMode.HEAL_ERASE:
+            self._erase_p1 = None
+            self._erase_p2 = None
         if mode not in _BRUSH_TOOLS:
             self._heal_drag_pts = []
         if mode != ToolMode.STRAIGHTEN:
@@ -1098,7 +1105,7 @@ class CanvasOverlay(QWidget):
             self._draw_lasso_in_progress(painter)
         if self._tool_mode in (ToolMode.LOCAL_OVAL, ToolMode.LOCAL_GRADIENT):
             self._draw_shape_in_progress(painter)
-        if self._tool_mode in (ToolMode.DUST_PICK, ToolMode.SCRATCH_PICK, ToolMode.SCRATCH_LINE, ToolMode.CLONE):
+        if self._tool_mode in (ToolMode.DUST_PICK, ToolMode.SCRATCH_PICK, ToolMode.SCRATCH_LINE, ToolMode.HEAL_ERASE, ToolMode.CLONE):
             self._draw_placed_heals(painter)
         if self._tool_mode == ToolMode.SCRATCH_LINE:
             self._draw_line_hover(painter)
@@ -1117,6 +1124,8 @@ class CanvasOverlay(QWidget):
             self._draw_dust_exclusions(painter)
         if self._tool_mode == ToolMode.STRAIGHTEN:
             self._draw_straighten_line(painter)
+        if self._tool_mode == ToolMode.HEAL_ERASE:
+            self._draw_erase_rect(painter)
         if self._tool_mode == ToolMode.KEYSTONE_LINES:
             self._draw_keystone_lines_tool(painter)
 
@@ -1503,6 +1512,17 @@ class CanvasOverlay(QWidget):
         painter.drawRoundedRect(badge, 4, 4)
         painter.setPen(QColor(THEME.accent_primary))
         painter.drawText(badge, Qt.AlignmentFlag.AlignCenter, label)
+
+    def _draw_erase_rect(self, painter: QPainter) -> None:
+        """Rubber band of the erase-tool drag: the rectangle whose manual heals are
+        deleted on release."""
+        if self._erase_p1 is None or self._erase_p2 is None:
+            return
+        pen = QPen(Qt.GlobalColor.white, 1.5, Qt.PenStyle.DashLine)
+        pen.setCosmetic(True)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRect(QRectF(self._erase_p1, self._erase_p2).normalized())
 
     def _classify_keystone_edge(self, p1: QPointF, p2: QPointF) -> str:
         dx, dy = p2.x() - p1.x(), p2.y() - p1.y()
@@ -2785,6 +2805,14 @@ class CanvasOverlay(QWidget):
             event.accept()
             return
 
+        if self._tool_mode == ToolMode.HEAL_ERASE:
+            if self._content_view_rect().contains(event.position()):
+                self._erase_p1 = event.position()
+                self._erase_p2 = event.position()
+                self.update()
+            event.accept()
+            return
+
         if self._tool_mode == ToolMode.CLONE and event.modifiers() & Qt.KeyboardModifier.AltModifier:
             coords = self._map_to_image_coords(event.position())
             if coords is not None:
@@ -3077,6 +3105,16 @@ class CanvasOverlay(QWidget):
             spacing = max(6.0, self._brush_screen_radius(self.state.config.retouch.manual_dust_size) * 0.5)
             if (pos - self._heal_drag_pts[-1]).manhattanLength() >= spacing:
                 self._heal_drag_pts.append(pos)
+            self.update()
+            event.accept()
+            return
+
+        if self._tool_mode == ToolMode.HEAL_ERASE and self._erase_p1 is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            rect = self._content_view_rect()
+            self._erase_p2 = QPointF(
+                float(np.clip(event.position().x(), rect.left(), rect.right())),
+                float(np.clip(event.position().y(), rect.top(), rect.bottom())),
+            )
             self.update()
             event.accept()
             return
@@ -3430,6 +3468,26 @@ class CanvasOverlay(QWidget):
         if self._split_dragging:
             self._split_dragging = False
             self.unsetCursor()
+            self.update()
+            event.accept()
+            return
+
+        # Before the pan release below: an armed erase drag means the press went to the
+        # erase tool, never to pan, so owning the release here changes nothing there.
+        if self._tool_mode == ToolMode.HEAL_ERASE and self._erase_p1 is not None and event.button() == Qt.MouseButton.LeftButton:
+            rect = self._content_view_rect()
+            p1 = self._erase_p1
+            p2 = QPointF(
+                float(np.clip(event.position().x(), rect.left(), rect.right())),
+                float(np.clip(event.position().y(), rect.top(), rect.bottom())),
+            )
+            self._erase_p1 = None
+            self._erase_p2 = None
+            # Ignore accidental clicks: erasing needs a rectangle to mean anything.
+            if math.hypot(p2.x() - p1.x(), p2.y() - p1.y()) >= 8.0:
+                c1, c2 = self._map_to_image_coords(p1), self._map_to_image_coords(p2)
+                if c1 is not None and c2 is not None:
+                    self.heal_erase_rect.emit([c1, c2])
             self.update()
             event.accept()
             return

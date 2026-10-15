@@ -115,11 +115,17 @@ class RetouchSidebar(BaseSidebar):
             "For the long straight marks the film picks up running through a camera or lab — too faint "
             "along any single pixel for the brush to find",
         )
+        self.pick_erase_btn = self._tool_toggle(
+            "fa5s.eraser",
+            "Erase",
+            "Erase Tool: drag a rectangle over the photo to delete every manual heal inside it, "
+            "false positives included. One history step, so Undo restores them together",
+        )
         self.undo_btn = self._icon_action("fa5s.undo", "Undo Last: remove the most recent manual heal")
         self.clear_btn = self._icon_action("fa5s.trash-alt", "Clear All: remove all manual heals (auto-detected dust is unaffected)")
         self.layout.addLayout(header_row(self.heals_subheader, self.undo_btn, self.clear_btn))
         tools_row = QHBoxLayout()
-        for btn in (self.pick_dust_btn, self.pick_scratch_btn, self.pick_line_btn):
+        for btn in (self.pick_dust_btn, self.pick_scratch_btn, self.pick_line_btn, self.pick_erase_btn):
             tools_row.addWidget(btn, 1)
         self.layout.addLayout(tools_row)
 
@@ -196,6 +202,7 @@ class RetouchSidebar(BaseSidebar):
         self.pick_dust_btn.toggled.connect(self._on_pick_toggled)
         self.pick_scratch_btn.toggled.connect(self._on_scratch_toggled)
         self.pick_line_btn.toggled.connect(self._on_line_toggled)
+        self.pick_erase_btn.toggled.connect(self._on_erase_toggled)
         self.manual_size_slider.valueChanged.connect(lambda v: self.update_config_section("retouch", render=False, manual_dust_size=int(v)))
         self.manual_size_slider.valueCommitted.connect(
             lambda v: self.update_config_section("retouch", render=False, persist=True, manual_dust_size=int(v))
@@ -263,6 +270,9 @@ class RetouchSidebar(BaseSidebar):
         self.controller.set_active_tool(ToolMode.SCRATCH_LINE if checked else ToolMode.NONE)
         self.line_threshold_slider.setEnabled(checked)
 
+    def _on_erase_toggled(self, checked: bool) -> None:
+        self.controller.set_active_tool(ToolMode.HEAL_ERASE if checked else ToolMode.NONE)
+
     def _set_ir_controls_enabled(self, enabled: bool) -> None:
         for w, tip in self._ir_tooltips.items():
             w.setEnabled(enabled)
@@ -285,6 +295,7 @@ class RetouchSidebar(BaseSidebar):
             self.pick_dust_btn.setChecked(self.state.active_tool == ToolMode.DUST_PICK)
             self.pick_scratch_btn.setChecked(self.state.active_tool == ToolMode.SCRATCH_PICK)
             self.pick_line_btn.setChecked(self.state.active_tool == ToolMode.SCRATCH_LINE)
+            self.pick_erase_btn.setChecked(self.state.active_tool == ToolMode.HEAL_ERASE)
             cloning = self.state.active_tool == ToolMode.CLONE
             self.clone_btn.setChecked(cloning)
             self.clone_source_btn.setChecked(cloning and self.state.clone_picking)
@@ -335,6 +346,7 @@ class RetouchSidebar(BaseSidebar):
             self.pick_dust_btn,
             self.pick_scratch_btn,
             self.pick_line_btn,
+            self.pick_erase_btn,
             self.line_threshold_slider,
             self.clone_btn,
             self.clone_source_btn,

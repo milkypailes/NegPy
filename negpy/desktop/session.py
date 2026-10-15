@@ -58,6 +58,7 @@ class ToolMode(Enum):
     DUST_PICK = auto()
     SCRATCH_PICK = auto()
     SCRATCH_LINE = auto()
+    HEAL_ERASE = auto()
     CLONE = auto()
     LOCAL_DRAW = auto()
     LOCAL_OVAL = auto()

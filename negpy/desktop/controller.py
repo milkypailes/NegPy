@@ -4451,6 +4451,49 @@ class AppController(QObject):
         )
         self.request_render()
 
+    def handle_heal_erase_rect(self, viewport_pts: list) -> None:
+        """Commits an erase-tool drag (two viewport-normalized corners)."""
+        with self.state.metrics_lock:
+            uv_grid = self.state.last_metrics.get("uv_grid")
+        if uv_grid is None or len(viewport_pts) < 2:
+            return
+        raw_pts = [CoordinateMapping.map_click_to_raw(nx, ny, uv_grid) for nx, ny in viewport_pts[:2]]
+        self.delete_heals_in_rect(raw_pts[0], raw_pts[1])
+
+    def delete_heals_in_rect(self, corner_a: tuple, corner_b: tuple) -> None:
+        """Removes every manual heal the raw-frame rect touches: a stroke with a point
+        inside, a legacy spot inside, a scratch line crossing it. One history step, so
+        Ctrl+Z restores them together."""
+        from negpy.features.retouch.logic import segment_intersects_rect
+
+        x1, x2 = sorted((float(corner_a[0]), float(corner_b[0])))
+        y1, y2 = sorted((float(corner_a[1]), float(corner_b[1])))
+        conf = self.state.config.retouch
+        strokes = [s for s in conf.manual_heal_strokes if not any(x1 <= float(p[0]) <= x2 and y1 <= float(p[1]) <= y2 for p in s[0])]
+        spots = [sp for sp in conf.manual_dust_spots if not (x1 <= float(sp[0]) <= x2 and y1 <= float(sp[1]) <= y2)]
+        lines = [
+            ln
+            for ln in conf.scratch_lines
+            if not segment_intersects_rect(float(ln[0]), float(ln[1]), float(ln[2]), float(ln[3]), (x1, y1, x2, y2))
+        ]
+        removed = (
+            (len(conf.manual_heal_strokes) - len(strokes))
+            + (len(conf.manual_dust_spots) - len(spots))
+            + (len(conf.scratch_lines) - len(lines))
+        )
+        if removed == 0:
+            self.set_status("No manual heals in that area", 3000)
+            return
+        self.session.update_config(
+            replace(
+                self.state.config,
+                retouch=replace(self.state.config.retouch, manual_dust_spots=spots, manual_heal_strokes=strokes, scratch_lines=lines),
+            ),
+            persist=True,
+        )
+        self.set_status(f"Deleted {removed} heals", 4000)
+        self.request_render()
+
     def undo_last_retouch(self) -> None:
         """
         Removes the most recently added heal (strokes first, then legacy spots).

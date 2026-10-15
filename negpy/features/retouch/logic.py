@@ -498,6 +498,33 @@ def exclusion_token(retouch) -> str:
 _FULLRES_SCAN_MAX_STROKES = 400
 
 
+def segment_intersects_rect(x0: float, y0: float, x1: float, y1: float, rect: Tuple[float, float, float, float]) -> bool:
+    """Whether the segment touches the normalized ``(x1, y1, x2, y2)`` rect: an endpoint
+    inside, or a crossing. Liang-Barsky clip against the ordered rect."""
+    rx1, ry1, rx2, ry2 = rect
+    if rx1 > rx2:
+        rx1, rx2 = rx2, rx1
+    if ry1 > ry2:
+        ry1, ry2 = ry2, ry1
+    if (rx1 <= x0 <= rx2 and ry1 <= y0 <= ry2) or (rx1 <= x1 <= rx2 and ry1 <= y1 <= ry2):
+        return True
+    dx, dy = x1 - x0, y1 - y0
+    t0, t1 = 0.0, 1.0
+    for p, q in ((-dx, x0 - rx1), (dx, rx2 - x0), (-dy, y0 - ry1), (dy, ry2 - y0)):
+        if abs(p) < 1e-12:
+            if q < 0.0:
+                return False
+        else:
+            t = q / p
+            if p < 0.0:
+                t0 = max(t0, t)
+            else:
+                t1 = min(t1, t)
+            if t0 > t1:
+                return False
+    return True
+
+
 def dust_detections_to_heal_strokes(
     score: Optional[np.ndarray],
     hair_masks: List[np.ndarray],

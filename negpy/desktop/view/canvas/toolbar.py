@@ -186,6 +186,7 @@ _TOOL_ROWS: dict[ToolMode, tuple[str, str, str]] = {
         "Click once on the line; the whole line is traced and repaired",
         "controls_panel.retouch_sidebar.line_threshold_slider",
     ),
+    ToolMode.HEAL_ERASE: ("Erase Heals", "Drag a rectangle; every manual heal inside it is deleted", ""),
     ToolMode.CLONE: ("Clone", "Paint over the defect; the dashed circle marks the source, Alt-click picks a new one", _BRUSH_SIZE),
     ToolMode.LOCAL_DRAW: ("Draw Mask", "Click to place vertices; a click near the start closes the mask", ""),
     ToolMode.LOCAL_OVAL: ("Oval Mask", "Drag out an oval", ""),
@@ -220,6 +221,7 @@ _CANVAS_TOOLS: tuple[tuple[ToolMode, str, str] | str, ...] = (
     (ToolMode.DUST_PICK, "pick_dust", "controls_panel.retouch_sidebar.pick_dust_btn"),
     (ToolMode.SCRATCH_PICK, "pick_scratch", "controls_panel.retouch_sidebar.pick_scratch_btn"),
     (ToolMode.SCRATCH_LINE, "pick_scratch_line", "controls_panel.retouch_sidebar.pick_line_btn"),
+    (ToolMode.HEAL_ERASE, "erase_heals", "controls_panel.retouch_sidebar.pick_erase_btn"),
     (ToolMode.CLONE, "clone_tool", "controls_panel.retouch_sidebar.clone_btn"),
 )
 _TOOL_BUTTON_PATHS = {spec[0]: spec[2] for spec in _CANVAS_TOOLS if not isinstance(spec, str)}

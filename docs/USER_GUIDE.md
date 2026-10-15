@@ -591,6 +591,7 @@ Spotting, as with a brush on a finished print. Marks are found by local contrast
 *   **Heal**: click dust spots to paint them out, or drag over a run of them.
 *   **Scratch**: click points along a scratch or hair, then double-click or press Enter. Esc cancels, Backspace removes the last point.
 *   **Line** (Transport Line): for long straight transport scratches. Click once on the scratch to trace and repair the whole line.
+*   **Erase**: drag a rectangle to delete every manual heal inside it; one Undo restores them.
 *   **Line Sensitivity** (0.05 to 0.95): lower catches fainter lines with a wider band; raise it if a line picks up film on either side. Applies to placed lines too.
 *   **Brush Size** (2 to 64 px): diameter of the heal, scratch and exclusion brushes, for new strokes. `Alt`+scroll on the canvas or pinch sets it.
 *   **Undo Last** / **Clear All**: remove the last or all manual heals and traced lines; auto-detected dust stays.

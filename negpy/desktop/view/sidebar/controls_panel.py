@@ -871,6 +871,13 @@ class ControlsPanel(QWidget):
                 "pick_dust",
             )
         )
+        ret.pick_erase_btn.setToolTip(
+            tooltip_with_shortcut(
+                "Erase heals in an area — drag a rectangle over the photo to delete every manual heal inside it. "
+                "One history step, so Undo restores them together",
+                "erase_heals",
+            )
+        )
         ret.clone_btn.setToolTip(
             tooltip_with_shortcut(
                 "Clone Tool: copy film from another area over a defect. Alt-click the source, then paint. Uses Brush Size",

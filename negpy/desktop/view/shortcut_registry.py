@@ -69,6 +69,7 @@ REGISTRY: dict[str, ShortcutEntry] = {
     "pick_dust": ShortcutEntry("Shift+D", "Toggle heal tool", "Tools"),
     "pick_scratch": ShortcutEntry("Shift+S", "Toggle scratch tool", "Tools"),
     "pick_scratch_line": ShortcutEntry("Shift+K", "Toggle transport-scratch line tool", "Tools"),
+    "erase_heals": ShortcutEntry("", "Toggle heal-erase tool", "Tools"),
     "clone_tool": ShortcutEntry("Shift+J", "Toggle clone tool", "Tools"),
     "local_draw": ShortcutEntry("Shift+B", "Toggle dodge & burn mask draw", "Tools"),
     "local_oval": ShortcutEntry("", "Toggle dodge & burn oval mask draw", "Tools"),

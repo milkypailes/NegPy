@@ -46,6 +46,7 @@ _TOOL_CURSORS: dict[ToolMode, Qt.CursorShape] = {
     ToolMode.WB_PICK: Qt.CursorShape.PointingHandCursor,
     ToolMode.CROP_MANUAL: Qt.CursorShape.CrossCursor,
     ToolMode.DUST_PICK: Qt.CursorShape.BlankCursor,
+    ToolMode.HEAL_ERASE: Qt.CursorShape.CrossCursor,
     ToolMode.CLONE: Qt.CursorShape.BlankCursor,
     ToolMode.LOCAL_DRAW: Qt.CursorShape.CrossCursor,
     ToolMode.LOCAL_OVAL: Qt.CursorShape.CrossCursor,
@@ -126,6 +127,7 @@ class ImageCanvas(QWidget):
     scratch_completed = pyqtSignal(list)
     clone_stroke_completed = pyqtSignal(list)
     clone_source_picked = pyqtSignal(float, float)
+    heal_erase_rect = pyqtSignal(list)
     dust_exclusion_painted = pyqtSignal(list)
     straighten_completed = pyqtSignal(float)
     keystone_line_marked = pyqtSignal(str, float, float, float, float)
@@ -191,6 +193,7 @@ class ImageCanvas(QWidget):
         self.overlay.scratch_completed.connect(self.scratch_completed.emit)
         self.overlay.clone_stroke_completed.connect(self.clone_stroke_completed.emit)
         self.overlay.clone_source_picked.connect(self.clone_source_picked.emit)
+        self.overlay.heal_erase_rect.connect(self.heal_erase_rect.emit)
         self.overlay.dust_exclusion_painted.connect(self.dust_exclusion_painted.emit)
         self.overlay.straighten_completed.connect(self.straighten_completed.emit)
         self.overlay.keystone_line_marked.connect(self.keystone_line_marked.emit)
@@ -725,7 +728,7 @@ class ImageCanvas(QWidget):
 
         # While a heal tool is live the menu serves that tool: the general settings menu would
         # be noise mid-retouch.
-        if self.state.active_tool in (ToolMode.DUST_PICK, ToolMode.SCRATCH_PICK):
+        if self.state.active_tool in (ToolMode.DUST_PICK, ToolMode.SCRATCH_PICK, ToolMode.HEAL_ERASE):
             self._exec_retouch_menu(pos, global_pos)
             return
         if self.state.active_tool == ToolMode.CLONE:

@@ -4970,6 +4970,46 @@ class TestRetouchPersistence(unittest.TestCase):
         self.controller.set_dust_overlay("marked")
         self.assertEqual(seen, ["marked"])
 
+    def _heal_config(self):
+        retouch = replace(
+            self.controller.state.config.retouch,
+            manual_heal_strokes=[([[0.5, 0.5]], 6.0, 0.0, 0.0), ([[0.05, 0.05]], 6.0, 0.0, 0.0)],
+            manual_dust_spots=[(0.6, 0.6, 6.0), (0.02, 0.9, 6.0)],
+            scratch_lines=[(0.0, 0.55, 1.0, 0.55, 8.0), (0.0, 0.9, 1.0, 0.92, 8.0)],
+        )
+        self.controller.state.config = replace(self.controller.state.config, retouch=retouch)
+
+    def test_delete_heals_in_rect_removes_inside_only(self):
+        self._heal_config()
+
+        self.controller.delete_heals_in_rect((0.4, 0.4), (0.7, 0.7))
+
+        saved = self.mock_session_manager.update_config.call_args.args[0]
+        self.assertEqual(saved.retouch.manual_heal_strokes, [([[0.05, 0.05]], 6.0, 0.0, 0.0)])
+        self.assertEqual(saved.retouch.manual_dust_spots, [(0.02, 0.9, 6.0)])
+        self.assertEqual(saved.retouch.scratch_lines, [(0.0, 0.9, 1.0, 0.92, 8.0)])
+        self.assertTrue(self.mock_session_manager.update_config.call_args.kwargs.get("persist"))
+        self.controller.request_render.assert_called_once()
+
+    def test_delete_heals_in_rect_empty_writes_nothing(self):
+        self._heal_config()
+
+        self.controller.delete_heals_in_rect((0.8, 0.0), (0.9, 0.1))
+
+        self.mock_session_manager.update_config.assert_not_called()
+        self.controller.request_render.assert_not_called()
+
+    def test_handle_heal_erase_rect_maps_corners_to_raw(self):
+        self._heal_config()
+        self.controller.state.last_metrics["uv_grid"] = MagicMock()
+        with patch("negpy.desktop.controller.CoordinateMapping") as mock_map:
+            mock_map.map_click_to_raw.side_effect = [(0.4, 0.4), (0.7, 0.7)]
+            self.controller.handle_heal_erase_rect([(0.1, 0.1), (0.9, 0.9)])
+
+        saved = self.mock_session_manager.update_config.call_args.args[0]
+        self.assertEqual(len(saved.retouch.manual_heal_strokes), 1)
+        self.assertEqual(len(saved.retouch.manual_dust_spots), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

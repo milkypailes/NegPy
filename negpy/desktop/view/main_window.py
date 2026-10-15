@@ -577,6 +577,7 @@ class MainWindow(QMainWindow):
         self.canvas.scratch_completed.connect(self.controller.handle_heal_stroke_completed)
         self.canvas.clone_stroke_completed.connect(self.controller.handle_clone_stroke_completed)
         self.canvas.clone_source_picked.connect(self.controller.set_clone_source)
+        self.canvas.heal_erase_rect.connect(self.controller.handle_heal_erase_rect)
         self.canvas.dust_exclusion_painted.connect(self.controller.handle_dust_exclusion_painted)
         self.canvas.straighten_completed.connect(self.controller.handle_straighten_completed)
         self.canvas.keystone_line_marked.connect(self.controller.handle_keystone_line_marked)

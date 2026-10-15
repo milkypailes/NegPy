@@ -764,3 +764,16 @@ def test_trace_scratch_follows_a_steep_line_across_a_wide_hq_buffer():
     assert nx1 - nx0 > 0.8
     fitted = (ny1 - ny0) * h / max((nx1 - nx0) * w, 1e-6)
     assert abs(fitted - slope) < 0.002
+
+
+def test_segment_intersects_rect_covers_endpoints_and_crossings():
+    from negpy.features.retouch.logic import segment_intersects_rect
+
+    rect = (0.25, 0.25, 0.75, 0.75)
+    assert segment_intersects_rect(0.5, 0.5, 0.9, 0.9, rect)  # starts inside
+    assert segment_intersects_rect(0.0, 0.0, 0.5, 0.5, rect)  # ends inside
+    assert segment_intersects_rect(0.0, 0.5, 1.0, 0.5, rect)  # crosses through
+    assert segment_intersects_rect(0.3, 0.3, 0.4, 0.4, rect)  # fully inside
+    assert not segment_intersects_rect(0.0, 0.0, 0.1, 0.1, rect)  # fully outside
+    assert not segment_intersects_rect(0.0, 0.0, 1.0, 0.0, rect)  # parallel outside
+    assert segment_intersects_rect(0.0, 0.0, 1.0, 1.0, (0.75, 0.75, 0.25, 0.25))  # unordered rect
