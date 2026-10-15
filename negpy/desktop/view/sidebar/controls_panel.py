@@ -871,6 +871,13 @@ class ControlsPanel(QWidget):
                 "pick_dust",
             )
         )
+        ret.bypass_btn.setToolTip(
+            tooltip_with_shortcut(
+                "Show Original: the unhealed photo with the heal markers on top, without changing the edit. "
+                "Stays on while more heals are painted",
+                "toggle_heal_bypass",
+            )
+        )
         ret.pick_erase_btn.setToolTip(
             tooltip_with_shortcut(
                 "Erase heals in an area — drag a rectangle over the photo to delete every manual heal inside it. "

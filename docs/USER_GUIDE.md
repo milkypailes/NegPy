@@ -576,7 +576,7 @@ Spotting, as with a brush on a finished print. Marks are found by local contrast
 *   **Size** (2 to 8 px): max spot radius.
 *   To protect detail, right-drag on the canvas to paint an exclusion band, or right-click → **Exclude from Optical Removal** for one spot. Toggling **Optical Removal** clears every band.
 *   The cursor button beside **Optical Removal** makes a plain right-click exclude the spot; the canvas menu is then out of reach while removal is on.
-*   **Full-Res Scan** runs the same detector on the full-resolution scan instead of the preview and keeps each hit as a manual heal. Catches sub-pixel specks the preview dilutes below the grain, both scanner dust and unexposed spots that print dark; right-click a placed heal on the canvas to delete a false positive.
+*   **Full-Res Scan** runs the same detector on the full-resolution scan instead of the preview and keeps each hit as a manual heal — a spot for specks, a traced outline for hairs. Catches sub-pixel specks the preview dilutes below the grain, both scanner dust and unexposed spots that print dark; right-click a placed heal on the canvas to delete a false positive.
 
 **IR Removal** uses the scanner's infrared channel, and is enabled only when the scan has one.
 
@@ -595,6 +595,7 @@ Spotting, as with a brush on a finished print. Marks are found by local contrast
 *   **Line Sensitivity** (0.05 to 0.95): lower catches fainter lines with a wider band; raise it if a line picks up film on either side. Applies to placed lines too.
 *   **Brush Size** (2 to 64 px): diameter of the heal, scratch and exclusion brushes, for new strokes. `Alt`+scroll on the canvas or pinch sets it.
 *   **Undo Last** / **Clear All**: remove the last or all manual heals and traced lines; auto-detected dust stays.
+*   **Show Original**: the unhealed photo with the heal markers on top, without changing the edit. Stays on while more heals are painted, so each new mark can be checked against the defect it covers.
 
 Right-click a stroke, scratch or line on the canvas to delete it.
 

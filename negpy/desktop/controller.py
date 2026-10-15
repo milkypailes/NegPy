@@ -383,6 +383,16 @@ def baseline_compare_config(config: WorkspaceConfig) -> WorkspaceConfig:
     )
 
 
+def heal_bypass_config(config: WorkspaceConfig) -> WorkspaceConfig:
+    """The edit with every manual heal lifted: the Heal Bypass preview shows the
+    unrepaired source under the placed-heal markers. Clone strokes stay: they are a
+    separate tool, not heals."""
+    return replace(
+        config,
+        retouch=replace(config.retouch, manual_dust_spots=[], manual_heal_strokes=[], scratch_lines=[]),
+    )
+
+
 # Solved knee fields under their slider names (sidebar/tone.py).
 _KNEE_LABELS = {
     "shadow_grade": "Shadows Grade",
@@ -508,6 +518,7 @@ class AppController(QObject):
     flat_output_changed = pyqtSignal(bool)
     linear_output_changed = pyqtSignal(bool)
     flat_peek_changed = pyqtSignal(bool)
+    heal_bypass_changed = pyqtSignal(bool)
     negative_peek_changed = pyqtSignal(bool)
     embedded_peek_changed = pyqtSignal(bool)
     flatfield_peek_changed = pyqtSignal(bool)
@@ -6848,6 +6859,14 @@ class AppController(QObject):
         if config_override is None and (self.state.negative_peek or self.state.embedded_peek) and not self._peek_shows(self.state.config):
             self.reset_all_peeks()
 
+        # Heal Bypass shows the unhealed source under the placed-heal markers: plain
+        # renders run a healless override instead of the edit, sticky across edits so
+        # painting more heals keeps showing the original. Override-shaped (no memo,
+        # no thumbnail, no metrics writeback) so nothing downstream files it as the edit.
+        bypass = config_override is None and not ephemeral and self.state.heal_bypass
+        if bypass:
+            config_override = heal_bypass_config(self.state.config)
+
         # The strip's patches were printed from the config as it stood, so once the edit
         # moves they prove something else. Drop them, which also cancels a strip still
         # building. Zone pins die the same way.
@@ -6890,6 +6909,8 @@ class AppController(QObject):
 
         dip = self.active_diptych()
         cam_xyz, camera_wb = self._effective_cam_xyz()
+        # A bypassed diptych lifts the heals from each half's own edit, not just the frame's.
+        dip_configs = tuple(heal_bypass_config(c) for c in dip[1]) if bypass and dip is not None else None
         task = RenderTask(
             buffer=preview_raw,
             config=config_override if config_override is not None else self.state.config,
@@ -6899,7 +6920,7 @@ class AppController(QObject):
             gpu_enabled=self.state.gpu_enabled,
             # A drag of the edit itself reads metrics back from the proxy, so the Analysis
             # panel tracks it. An override must not replace the edit's histograms.
-            readback_metrics=readback_metrics or (interactive and config_override is None and not ephemeral),
+            readback_metrics=(readback_metrics or (interactive and config_override is None and not ephemeral)) and not bypass,
             ir_buffer=ir_buffer,
             detect_buffer=detect_buffer,
             crop_preview_full=crop_preview_full,
@@ -6917,7 +6938,7 @@ class AppController(QObject):
             ),
             cam_xyz=cam_xyz,
             camera_wb=camera_wb,
-            diptych=dip[1] if dip is not None else None,
+            diptych=dip_configs if dip_configs is not None else (dip[1] if dip is not None else None),
             split_x=dip[0]["split_x"] if dip is not None else 0.5,
             gutter_thickness=dip[0]["gutter_thickness"] if dip is not None else 0.0,
             split_axis=str(dip[0].get("split_axis") or "x") if dip is not None else "x",
@@ -7092,6 +7113,22 @@ class AppController(QObject):
             self.request_render(readback_metrics=False, config_override=flat_master_config(self.state.config))
         else:
             self.request_render()
+
+    def toggle_heal_bypass(self, force: Optional[bool] = None) -> None:
+        """Show the unhealed source under the placed-heal markers, without changing the
+        saved edit. Sticky across edits: painting more heals keeps showing the original
+        until this is toggled off. ``force`` sets an explicit state; otherwise toggles.
+        """
+        if self.state.preview_raw is None:
+            return
+        target = (not self.state.heal_bypass) if force is None else force
+        if target == self.state.heal_bypass:
+            return
+        if target and self.state.compare_mode:
+            self.exit_compare()
+        self.state.heal_bypass = target
+        self.heal_bypass_changed.emit(target)
+        self.request_render()
 
     def _paint_negative_peek(self) -> None:
         """Put the decoded source on the canvas: un-inverted, un-normalized, no tone edits.

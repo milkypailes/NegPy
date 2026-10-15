@@ -3,7 +3,7 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 
-from negpy.desktop.controller import AppController
+from negpy.desktop.controller import AppController, heal_bypass_config
 from negpy.desktop.session import AppState, DesktopSessionManager
 from negpy.features.retouch.logic import (
     compute_dust_stats,
@@ -40,17 +40,67 @@ def test_speck_becomes_one_centred_spot_heal():
     assert 798 / 1600 <= ny <= 802 / 1600
 
 
-def test_hair_mask_becomes_strokes_on_the_defect():
-    hair = np.zeros((100, 100), dtype=np.uint8)
-    hair[50, 10:90] = 1  # long thin hair
-    strokes = dust_detections_to_heal_strokes(None, [hair], (100, 100))
-    assert strokes
-    for points, size, _dx, _dy in strokes:
-        (nx, ny) = points[0]
-        assert 0.0 <= nx <= 1.0 and 0.0 <= ny <= 1.0
-        assert HEAL_SIZE_MIN <= size <= HEAL_SIZE_MAX
-        # Spots sit on the hair row (within one brush diameter of it).
-        assert abs(ny * 100 - 50) <= size
+def test_hair_mask_becomes_one_traced_stroke():
+    hair = np.zeros((1600, 1600), dtype=np.uint8)
+    hair[800:802, 600:800] = 1  # long thin hair
+    strokes = dust_detections_to_heal_strokes(None, [hair], (1600, 1600))
+    assert len(strokes) == 1
+    points, size, _dx, _dy = strokes[0]
+    assert len(points) >= 2, "a trace, not a spot"
+    assert HEAL_SIZE_MIN <= size <= HEAL_SIZE_MAX
+    xs = sorted(p[0] * 1600 for p in points)
+    assert xs[0] <= 601.0 and xs[-1] >= 799.0, "the trace spans the hair"
+    assert all(abs(p[1] * 1600 - 801) <= 3.0 for p in points), "the trace hugs the hair"
+
+
+def test_minor_hairline_traces_instead_of_circling():
+    # A 1 px, 15 px hairline: below the detector's hair-routing minimum area, so the
+    # old shape gate encircled it. Tracing needs no minimum.
+    hair = np.zeros((1600, 1600), dtype=np.uint8)
+    hair[900, 700:715] = 1
+    strokes = dust_detections_to_heal_strokes(None, [hair], (1600, 1600))
+    assert len(strokes) == 1
+    points, _size, _dx, _dy = strokes[0]
+    assert len(points) >= 2
+    xs = sorted(p[0] * 1600 for p in points)
+    assert xs[0] <= 701.0 and xs[-1] >= 714.0
+
+
+def test_bent_hair_converts_to_closed_loop():
+    hair = np.zeros((1600, 1600), dtype=np.uint8)
+    hair[500:700, 800:803] = 1
+    hair[697:700, 800:1000] = 1  # an L bend
+    strokes = dust_detections_to_heal_strokes(None, [hair], (1600, 1600))
+    assert len(strokes) == 1
+    points, _size, _dx, _dy = strokes[0]
+    assert len(points) > 2, "a bend survives as a loop, not two ends"
+    assert points[0] == points[-1], "the loop is closed for the open-chain bake"
+    assert all(500 - 5 <= p[1] * 1600 <= 700 + 5 and 800 - 5 <= p[0] * 1600 <= 1000 + 5 for p in points)
+
+
+def test_hair_brush_is_sized_to_thickness():
+    hair = np.zeros((1600, 1600), dtype=np.uint8)
+    hair[800:803, 600:1000] = 1  # 3 px thick, 400 long
+    strokes = dust_detections_to_heal_strokes(None, [hair], (1600, 1600))
+    assert len(strokes) == 1
+    _points, size, _dx, _dy = strokes[0]
+    # Thickness plus skirt pad, not the 400 px bounding length.
+    assert size < 20.0
+
+
+def test_hair_roundtrip_repairs_through_the_trace():
+    rng = np.random.default_rng(11)
+    h = w = 800
+    img = (np.full((h, w, 3), 0.18) * (1.0 + rng.normal(0, 0.02, (h, w, 3)))).astype(np.float32)
+    img[400:402, 300:450] = 0.005
+    _score, hair = detect_luma_score(img, 0.66, 4, hair_threshold=0.01)
+    assert hair is not None
+    strokes = dust_detections_to_heal_strokes(None, [hair], img.shape[:2])
+    assert len(strokes) == 1 and len(strokes[0][0]) >= 2
+    manual = strokes_to_score(img, strokes, [])
+    assert manual is not None and (manual < 1.0).any()
+    kept, dropped = filter_strokes_by_score(strokes, manual, img.shape[:2])
+    assert kept == strokes and not dropped
 
 
 def test_stroke_cap_keeps_the_largest_first():
@@ -256,3 +306,114 @@ class TestDustScanFinished(unittest.TestCase):
             [tuple(p[0]) for p in (s[0] for s in saved.retouch.manual_heal_strokes)],
             [(0.5, 0.5), (0.7, 0.7)],
         )
+
+
+def test_heal_bypass_config_lifts_heals_keeps_clones():
+    from dataclasses import replace
+
+    from negpy.domain.models import WorkspaceConfig
+
+    config = WorkspaceConfig()
+    config = replace(
+        config,
+        retouch=replace(
+            config.retouch,
+            manual_heal_strokes=[([[0.5, 0.5]], 6.0, 0.0, 0.0)],
+            manual_dust_spots=[(0.2, 0.2, 6.0)],
+            scratch_lines=[(0.0, 0.0, 1.0, 1.0, 8.0)],
+            clone_strokes=[([[0.1, 0.1]], 6.0, 0.0, 0.0, 1.0, 0.5, True)],
+        ),
+    )
+    out = heal_bypass_config(config)
+    assert out.retouch.manual_heal_strokes == []
+    assert out.retouch.manual_dust_spots == []
+    assert out.retouch.scratch_lines == []
+    assert out.retouch.clone_strokes == config.retouch.clone_strokes
+    assert out.exposure == config.exposure
+
+
+class TestHealBypass(unittest.TestCase):
+    """The Show Original toggle previews the unhealed source without touching the edit."""
+
+    def setUp(self):
+        self.mock_session_manager = MagicMock(spec=DesktopSessionManager)
+        self.mock_session_manager.state = AppState()
+        self.mock_session_manager.repo = MagicMock()
+
+        with (
+            patch("negpy.desktop.controller.RenderWorker") as mock_rw_class,
+            patch("negpy.desktop.controller.PreviewManager") as mock_pm_class,
+        ):
+            mock_rw_class.return_value = MagicMock()
+            mock_pm_class.return_value = MagicMock(spec=PreviewManager)
+            mock_pm_class.return_value.load_linear_preview.return_value = (None, (0, 0), {})
+            self.controller = AppController(self.mock_session_manager)
+        self.controller.request_render = MagicMock()
+        self.controller.state.current_file_path = "/rolls/frame.tif"
+        self.controller.state.current_file_hash = "frame-hash"
+
+    def tearDown(self):
+        import gc
+
+        for thread in [
+            self.controller.render_thread,
+            self.controller.export_thread,
+            self.controller.thumb_thread,
+            self.controller.norm_thread,
+            self.controller.discovery_thread,
+            self.controller.preview_load_thread,
+            self.controller.prefetch_load_thread,
+            self.controller.scan_thread,
+        ]:
+            if thread is not None and thread.isRunning():
+                thread.quit()
+                thread.wait()
+        del self.controller
+        gc.collect()
+
+    def test_toggle_flips_and_renders(self):
+        import numpy as np
+
+        self.controller.state.preview_raw = np.zeros((8, 8, 3), dtype=np.float32)
+        seen = []
+        self.controller.heal_bypass_changed.connect(seen.append)
+
+        self.controller.toggle_heal_bypass()
+
+        self.assertTrue(self.controller.state.heal_bypass)
+        self.assertEqual(seen, [True])
+        self.controller.request_render.assert_called_once()
+
+    def test_toggle_off_renders_plain(self):
+        import numpy as np
+
+        self.controller.state.preview_raw = np.zeros((8, 8, 3), dtype=np.float32)
+        self.controller.state.heal_bypass = True
+
+        self.controller.toggle_heal_bypass(force=False)
+
+        self.assertFalse(self.controller.state.heal_bypass)
+        self.controller.request_render.assert_called_once()
+
+    def test_bypassed_render_strips_heals_and_skips_memo(self):
+        import numpy as np
+
+        from dataclasses import replace
+
+        retouch = replace(self.controller.state.config.retouch, manual_heal_strokes=[([[0.5, 0.5]], 6.0, 0.0, 0.0)])
+        self.controller.state.config = replace(self.controller.state.config, retouch=retouch)
+        self.controller.state.current_file_path = ""
+        self.controller.state.preview_raw = np.zeros((16, 16, 3), dtype=np.float32)
+        self.controller.state.heal_bypass = True
+        tasks = []
+        self.controller.render_requested.connect(tasks.append)
+
+        AppController.request_render(self.controller)
+
+        self.assertEqual(len(tasks), 1)
+        task = tasks[0]
+        self.assertEqual(task.config.retouch.manual_heal_strokes, [])
+        self.assertEqual(len(self.controller.state.config.retouch.manual_heal_strokes), 1, "the edit keeps its heals")
+        self.assertTrue(task.config_override)
+        self.assertEqual(task.memo_key, "")
+        self.assertFalse(task.readback_metrics)

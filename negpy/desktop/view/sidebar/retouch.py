@@ -128,6 +128,15 @@ class RetouchSidebar(BaseSidebar):
         for btn in (self.pick_dust_btn, self.pick_scratch_btn, self.pick_line_btn, self.pick_erase_btn):
             tools_row.addWidget(btn, 1)
         self.layout.addLayout(tools_row)
+        self.bypass_btn = self._small_toggle(
+            "fa5s.eye-slash",
+            "Show Original",
+            False,
+            "Show Original: the unhealed photo with the heal markers on top, without changing the edit. "
+            "Stays on while more heals are painted",
+            align_left=True,
+        )
+        self.layout.addWidget(self.bypass_btn)
 
         self.manual_size_slider = CompactSlider(
             "Brush Size", HEAL_SIZE_MIN, HEAL_SIZE_MAX, float(conf.manual_dust_size), step=1.0, precision=1, unit=" px"
@@ -203,6 +212,8 @@ class RetouchSidebar(BaseSidebar):
         self.pick_scratch_btn.toggled.connect(self._on_scratch_toggled)
         self.pick_line_btn.toggled.connect(self._on_line_toggled)
         self.pick_erase_btn.toggled.connect(self._on_erase_toggled)
+        self.bypass_btn.toggled.connect(lambda c: self.controller.toggle_heal_bypass(force=c))
+        self.controller.heal_bypass_changed.connect(self.bypass_btn.setChecked)
         self.manual_size_slider.valueChanged.connect(lambda v: self.update_config_section("retouch", render=False, manual_dust_size=int(v)))
         self.manual_size_slider.valueCommitted.connect(
             lambda v: self.update_config_section("retouch", render=False, persist=True, manual_dust_size=int(v))
@@ -296,6 +307,7 @@ class RetouchSidebar(BaseSidebar):
             self.pick_scratch_btn.setChecked(self.state.active_tool == ToolMode.SCRATCH_PICK)
             self.pick_line_btn.setChecked(self.state.active_tool == ToolMode.SCRATCH_LINE)
             self.pick_erase_btn.setChecked(self.state.active_tool == ToolMode.HEAL_ERASE)
+            self.bypass_btn.setChecked(self.state.heal_bypass)
             cloning = self.state.active_tool == ToolMode.CLONE
             self.clone_btn.setChecked(cloning)
             self.clone_source_btn.setChecked(cloning and self.state.clone_picking)
@@ -347,6 +359,7 @@ class RetouchSidebar(BaseSidebar):
             self.pick_scratch_btn,
             self.pick_line_btn,
             self.pick_erase_btn,
+            self.bypass_btn,
             self.line_threshold_slider,
             self.clone_btn,
             self.clone_source_btn,

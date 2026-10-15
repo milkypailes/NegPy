@@ -79,6 +79,7 @@ REGISTRY: dict[str, ShortcutEntry] = {
     "toggle_flat_peek": ShortcutEntry("M", "Peek flat scan (digital intermediate)", "Tools"),
     "toggle_negative_peek": ShortcutEntry("N", "Peek negative (source as loaded)", "Tools"),
     "toggle_embedded_peek": ShortcutEntry("P", "Peek the camera's embedded preview", "Tools"),
+    "toggle_heal_bypass": ShortcutEntry("", "Show the unhealed photo under the heal markers", "Tools"),
     "toggle_zones": ShortcutEntry("Shift+Z", "Adams zone overlay", "Tools"),
     "toggle_clipping_overlay": ShortcutEntry("", "Clipping Overlay: paper black and paper white on the frame", "Tools"),
     "toggle_zone_hover_highlight": ShortcutEntry("", "Zone Highlight: light up the zone strip's hovered zone on the frame", "Tools"),

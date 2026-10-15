@@ -316,6 +316,8 @@ class AppState:
     embedded_peek: bool = False
     # Transient: preview is showing the selected Flat Field profile's self-check.
     flatfield_peek: bool = False
+    # Transient: preview is showing the unhealed source under the placed-heal markers.
+    heal_bypass: bool = False
     # A painted peek's canvas keys (negative, embedded, Check Flat Field), apart from last_metrics,
     # which holds the print. Stays until the print is painted again, not until the peek flag drops.
     peek_frame: Optional[Dict[str, Any]] = None

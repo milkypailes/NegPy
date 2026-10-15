@@ -368,6 +368,7 @@ class ShortcutManager:
             "open_tools_menu": lambda: self.window.toolbar.open_tools_menu(),
             "toggle_flat_peek": controller.toggle_flat_peek,
             "toggle_negative_peek": controller.toggle_negative_peek,
+            "toggle_heal_bypass": controller.toggle_heal_bypass,
             "toggle_embedded_peek": controller.toggle_embedded_peek,
             "toggle_flatfield_peek": controller.toggle_flatfield_peek,
             "toggle_zones": controller.toggle_zones_overlay,

@@ -531,13 +531,15 @@ def dust_detections_to_heal_strokes(
     shape: Tuple[int, int],
     max_strokes: int = _FULLRES_SCAN_MAX_STROKES,
 ) -> List[Tuple]:
-    """Detection masks → single-point manual heal strokes in raw-frame coordinates.
+    """Detection masks → manual heal strokes in raw-frame coordinates.
 
-    Each connected component becomes one spot heal at its centroid, sized to cover its
-    bounding box plus the detector's skirt pad, at ``HEAL_SIZE_REF`` scale. Components
-    wider than the brush tile into spaced spots along the defect itself, so a long hair
-    does not stamp clean film around it. Sorted largest-first, so a cap keeps the worst
-    defects. Returns ``manual_heal_strokes`` entries ``(points, size, 0.0, 0.0)``."""
+    Each connected component becomes one stroke tracing it: a closed contour with the
+    brush sized to the defect's own thickness, so the search area hugs the mark
+    instead of stamping the clean film around it. A traced contour with that brush
+    always covers its component, so only defects wider than the largest brush fall
+    back to spots (degenerate) or spaced tiling (oversize compact). Sorted
+    largest-first, so a cap keeps the worst defects. Returns ``manual_heal_strokes``
+    entries ``(points, size, 0.0, 0.0)``."""
     h, w = int(shape[0]), int(shape[1])
     if h <= 0 or w <= 0 or max_strokes <= 0:
         return []
@@ -580,6 +582,13 @@ def dust_detections_to_heal_strokes(
             continue
         y0, y1 = int(ys.min()), int(ys.max())
         x0, x1 = int(xs.min()), int(xs.max())
+        sub = comp[y0 : y1 + 1, x0 : x1 + 1]
+        traced = _trace_contour_stroke(sub, x0, y0, w, h, ref_scale, pad)
+        if traced is not None:
+            strokes.append(traced)
+            if len(strokes) >= max_strokes:
+                return strokes
+            continue
         diameter = float(max(y1 - y0 + 1, x1 - x0 + 1)) + 2.0 * pad
         size = float(np.clip(diameter / ref_scale, HEAL_SIZE_MIN, HEAL_SIZE_MAX))
         if diameter <= step_full:
@@ -598,6 +607,38 @@ def dust_detections_to_heal_strokes(
         if len(strokes) >= max_strokes:
             return strokes
     return strokes
+
+
+def _trace_contour_stroke(sub: np.ndarray, x0: int, y0: int, w: int, h: int, ref_scale: float, pad: float) -> Optional[Tuple]:
+    """Component → one closed contour stroke tracing it, or None when the brush cannot
+    cover it. The brush spans the defect's own thickness plus the skirt pad, which
+    reaches every interior pixel from the boundary, so the search area follows the
+    mark. Points simplify to the brush radius, which the painted capsule spans without
+    gaps. ``(x0, y0)`` is the sub-image offset in the full plane. None past the
+    largest brush: the caller tiles those instead."""
+    # Padded: the crop holds no background, against which the transform measures.
+    dist = cv2.distanceTransform(np.pad(np.ascontiguousarray(sub.astype(np.uint8)), 1), cv2.DIST_L2, 5)
+    size = 2.0 * (float(dist.max()) + pad) / ref_scale
+    if size > HEAL_SIZE_MAX:
+        return None
+    size = max(size, HEAL_SIZE_MIN)
+    contours, _ = cv2.findContours(np.ascontiguousarray(sub.astype(np.uint8)), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not contours:
+        return None
+    contour = max(contours, key=cv2.contourArea)
+    eps = max(1.0, size * ref_scale * 0.25)
+    approx = cv2.approxPolyDP(contour, eps, True)
+    if len(approx) >= 3:
+        points = [[[float(p[0][0] + x0) / w, float(p[0][1] + y0) / h] for p in approx]]
+        points[0].append(points[0][0])  # close the loop; the bake paints open chains
+    elif len(approx) == 2:
+        # Degenerate-thin: the loop simplifies to its two ends, which the capsule joins.
+        # A bend surviving the epsilon keeps its points above; a smaller one fits inside
+        # the search area either way.
+        points = [[[float(p[0][0] + x0) / w, float(p[0][1] + y0) / h] for p in approx]]
+    else:
+        return None
+    return (points[0], size, 0.0, 0.0)
 
 
 def filter_strokes_by_score(
