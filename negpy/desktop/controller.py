@@ -462,6 +462,8 @@ class AppController(QObject):
     normalization_requested = pyqtSignal(NormalizationTask)
     batch_autocrop_requested = pyqtSignal(BatchAutoCropTask)
     thumbnail_render_requested = pyqtSignal(ThumbnailRenderTask)
+    dust_scan_requested = pyqtSignal(object)  # DustScanTask
+    dust_scan_running_changed = pyqtSignal(bool)
     thumbnail_refresh_state_changed = pyqtSignal(bool)  # a background refresh started/stopped running
     analysis_buffer_preview_requested = pyqtSignal(float)
     analysis_buffer_drag_changed = pyqtSignal(bool)
@@ -710,6 +712,13 @@ class AppController(QObject):
         self.thumbnail_render_worker = ThumbnailRenderWorker(self.thumbnail_render_preview_service, self.preview_service)
         self.thumbnail_render_worker.moveToThread(self.norm_thread)
         self.norm_thread.start()
+
+        from negpy.desktop.workers.dust_scan import DustScanWorker
+
+        # Shares the normalization thread: same bursty CPU profile, never alongside it.
+        self.dust_scan_worker = DustScanWorker()
+        self.dust_scan_worker.moveToThread(self.norm_thread)
+        self._dust_scan_running = False
 
         self.discovery_thread = QThread()
         self.discovery_worker = AssetDiscoveryWorker()
@@ -985,6 +994,10 @@ class AppController(QObject):
         self.batch_autocrop_worker.error.connect(self._on_batch_autocrop_error)
 
         self.thumbnail_render_requested.connect(self.thumbnail_render_worker.process)
+        self.dust_scan_requested.connect(self.dust_scan_worker.run)
+        self.dust_scan_worker.started.connect(self._on_dust_scan_started)
+        self.dust_scan_worker.finished.connect(self._on_dust_scan_finished)
+        self.dust_scan_worker.error.connect(self._on_dust_scan_error)
         self.thumbnail_render_worker.frame_started.connect(self._on_thumbnail_render_frame_started)
         self.thumbnail_render_worker.progress.connect(self._on_thumbnail_render_progress)
         self.thumbnail_render_worker.rendered.connect(self._on_thumbnail_rendered)
@@ -4461,6 +4474,83 @@ class AppController(QObject):
             persist=True,
         )
         self.request_render()
+
+    def scan_fullres_dust_to_heals(self) -> None:
+        """Detect dust on the full-resolution decode and keep each hit as a manual heal.
+
+        The interactive render detects at preview scale, where a sub-pixel speck dilutes
+        below the grain. This re-runs the same optical gate at 1:1 and appends one spot
+        heal per component, so false positives stay individually deletable on the canvas.
+        """
+        from negpy.desktop.workers.dust_scan import DustScanTask
+
+        if self._dust_scan_running:
+            return
+        path = self.state.current_file_path
+        if not path:
+            self.set_status("Open a frame before scanning for dust", 3000, kind="warning")
+            return
+        key = self.state.current_file_hash or path
+        task = DustScanTask(file_path=path, config=self.state.config, key=key, half=self._active_half())
+        self._dust_scan_running = True
+        self.dust_scan_running_changed.emit(True)
+        self.set_status("Scanning full resolution for dust…", 0)
+        self.dust_scan_requested.emit(task)
+
+    def _on_dust_scan_started(self) -> None:
+        self.set_status("Scanning full resolution for dust…", 0)
+
+    def _set_dust_scan_idle(self) -> None:
+        if self._dust_scan_running:
+            self._dust_scan_running = False
+            self.dust_scan_running_changed.emit(False)
+
+    @property
+    def is_dust_scan_running(self) -> bool:
+        return self._dust_scan_running
+
+    def _on_dust_scan_finished(self, strokes: list, dropped: int, key: str) -> None:
+        self._set_dust_scan_idle()
+        if key != (self.state.current_file_hash or self.state.current_file_path):
+            return
+        if not strokes:
+            if dropped:
+                self.set_status(
+                    f"Full-res scan found {dropped} marks but none held local contrast under the brush",
+                    6000,
+                )
+            else:
+                self.set_status("Full-res scan found no dust", 4000)
+            return
+        conf = self.state.config.retouch
+        # Detection reads the unrepaired decode, so a re-scan finds the same specks:
+        # skip centres a previous run already placed.
+        placed = {(round(float(p[0]), 6), round(float(p[1]), 6)) for s in conf.manual_heal_strokes for p in s[0] if len(s[0]) == 1} | {
+            (round(float(nx), 6), round(float(ny), 6)) for nx, ny, _size in conf.manual_dust_spots
+        }
+        fresh = [s for s in strokes if (round(float(s[0][0][0]), 6), round(float(s[0][0][1]), 6)) not in placed]
+        if not fresh:
+            self.set_status("Full-res scan found nothing new", 4000)
+            return
+        self.session.update_config(
+            replace(
+                self.state.config,
+                retouch=replace(conf, manual_heal_strokes=list(conf.manual_heal_strokes) + fresh),
+            ),
+            persist=True,
+        )
+        note = f" ({dropped} without local contrast skipped)" if dropped else ""
+        self.set_status(
+            f"Full-res scan added {len(fresh)} heals{note} — right-click one to delete a false positive",
+            6000,
+        )
+        self.request_render()
+
+    def _on_dust_scan_error(self, message: str, key: str) -> None:
+        self._set_dust_scan_idle()
+        if key != (self.state.current_file_hash or self.state.current_file_path):
+            return
+        self.set_status(message, 6000, kind="error")
 
     def _handle_dust_pick(self, nx: float, ny: float) -> None:
         with self.state.metrics_lock:

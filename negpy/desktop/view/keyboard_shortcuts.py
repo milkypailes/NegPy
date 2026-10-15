@@ -458,6 +458,7 @@ class ShortcutManager:
             "toggle_hq": controller.toggle_hq_preview,
             # Button clicks, so the shortcut runs the same gating and toast the mouse gets.
             "toggle_optical_removal": controls.retouch_sidebar.auto_dust_btn.click,
+            "fullres_dust_scan": controls.retouch_sidebar.fullres_btn.click,
             "toggle_right_click_excludes": controls.retouch_sidebar.right_click_btn.click,
             "toggle_ir_removal": controls.retouch_sidebar.ir_dust_btn.click,
             "toggle_flat_field": controls.flatfield_sidebar.enable_btn.click,

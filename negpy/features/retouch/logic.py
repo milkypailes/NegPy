@@ -8,7 +8,7 @@ from numba import prange  # type: ignore
 
 from negpy.domain.types import ImageBuffer
 from negpy.features.geometry.logic import smooth_polyline
-from negpy.features.retouch.models import HEAL_SIZE_REF, IR_METHOD_NEGPY
+from negpy.features.retouch.models import HEAL_SIZE_MAX, HEAL_SIZE_MIN, HEAL_SIZE_REF, IR_METHOD_NEGPY
 from negpy.kernel.system.parallel import parallel_njit
 from negpy.kernel.image.logic import get_luminance
 from negpy.kernel.image.validation import ensure_image
@@ -440,6 +440,124 @@ def exclusion_token(retouch) -> str:
     if not retouch.dust_exclusion_strokes:
         return ""
     return "|ex" + hashlib.sha1(repr(retouch.dust_exclusion_strokes).encode()).hexdigest()[:12]
+
+
+# Cap on heals one full-res scan may place. A mis-tuned threshold on a busy frame can
+# otherwise return thousands of strokes, each a config entry the render re-gates.
+_FULLRES_SCAN_MAX_STROKES = 400
+
+
+def dust_detections_to_heal_strokes(
+    score: Optional[np.ndarray],
+    hair_masks: List[np.ndarray],
+    shape: Tuple[int, int],
+    max_strokes: int = _FULLRES_SCAN_MAX_STROKES,
+) -> List[Tuple]:
+    """Detection masks → single-point manual heal strokes in raw-frame coordinates.
+
+    Each connected component becomes one spot heal at its centroid, sized to cover its
+    bounding box plus the detector's skirt pad, at ``HEAL_SIZE_REF`` scale. Components
+    wider than the brush tile into spaced spots along the defect itself, so a long hair
+    does not stamp clean film around it. Sorted largest-first, so a cap keeps the worst
+    defects. Returns ``manual_heal_strokes`` entries ``(points, size, 0.0, 0.0)``."""
+    h, w = int(shape[0]), int(shape[1])
+    if h <= 0 or w <= 0 or max_strokes <= 0:
+        return []
+    ref_scale = max(h, w) / HEAL_SIZE_REF
+    pad = _DETECT_PAD_PX * film_scale((h, w))
+    step_full = max(1.0, HEAL_SIZE_MAX * ref_scale * 0.75)
+
+    masks: List[np.ndarray] = []
+    if score is not None and np.asarray(score).shape[:2] == (h, w):
+        hit = (np.asarray(score) < 1.0).astype(np.uint8)
+        if hit.any():
+            masks.append(hit)
+    elif score is not None:
+        hit = cv2.resize(np.asarray(score).astype(np.float32), (w, h), interpolation=cv2.INTER_LINEAR) < 1.0
+        if np.any(hit):
+            masks.append(hit.astype(np.uint8))
+    for hm in hair_masks or []:
+        arr = np.asarray(hm)
+        if arr.shape[:2] != (h, w):
+            arr = (cv2.resize(arr.astype(np.float32), (w, h), interpolation=cv2.INTER_NEAREST) > 0).astype(np.uint8)
+        else:
+            arr = (arr > 0).astype(np.uint8)
+        if arr.any():
+            masks.append(arr)
+
+    comps: List[Tuple[int, np.ndarray]] = []
+    for m in masks:
+        n_lbl, labels, stats, _ = cv2.connectedComponentsWithStats(np.ascontiguousarray(m), connectivity=8)
+        for i in range(1, n_lbl):
+            area = int(stats[i, cv2.CC_STAT_AREA])
+            if area < 2:
+                continue
+            comps.append((area, (labels == i)))
+    comps.sort(key=lambda c: c[0], reverse=True)
+
+    strokes: List[Tuple] = []
+    for _area, comp in comps:
+        ys, xs = np.nonzero(comp)
+        if ys.size == 0:
+            continue
+        y0, y1 = int(ys.min()), int(ys.max())
+        x0, x1 = int(xs.min()), int(xs.max())
+        diameter = float(max(y1 - y0 + 1, x1 - x0 + 1)) + 2.0 * pad
+        size = float(np.clip(diameter / ref_scale, HEAL_SIZE_MIN, HEAL_SIZE_MAX))
+        if diameter <= step_full:
+            cy, cx = float(ys.mean()), float(xs.mean())
+            strokes.append(([[cx / w, cy / h]], size, 0.0, 0.0))
+        else:
+            dilated = cv2.dilate(comp.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (max(1, int(step_full) | 1),) * 2))
+            step = max(1, int(round(step_full)))
+            for gy in range(y0, y1 + 1, step):
+                for gx in range(x0, x1 + 1, step):
+                    if not dilated[gy, gx]:
+                        continue
+                    strokes.append(([[gx / w, gy / h]], float(HEAL_SIZE_MAX), 0.0, 0.0))
+                    if len(strokes) >= max_strokes:
+                        return strokes
+        if len(strokes) >= max_strokes:
+            return strokes
+    return strokes
+
+
+def filter_strokes_by_score(
+    strokes: List[Tuple],
+    score: Optional[np.ndarray],
+    shape: Tuple[int, int],
+) -> Tuple[List[Tuple], List[Tuple]]:
+    """Split strokes into ``(kept, dropped)`` by a manual score over the same buffer.
+
+    A stroke is kept when the score marks film under its brush footprint: the manual
+    bake re-gates every stroke by local contrast, so one with no verdict there would
+    place a mark that repairs nothing. ``score`` is None when nothing re-fired, and
+    every stroke is dropped."""
+    if not strokes or score is None:
+        return [], list(strokes)
+    h, w = int(shape[0]), int(shape[1])
+    plane = np.asarray(score)
+    if plane.shape[:2] != (h, w):
+        plane = cv2.resize(plane.astype(np.float32), (w, h), interpolation=cv2.INTER_LINEAR)
+    ref_scale = max(h, w) / HEAL_SIZE_REF
+    kept: List[Tuple] = []
+    dropped: List[Tuple] = []
+    for stroke in strokes:
+        points = list(stroke[0])
+        radius = max(1.0, float(stroke[1]) * ref_scale * 0.5)
+        hit = False
+        for nx, ny in points:
+            cx, cy = float(nx) * w, float(ny) * h
+            x0, x1 = max(0, int(cx - radius)), min(w, int(cx + radius) + 1)
+            y0, y1 = max(0, int(cy - radius)), min(h, int(cy + radius) + 1)
+            if x1 <= x0 or y1 <= y0:
+                continue
+            ys, xs = np.mgrid[y0:y1, x0:x1]
+            if ((plane[y0:y1, x0:x1] < 1.0) & ((xs - cx) ** 2 + (ys - cy) ** 2 <= radius * radius)).any():
+                hit = True
+                break
+        (kept if hit else dropped).append(stroke)
+    return kept, dropped
 
 
 def strokes_to_score(

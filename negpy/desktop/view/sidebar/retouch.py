@@ -36,6 +36,11 @@ _RIGHT_CLICK_TIP = (
     "Off, a right-click opens the canvas menu and its Exclude From Optical Removal item does the same. "
     "Right-drag paints a band either way."
 )
+_FULLRES_TIP = (
+    "Detect dust on the full-resolution scan instead of the preview, and keep each hit as a manual heal. "
+    "Catches sub-pixel specks the preview dilutes below the grain. "
+    "Runs in the background; right-click a placed heal on the canvas to delete a false positive."
+)
 
 
 def _clone_hint(picking: bool, has_source: bool) -> str:
@@ -72,6 +77,8 @@ class RetouchSidebar(BaseSidebar):
         self.hair_threshold_slider = CompactSlider("Hair Threshold", 0.01, 1.0, conf.dust_hair_threshold)
         self.auto_size_slider = CompactSlider("Size", 2.0, 8.0, float(conf.dust_size), step=1.0, precision=1, unit=" px")
         self.layout.addWidget(SliderGroup(self.threshold_slider, self.hair_threshold_slider, self.auto_size_slider))
+        self.fullres_btn = self._labeled_action("fa5s.search-plus", "Full-Res Scan", _FULLRES_TIP)
+        self.layout.addWidget(self.fullres_btn)
 
         self.ir_dust_btn = self._small_toggle("fa5s.broom", "IR Removal", conf.ir_dust_remove, _IR_REMOVAL_TIP, align_left=True)
         self.ir_method_btn = ChoiceButton(tuple(("", label) for label in _IR_METHOD_LABELS), "")
@@ -214,6 +221,8 @@ class RetouchSidebar(BaseSidebar):
         self.clone_clear_btn.clicked.connect(self.controller.clear_clones)
         self.undo_btn.clicked.connect(self.controller.undo_last_retouch)
         self.clear_btn.clicked.connect(self.controller.clear_retouch)
+        self.fullres_btn.clicked.connect(self.controller.scan_fullres_dust_to_heals)
+        self.controller.dust_scan_running_changed.connect(self._on_dust_scan_running)
         self.overlay_btn.currentChanged.connect(lambda i: self.controller.set_dust_overlay(_OVERLAY_MODES[i]))
 
         self.ir_dust_btn.toggled.connect(
@@ -259,6 +268,10 @@ class RetouchSidebar(BaseSidebar):
             w.setEnabled(enabled)
             w.setToolTip(tip if enabled else "No IR channel in this scan")
 
+    def _on_dust_scan_running(self, running: bool) -> None:
+        self.fullres_btn.setEnabled(not running)
+        self.fullres_btn.setText("Scanning…" if running else "Full-Res Scan")
+
     def sync_ui(self) -> None:
         conf = self.state.config.retouch
         self.block_signals(True)
@@ -296,6 +309,7 @@ class RetouchSidebar(BaseSidebar):
             has_heals = num_heals > 0
             self.undo_btn.setEnabled(has_heals)
             self.clear_btn.setEnabled(has_heals)
+            self._on_dust_scan_running(self.controller.is_dust_scan_running)
 
             # Show unchecked on non-IR files: the config value is inert without an IR plane, and a
             # checked but greyed button reads as stuck on.

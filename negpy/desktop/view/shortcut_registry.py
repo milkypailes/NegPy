@@ -83,6 +83,7 @@ REGISTRY: dict[str, ShortcutEntry] = {
     "toggle_zone_hover_highlight": ShortcutEntry("", "Zone Highlight: light up the zone strip's hovered zone on the frame", "Tools"),
     "toggle_hq": ShortcutEntry("", "Toggle high-quality (full-resolution) preview", "View"),
     "toggle_optical_removal": ShortcutEntry("", "Toggle Optical Removal", "Retouch"),
+    "fullres_dust_scan": ShortcutEntry("", "Scan full resolution for dust into manual heals", "Retouch"),
     "toggle_right_click_excludes": ShortcutEntry("", "Toggle right-click excludes from Optical Removal", "Retouch"),
     "toggle_ir_removal": ShortcutEntry("", "Toggle IR Removal", "Retouch"),
     "toggle_flat_field": ShortcutEntry("", "Toggle Apply Flat Field", "Geometry"),
