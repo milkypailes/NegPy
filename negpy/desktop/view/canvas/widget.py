@@ -47,6 +47,7 @@ _TOOL_CURSORS: dict[ToolMode, Qt.CursorShape] = {
     ToolMode.CROP_MANUAL: Qt.CursorShape.CrossCursor,
     ToolMode.DUST_PICK: Qt.CursorShape.BlankCursor,
     ToolMode.HEAL_ERASE: Qt.CursorShape.CrossCursor,
+    ToolMode.SCAN_REGION: Qt.CursorShape.CrossCursor,
     ToolMode.CLONE: Qt.CursorShape.BlankCursor,
     ToolMode.LOCAL_DRAW: Qt.CursorShape.CrossCursor,
     ToolMode.LOCAL_OVAL: Qt.CursorShape.CrossCursor,
@@ -128,6 +129,7 @@ class ImageCanvas(QWidget):
     clone_stroke_completed = pyqtSignal(list)
     clone_source_picked = pyqtSignal(float, float)
     heal_erase_rect = pyqtSignal(list)
+    scan_region_picked = pyqtSignal(list)
     dust_exclusion_painted = pyqtSignal(list)
     straighten_completed = pyqtSignal(float)
     keystone_line_marked = pyqtSignal(str, float, float, float, float)
@@ -194,6 +196,7 @@ class ImageCanvas(QWidget):
         self.overlay.clone_stroke_completed.connect(self.clone_stroke_completed.emit)
         self.overlay.clone_source_picked.connect(self.clone_source_picked.emit)
         self.overlay.heal_erase_rect.connect(self.heal_erase_rect.emit)
+        self.overlay.scan_region_picked.connect(self.scan_region_picked.emit)
         self.overlay.dust_exclusion_painted.connect(self.dust_exclusion_painted.emit)
         self.overlay.straighten_completed.connect(self.straighten_completed.emit)
         self.overlay.keystone_line_marked.connect(self.keystone_line_marked.emit)

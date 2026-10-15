@@ -4,7 +4,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 
 from negpy.desktop.controller import AppController, heal_bypass_config
-from negpy.desktop.session import AppState, DesktopSessionManager
+from negpy.desktop.session import AppState, DesktopSessionManager, ToolMode
 from negpy.features.retouch.logic import (
     compute_dust_stats,
     detect_bright_luma_score,
@@ -417,3 +417,127 @@ class TestHealBypass(unittest.TestCase):
         self.assertTrue(task.config_override)
         self.assertEqual(task.memo_key, "")
         self.assertFalse(task.readback_metrics)
+
+
+def test_region_to_pixels_orders_and_clamps():
+    from negpy.features.retouch.logic import region_to_pixels
+
+    assert region_to_pixels((0.75, 0.75, 0.25, 0.25), (100, 200)) == (50, 25, 150, 75)
+    assert region_to_pixels((-0.5, -0.5, 2.0, 2.0), (100, 200)) == (0, 0, 200, 100)
+
+
+def test_region_to_pixels_degenerate_is_no_region():
+    from negpy.features.retouch.logic import region_to_pixels
+
+    assert region_to_pixels((0.5, 0.5, 0.5, 0.5), (100, 200)) is None
+    assert region_to_pixels((0.0, 0.0, 0.001, 0.001), (100, 200)) is None
+
+
+class TestDustScanDispatch(unittest.TestCase):
+    """The scan entry builds the worker task from the dialog choices."""
+
+    def setUp(self):
+        self.mock_session_manager = MagicMock(spec=DesktopSessionManager)
+        self.mock_session_manager.state = AppState()
+        self.mock_session_manager.repo = MagicMock()
+
+        with (
+            patch("negpy.desktop.controller.RenderWorker") as mock_rw_class,
+            patch("negpy.desktop.controller.PreviewManager") as mock_pm_class,
+        ):
+            mock_rw_class.return_value = MagicMock()
+            mock_pm_class.return_value = MagicMock(spec=PreviewManager)
+            mock_pm_class.return_value.load_linear_preview.return_value = (None, (0, 0), {})
+            self.controller = AppController(self.mock_session_manager)
+        self.controller.request_render = MagicMock()
+        self.controller.state.current_file_path = "/rolls/frame.tif"
+        self.controller.state.current_file_hash = "frame-hash"
+
+    def tearDown(self):
+        import gc
+
+        for thread in [
+            self.controller.render_thread,
+            self.controller.export_thread,
+            self.controller.thumb_thread,
+            self.controller.norm_thread,
+            self.controller.discovery_thread,
+            self.controller.preview_load_thread,
+            self.controller.prefetch_load_thread,
+            self.controller.scan_thread,
+        ]:
+            if thread is not None and thread.isRunning():
+                thread.quit()
+                thread.wait()
+        del self.controller
+        gc.collect()
+
+    def _dispatched_task(self):
+        tasks = []
+        self.controller.dust_scan_requested.connect(tasks.append)
+        return tasks
+
+    def test_defaults_repeat_the_plain_scan(self):
+        tasks = self._dispatched_task()
+
+        self.controller.scan_fullres_dust_to_heals()
+
+        self.assertEqual(len(tasks), 1)
+        self.assertEqual(tasks[0].polarity, "both")
+        self.assertIsNone(tasks[0].region)
+        self.assertEqual(self.controller._last_scan_polarity, "both")
+
+    def test_polarity_and_region_reach_the_task(self):
+        tasks = self._dispatched_task()
+
+        self.controller.scan_fullres_dust_to_heals(polarity="print_dark", region=(0.1, 0.2, 0.4, 0.5))
+
+        self.assertEqual(tasks[0].polarity, "print_dark")
+        self.assertEqual(tasks[0].region, (0.1, 0.2, 0.4, 0.5))
+        self.assertEqual(self.controller._last_scan_polarity, "print_dark")
+
+    def test_unknown_polarity_falls_back_to_both(self):
+        tasks = self._dispatched_task()
+
+        self.controller.scan_fullres_dust_to_heals(polarity="sideways")
+
+        self.assertEqual(tasks[0].polarity, "both")
+
+    def test_degenerate_region_falls_back_to_whole(self):
+        tasks = self._dispatched_task()
+
+        self.controller.scan_fullres_dust_to_heals(region=(0.5, 0.5, 0.5, 0.5))
+
+        self.assertIsNone(tasks[0].region)
+
+    def test_region_outside_the_frame_clips(self):
+        tasks = self._dispatched_task()
+
+        self.controller.scan_fullres_dust_to_heals(region=(-0.5, -0.5, 2.0, 0.4))
+
+        self.assertEqual(tasks[0].region, (0.0, 0.0, 1.0, 0.4))
+
+    def test_second_scan_while_running_is_dropped(self):
+        self.controller._dust_scan_running = True
+        tasks = self._dispatched_task()
+
+        self.controller.scan_fullres_dust_to_heals()
+
+        self.assertEqual(tasks, [])
+
+    def test_picked_region_returns_to_the_dialog(self):
+        self.controller.state.last_metrics["uv_grid"] = MagicMock()
+        with (
+            patch("negpy.desktop.controller.CoordinateMapping") as mock_map,
+            patch.object(self.controller, "open_dust_scan_dialog") as mock_open,
+        ):
+            mock_map.map_click_to_raw.side_effect = [(0.1, 0.2), (0.4, 0.5)]
+            self.controller.handle_scan_region_picked([(0.0, 0.0), (1.0, 1.0)])
+
+        self.assertEqual(self.controller.state.active_tool, ToolMode.NONE)
+        self.assertEqual(self.controller._pending_scan_region, ("frame-hash", (0.1, 0.2, 0.4, 0.5)))
+        mock_open.assert_called_once()
+
+    def test_begin_pick_arms_the_region_tool(self):
+        self.controller.begin_scan_region_pick()
+        self.assertEqual(self.controller.state.active_tool, ToolMode.SCAN_REGION)

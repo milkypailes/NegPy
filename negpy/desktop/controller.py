@@ -730,6 +730,8 @@ class AppController(QObject):
         self.dust_scan_worker = DustScanWorker()
         self.dust_scan_worker.moveToThread(self.norm_thread)
         self._dust_scan_running = False
+        self._last_scan_polarity = "both"
+        self._pending_scan_region: Optional[tuple] = None  # (file key, raw-normalized rect)
 
         self.discovery_thread = QThread()
         self.discovery_worker = AssetDiscoveryWorker()
@@ -4529,26 +4531,87 @@ class AppController(QObject):
         )
         self.request_render()
 
-    def scan_fullres_dust_to_heals(self) -> None:
+    def open_dust_scan_dialog(self) -> None:
+        """Offer the full-res dust scan options: which polarity to find, over the whole
+        image or a picked rectangle. Defaults repeat the previous run, so the plain
+        whole-image scan stays one accept away."""
+        from negpy.desktop.view.widgets.dust_scan_dialog import DustScanDialog
+
+        if self._dust_scan_running or not self.state.current_file_path:
+            if not self.state.current_file_path:
+                self.set_status("Open a frame before scanning for dust", 3000, kind="warning")
+            return
+        file_key = self.state.current_file_hash or self.state.current_file_path
+        initial_region = self._pending_scan_region[1] if self._pending_scan_region and self._pending_scan_region[0] == file_key else None
+        dialog = DustScanDialog(
+            initial_polarity=self._last_scan_polarity,
+            initial_region=initial_region,
+            parent=None,
+            repo=self.session.repo,
+        )
+        dialog.select_requested.connect(dialog.reject)
+        dialog.select_requested.connect(self.begin_scan_region_pick)
+        if not dialog.exec():
+            return
+        self._last_scan_polarity = dialog.polarity_value()
+        self.scan_fullres_dust_to_heals(polarity=dialog.polarity_value(), region=dialog.region_value())
+
+    def begin_scan_region_pick(self) -> None:
+        """Close the dialog path and arm the canvas rectangle picker; the completed
+        drag reopens the dialog with the rectangle set."""
+        if self._dust_scan_running:
+            return
+        self.set_active_tool(ToolMode.SCAN_REGION)
+        self.set_status("Drag a rectangle over the photo to scan that area", 0)
+
+    def handle_scan_region_picked(self, viewport_pts: list) -> None:
+        """Store a picked scan rectangle (raw-frame normalized) and return to the dialog."""
+        with self.state.metrics_lock:
+            uv_grid = self.state.last_metrics.get("uv_grid")
+        self.set_active_tool(ToolMode.NONE)
+        if uv_grid is None or len(viewport_pts) < 2:
+            self.set_status("", 0)
+            return
+        raw_pts = [CoordinateMapping.map_click_to_raw(nx, ny, uv_grid) for nx, ny in viewport_pts[:2]]
+        (x1, y1), (x2, y2) = raw_pts
+        rect = (min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))
+        self._pending_scan_region = (self.state.current_file_hash or self.state.current_file_path, rect)
+        self.set_status("", 0)
+        self.open_dust_scan_dialog()
+
+    def scan_fullres_dust_to_heals(self, polarity: str = "both", region: Optional[tuple] = None) -> None:
         """Detect dust on the full-resolution decode and keep each hit as a manual heal.
 
         The interactive render detects at preview scale, where a sub-pixel speck dilutes
-        below the grain. This re-runs the same optical gate at 1:1 and appends one spot
-        heal per component, so false positives stay individually deletable on the canvas.
+        below the grain. This re-runs the optical gates at 1:1 and appends one stroke
+        per component, so false positives stay individually deletable on the canvas.
+        ``polarity`` is print-domain ("print_bright", "print_dark", "both"); ``region``
+        a raw-normalized rect covered instead of the whole image. Defaults repeat the
+        original whole-image scan.
         """
         from negpy.desktop.workers.dust_scan import DustScanTask
 
+        if polarity not in ("print_bright", "print_dark", "both"):
+            polarity = "both"
+        if region is not None:
+            x1, y1, x2, y2 = (float(v) for v in region)
+            region = (min(max(x1, 0.0), 1.0), min(max(y1, 0.0), 1.0), min(max(x2, 0.0), 1.0), min(max(y2, 0.0), 1.0))
+            if not (region[2] > region[0] and region[3] > region[1]):
+                region = None
         if self._dust_scan_running:
             return
         path = self.state.current_file_path
         if not path:
             self.set_status("Open a frame before scanning for dust", 3000, kind="warning")
             return
+        self._last_scan_polarity = polarity
         key = self.state.current_file_hash or path
-        task = DustScanTask(file_path=path, config=self.state.config, key=key, half=self._active_half())
+        task = DustScanTask(file_path=path, config=self.state.config, key=key, half=self._active_half(), polarity=polarity, region=region)
         self._dust_scan_running = True
         self.dust_scan_running_changed.emit(True)
-        self.set_status("Scanning full resolution for dust…", 0)
+        what = {"print_bright": "bright dust", "print_dark": "dark dust", "both": "dust"}[polarity]
+        where = " in the selected area" if region is not None else ""
+        self.set_status(f"Scanning full resolution for {what}{where}…", 0)
         self.dust_scan_requested.emit(task)
 
     def _on_dust_scan_started(self) -> None:

@@ -497,6 +497,24 @@ def exclusion_token(retouch) -> str:
 # otherwise return thousands of strokes, each a config entry the render re-gates.
 _FULLRES_SCAN_MAX_STROKES = 400
 
+# Minimum scan-region extent in buffer pixels. Below this the detection windows have
+# nothing to read against; the worker falls back to the whole frame.
+_SCAN_REGION_MIN_PX = 8
+
+
+def region_to_pixels(rect: Tuple[float, float, float, float], shape: Tuple[int, int]) -> Optional[Tuple[int, int, int, int]]:
+    """Normalized ``(x1, y1, x2, y2)`` scan region → clamped ``(x0, y0, x1, y1)`` buffer
+    pixels, ordered. None when the box collapses below the pixels the detection
+    windows need, which the worker reads as no region."""
+    h, w = int(shape[0]), int(shape[1])
+    ax, ay, bx, by = (float(v) for v in rect)
+    x0, x1 = sorted((min(max(ax, 0.0), 1.0) * w, min(max(bx, 0.0), 1.0) * w))
+    y0, y1 = sorted((min(max(ay, 0.0), 1.0) * h, min(max(by, 0.0), 1.0) * h))
+    x0, y0, x1, y1 = int(x0), int(y0), int(min(x1, w)), int(min(y1, h))
+    if x1 - x0 < _SCAN_REGION_MIN_PX or y1 - y0 < _SCAN_REGION_MIN_PX:
+        return None
+    return x0, y0, x1, y1
+
 
 def segment_intersects_rect(x0: float, y0: float, x1: float, y1: float, rect: Tuple[float, float, float, float]) -> bool:
     """Whether the segment touches the normalized ``(x1, y1, x2, y2)`` rect: an endpoint

@@ -188,6 +188,7 @@ _TOOL_ROWS: dict[ToolMode, tuple[str, str, str]] = {
     ),
     ToolMode.HEAL_ERASE: ("Erase Heals", "Drag a rectangle; every manual heal inside it is deleted", ""),
     ToolMode.CLONE: ("Clone", "Paint over the defect; the dashed circle marks the source, Alt-click picks a new one", _BRUSH_SIZE),
+    ToolMode.SCAN_REGION: ("Scan Region", "Drag the rectangle the dust scan covers, then pick the dust to find", ""),
     ToolMode.LOCAL_DRAW: ("Draw Mask", "Click to place vertices; a click near the start closes the mask", ""),
     ToolMode.LOCAL_OVAL: ("Oval Mask", "Drag out an oval", ""),
     ToolMode.LOCAL_GRADIENT: ("Card Edge", "Drag from the full-exposure edge to where it fades out", ""),

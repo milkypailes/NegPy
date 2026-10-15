@@ -16,13 +16,18 @@ class DustScanTask:
     ``config`` is the edit at dispatch: decode params plus the dust thresholds, size
     and exclusion strokes the scan runs with. ``key`` identifies the frame the scan
     left (content hash + fork suffix); the controller drops results that arrive after
-    the user moved on. ``half`` is the active half-frame slice, if any.
+    the user moved on. ``half`` is the active half-frame slice, if any. ``polarity``
+    is print-domain ("print_bright", "print_dark", "both"). ``region`` is an optional
+    raw-normalized rect covered instead of the whole image; coordinates follow the
+    half slice, like the strokes they produce.
     """
 
     file_path: str
     config: WorkspaceConfig
     key: str
     half: Optional[tuple] = None
+    polarity: str = "both"
+    region: Optional[tuple] = None
 
 
 class DustScanWorker(QObject):
@@ -52,6 +57,7 @@ class DustScanWorker(QObject):
             drop_exclusions,
             dust_detections_to_heal_strokes,
             filter_strokes_by_score,
+            region_to_pixels,
             strokes_to_score,
         )
 
@@ -63,18 +69,45 @@ class DustScanWorker(QObject):
                 half, split_x, crop_rect, gutter, axis = task.half
                 if half:
                     f32, _ir = ImageProcessor._slice_half_source(f32, _ir, half, split_x, crop_rect, gutter, axis)
-            stats = compute_dust_stats(f32, int(ret.dust_size))
-            dark, hair = detect_luma_score(
-                f32,
-                float(ret.dust_threshold),
-                int(ret.dust_size),
-                stats=stats,
-                hair_threshold=float(ret.dust_hair_threshold),
-            )
-            bright = detect_bright_luma_score(f32, float(ret.dust_threshold), int(ret.dust_size))
+            # A region scans its crop alone, then pastes the verdict back onto the full
+            # frame: conversion and verification stay in raw-frame coordinates, and a
+            # defect straddling the rim keeps the repair on the side inside.
+            detect_img = f32
+            bounds = region_to_pixels(task.region, f32.shape[:2]) if task.region is not None else None
+            if bounds is not None:
+                x0, y0, x1, y1 = bounds
+                detect_img = np.ascontiguousarray(f32[y0:y1, x0:x1])
+            stats = compute_dust_stats(detect_img, int(ret.dust_size))
+            dark, hair = None, None
+            if task.polarity in ("print_bright", "both"):
+                dark, hair = detect_luma_score(
+                    detect_img,
+                    float(ret.dust_threshold),
+                    int(ret.dust_size),
+                    stats=stats,
+                    hair_threshold=float(ret.dust_hair_threshold),
+                )
+            bright = None
+            if task.polarity in ("print_dark", "both"):
+                bright = detect_bright_luma_score(detect_img, float(ret.dust_threshold), int(ret.dust_size))
             sides = [s for s in (dark, bright) if s is not None]
             score = sides[0] if len(sides) == 1 else (np.minimum(*sides).astype(np.float32) if sides else None)
+            if bounds is not None:
+                x0, y0, x1, y1 = bounds
+                h, w = f32.shape[:2]
+                full = np.ones((h, w), dtype=np.float32)
+                if score is not None:
+                    full[y0:y1, x0:x1] = score
+                score = full
+                full_hairs = []
+                for hm in [hair] if hair is not None else []:
+                    plane = np.zeros((h, w), dtype=np.uint8)
+                    plane[y0:y1, x0:x1] = (np.asarray(hm) > 0).astype(np.uint8)
+                    full_hairs.append(plane)
+                hair = full_hairs[0] if full_hairs else None
             score, hair = drop_exclusions(score, hair, list(ret.dust_exclusion_strokes))
+            hairs: List = [hair] if hair is not None else []
+            strokes = dust_detections_to_heal_strokes(score, hairs, f32.shape[:2])
             hairs: List = [hair] if hair is not None else []
             strokes = dust_detections_to_heal_strokes(score, hairs, f32.shape[:2])
             # The manual bake re-gates every stroke by local contrast on this same

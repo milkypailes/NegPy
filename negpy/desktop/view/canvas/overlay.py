@@ -311,6 +311,7 @@ class CanvasOverlay(QWidget):
     clone_stroke_completed = pyqtSignal(list)  # viewport-normalized points
     clone_source_picked = pyqtSignal(float, float)  # viewport-normalized x, y
     heal_erase_rect = pyqtSignal(list)  # two viewport-normalized corners of the deletion rect
+    scan_region_picked = pyqtSignal(list)  # two viewport-normalized corners of the scan region
     dust_exclusion_painted = pyqtSignal(list)  # viewport-normalized points of a right-drag
     local_mask_selected = pyqtSignal(int)
     local_mask_edited = pyqtSignal(int, list)  # (mask index, viewport-normalized vertices)
@@ -374,6 +375,9 @@ class CanvasOverlay(QWidget):
         # Erase-tool rubber band: opposite corners of the deletion rect, viewport px.
         self._erase_p1: Optional[QPointF] = None
         self._erase_p2: Optional[QPointF] = None
+        # Scan-region rubber band: same shape, feeding the dust-scan dialog.
+        self._scan_p1: Optional[QPointF] = None
+        self._scan_p2: Optional[QPointF] = None
         # Right-drag path painting an optical-removal exclusion. Non-empty from the press to
         # the release, which is also what holds the context menu back (contextMenuEvent).
         self._exclude_drag_pts: List[QPointF] = []
@@ -595,6 +599,9 @@ class CanvasOverlay(QWidget):
         if mode != ToolMode.HEAL_ERASE:
             self._erase_p1 = None
             self._erase_p2 = None
+        if mode != ToolMode.SCAN_REGION:
+            self._scan_p1 = None
+            self._scan_p2 = None
         if mode not in _BRUSH_TOOLS:
             self._heal_drag_pts = []
         if mode != ToolMode.STRAIGHTEN:
@@ -672,6 +679,11 @@ class CanvasOverlay(QWidget):
             return True
         if self._tool_mode == ToolMode.SCRATCH_PICK and self._scratch_pts:
             self._scratch_pts = []
+            self.update()
+            return True
+        if self._tool_mode == ToolMode.SCAN_REGION and self._scan_p1 is not None:
+            self._scan_p1 = None
+            self._scan_p2 = None
             self.update()
             return True
         if self._tool_mode == ToolMode.STRAIGHTEN and self._straighten_p1 is not None:
@@ -1105,7 +1117,14 @@ class CanvasOverlay(QWidget):
             self._draw_lasso_in_progress(painter)
         if self._tool_mode in (ToolMode.LOCAL_OVAL, ToolMode.LOCAL_GRADIENT):
             self._draw_shape_in_progress(painter)
-        if self._tool_mode in (ToolMode.DUST_PICK, ToolMode.SCRATCH_PICK, ToolMode.SCRATCH_LINE, ToolMode.HEAL_ERASE, ToolMode.CLONE):
+        if self._tool_mode in (
+            ToolMode.DUST_PICK,
+            ToolMode.SCRATCH_PICK,
+            ToolMode.SCRATCH_LINE,
+            ToolMode.HEAL_ERASE,
+            ToolMode.SCAN_REGION,
+            ToolMode.CLONE,
+        ):
             self._draw_placed_heals(painter)
         if self._tool_mode == ToolMode.SCRATCH_LINE:
             self._draw_line_hover(painter)
@@ -1126,6 +1145,8 @@ class CanvasOverlay(QWidget):
             self._draw_straighten_line(painter)
         if self._tool_mode == ToolMode.HEAL_ERASE:
             self._draw_erase_rect(painter)
+        if self._tool_mode == ToolMode.SCAN_REGION:
+            self._draw_scan_rect(painter)
         if self._tool_mode == ToolMode.KEYSTONE_LINES:
             self._draw_keystone_lines_tool(painter)
 
@@ -1516,13 +1537,20 @@ class CanvasOverlay(QWidget):
     def _draw_erase_rect(self, painter: QPainter) -> None:
         """Rubber band of the erase-tool drag: the rectangle whose manual heals are
         deleted on release."""
-        if self._erase_p1 is None or self._erase_p2 is None:
+        self._draw_marquee_rect(painter, self._erase_p1, self._erase_p2)
+
+    def _draw_scan_rect(self, painter: QPainter) -> None:
+        """Rubber band of the scan-region drag: the rectangle the dust scan covers."""
+        self._draw_marquee_rect(painter, self._scan_p1, self._scan_p2)
+
+    def _draw_marquee_rect(self, painter: QPainter, p1: Optional[QPointF], p2: Optional[QPointF]) -> None:
+        if p1 is None or p2 is None:
             return
         pen = QPen(Qt.GlobalColor.white, 1.5, Qt.PenStyle.DashLine)
         pen.setCosmetic(True)
         painter.setPen(pen)
         painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.drawRect(QRectF(self._erase_p1, self._erase_p2).normalized())
+        painter.drawRect(QRectF(p1, p2).normalized())
 
     def _classify_keystone_edge(self, p1: QPointF, p2: QPointF) -> str:
         dx, dy = p2.x() - p1.x(), p2.y() - p1.y()
@@ -2813,6 +2841,14 @@ class CanvasOverlay(QWidget):
             event.accept()
             return
 
+        if self._tool_mode == ToolMode.SCAN_REGION:
+            if self._content_view_rect().contains(event.position()):
+                self._scan_p1 = event.position()
+                self._scan_p2 = event.position()
+                self.update()
+            event.accept()
+            return
+
         if self._tool_mode == ToolMode.CLONE and event.modifiers() & Qt.KeyboardModifier.AltModifier:
             coords = self._map_to_image_coords(event.position())
             if coords is not None:
@@ -3112,6 +3148,16 @@ class CanvasOverlay(QWidget):
         if self._tool_mode == ToolMode.HEAL_ERASE and self._erase_p1 is not None and event.buttons() & Qt.MouseButton.LeftButton:
             rect = self._content_view_rect()
             self._erase_p2 = QPointF(
+                float(np.clip(event.position().x(), rect.left(), rect.right())),
+                float(np.clip(event.position().y(), rect.top(), rect.bottom())),
+            )
+            self.update()
+            event.accept()
+            return
+
+        if self._tool_mode == ToolMode.SCAN_REGION and self._scan_p1 is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            rect = self._content_view_rect()
+            self._scan_p2 = QPointF(
                 float(np.clip(event.position().x(), rect.left(), rect.right())),
                 float(np.clip(event.position().y(), rect.top(), rect.bottom())),
             )
@@ -3488,6 +3534,24 @@ class CanvasOverlay(QWidget):
                 c1, c2 = self._map_to_image_coords(p1), self._map_to_image_coords(p2)
                 if c1 is not None and c2 is not None:
                     self.heal_erase_rect.emit([c1, c2])
+            self.update()
+            event.accept()
+            return
+
+        # Same ownership: a region drag never starts under pan either.
+        if self._tool_mode == ToolMode.SCAN_REGION and self._scan_p1 is not None and event.button() == Qt.MouseButton.LeftButton:
+            rect = self._content_view_rect()
+            p1 = self._scan_p1
+            p2 = QPointF(
+                float(np.clip(event.position().x(), rect.left(), rect.right())),
+                float(np.clip(event.position().y(), rect.top(), rect.bottom())),
+            )
+            self._scan_p1 = None
+            self._scan_p2 = None
+            if math.hypot(p2.x() - p1.x(), p2.y() - p1.y()) >= 8.0:
+                c1, c2 = self._map_to_image_coords(p1), self._map_to_image_coords(p2)
+                if c1 is not None and c2 is not None:
+                    self.scan_region_picked.emit([c1, c2])
             self.update()
             event.accept()
             return

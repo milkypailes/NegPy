@@ -37,8 +37,8 @@ _RIGHT_CLICK_TIP = (
     "Right-drag paints a band either way."
 )
 _FULLRES_TIP = (
-    "Detect dust on the full-resolution scan instead of the preview, and keep each hit as a manual heal. "
-    "Catches sub-pixel specks the preview dilutes below the grain, both scanner dust and unexposed spots that print dark. "
+    "Scan the full-resolution image for dust and keep each hit as a manual heal. "
+    "Pick bright dust, dark dust or both, over the whole image or a rectangle. "
     "Runs in the background; right-click a placed heal on the canvas to delete a false positive."
 )
 
@@ -239,7 +239,7 @@ class RetouchSidebar(BaseSidebar):
         self.clone_clear_btn.clicked.connect(self.controller.clear_clones)
         self.undo_btn.clicked.connect(self.controller.undo_last_retouch)
         self.clear_btn.clicked.connect(self.controller.clear_retouch)
-        self.fullres_btn.clicked.connect(self.controller.scan_fullres_dust_to_heals)
+        self.fullres_btn.clicked.connect(self.controller.open_dust_scan_dialog)
         self.controller.dust_scan_running_changed.connect(self._on_dust_scan_running)
         self.overlay_btn.currentChanged.connect(lambda i: self.controller.set_dust_overlay(_OVERLAY_MODES[i]))
 

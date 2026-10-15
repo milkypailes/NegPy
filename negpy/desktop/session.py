@@ -59,6 +59,7 @@ class ToolMode(Enum):
     SCRATCH_PICK = auto()
     SCRATCH_LINE = auto()
     HEAL_ERASE = auto()
+    SCAN_REGION = auto()
     CLONE = auto()
     LOCAL_DRAW = auto()
     LOCAL_OVAL = auto()
