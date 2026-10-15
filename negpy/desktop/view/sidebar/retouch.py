@@ -38,7 +38,7 @@ _RIGHT_CLICK_TIP = (
 )
 _FULLRES_TIP = (
     "Detect dust on the full-resolution scan instead of the preview, and keep each hit as a manual heal. "
-    "Catches sub-pixel specks the preview dilutes below the grain. "
+    "Catches sub-pixel specks the preview dilutes below the grain, both scanner dust and unexposed spots that print dark. "
     "Runs in the background; right-click a placed heal on the canvas to delete a false positive."
 )
 

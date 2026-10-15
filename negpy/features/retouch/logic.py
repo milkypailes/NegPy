@@ -383,6 +383,57 @@ def detect_luma_score(
     return score, hair_mask
 
 
+def detect_bright_luma_score(img: ImageBuffer, dust_threshold: float, dust_size: int) -> Optional[np.ndarray]:
+    """Bright-side mirror of ``detect_luma_score`` for unexposed dust: film the camera
+    never exposed stays clear, so it reads as a luminance surplus against the exposed
+    film around it. Measured in linear space, not density: density is logarithmic, so a
+    bright speck's deficit is squashed by the proxy normalization while a dark speck's
+    excess is unbounded. Morphology mirrors too (close keeps bright marks, background
+    takes the minimum), with the same seed bar, grain-relative σ and hysteresis. The
+    texture ramp is measured on the same linear proxy: uniform areas (sky, walls) keep
+    full sensitivity, busy film only reports strong outliers. Everything stays compact,
+    since long marks tile into spots at conversion. Returns the fill score, or None
+    when nothing clears the bar. Scan-only: highlights and speculars clear this bar,
+    so it runs where each hit stays individually deletable."""
+    hi_bar = detect_bar(dust_threshold)
+    if not math.isfinite(hi_bar):
+        return None
+    lin = get_luminance(img).astype(np.float32)
+    white = max(float(np.percentile(lin, 99.5)), 1e-6)
+    # Gain-invariant like the density z: a gain scales the surplus and its σ together.
+    # Normalized by level, not range, so flat film cannot squash the surplus the way
+    # the density spread floor would.
+    proxy = np.ascontiguousarray(lin / white)
+    base_size = max(1.0, float(dust_size)) * film_scale(proxy.shape)
+    v_win = int(max(3, base_size * 3.0)) * 2 + 1
+    w_win = _texture_win(proxy.shape, dust_size)
+    clipped = np.clip(proxy, 0.0, 1.0)
+    disk = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * int(round(base_size)) + 1,) * 2)
+    background = np.minimum(
+        cv2.medianBlur(_u8(clipped), v_win).astype(np.float32) / 255.0, cv2.morphologyEx(clipped, cv2.MORPH_CLOSE, disk)
+    )
+    excess = cv2.blur(proxy - background, (_DETECT_AVG_PX, _DETECT_AVG_PX))
+    mad = cv2.medianBlur(_u8(np.abs(excess) * _DETECT_MAD_GAIN), w_win).astype(np.float32) / (255.0 * _DETECT_MAD_GAIN)
+    z = excess / np.maximum(mad / 0.6745, _DETECT_SIGMA_MIN)
+    _, texture = _box_mean_std(proxy, w_win)
+    seeds = z >= hi_bar
+    if not np.any(seeds):
+        return None
+    scale = film_scale(proxy.shape)
+    lo = max(_DETECT_Z_GROW, hi_bar * _DETECT_Z_GROW_FRAC)
+    reach = int(round(_DETECT_GROW_REACH * max(1, dust_size) * scale))
+    near = cv2.dilate(seeds.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * reach + 1,) * 2)) > 0
+    n_lbl, lab, _, _ = cv2.connectedComponentsWithStats((near & (z >= lo)).astype(np.uint8), connectivity=8)
+    bar = hi_bar * (1.0 + _DETECT_TEXTURE_GAIN * np.maximum(texture - _DETECT_TEXTURE_KNEE, 0.0))
+    keep = np.zeros(n_lbl, dtype=bool)
+    keep[np.unique(lab[seeds & (z >= bar)])] = True
+    keep[0] = False
+    if not keep.any():
+        return None
+    hit = keep[lab].astype(np.uint8)
+    return _mask_to_score(hit, _DETECT_PAD_PX * scale) if hit.any() else None
+
+
 def exclusion_cover(strokes: List[Tuple], shape: Tuple[int, int]) -> np.ndarray:
     """Excluded strokes → their binary footprint on a plane of ``shape``. A stroke is the
     band its whole path sweeps, not its sampled points: the drag is sampled sparsely and

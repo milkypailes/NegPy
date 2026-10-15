@@ -7,6 +7,7 @@ from negpy.desktop.controller import AppController
 from negpy.desktop.session import AppState, DesktopSessionManager
 from negpy.features.retouch.logic import (
     compute_dust_stats,
+    detect_bright_luma_score,
     detect_luma_score,
     dust_detections_to_heal_strokes,
     filter_strokes_by_score,
@@ -88,6 +89,62 @@ def test_filter_keeps_strokes_the_manual_gate_refires():
     manual = strokes_to_score(img, strokes, [])
     kept, dropped = filter_strokes_by_score(strokes, manual, img.shape[:2])
     assert len(kept) == len(strokes) and not dropped
+
+
+def _unexposed_speck_source(h=160, w=160, seed=42):
+    rng = np.random.default_rng(seed)
+    img = (np.full((h, w, 3), 0.18) * (1.0 + rng.normal(0, 0.02, (h, w, 3)))).astype(np.float32)
+    img[80:83, 80:83] = 0.70  # unexposed: clear on the negative, bright on the scan
+    return img
+
+
+def test_detect_bright_luma_score_finds_unexposed_speck():
+    img = _unexposed_speck_source()
+    score = detect_bright_luma_score(img, dust_threshold=0.66, dust_size=4)
+    assert score is not None
+    assert score[80:83, 80:83].max() < 1.0, "the unexposed speck must be scored as a defect"
+    ys, xs = np.where(score < 1.0)
+    assert abs(float(xs.mean()) - 81.5) < 5.0 and abs(float(ys.mean()) - 81.5) < 5.0
+
+
+def test_detect_bright_luma_score_clean_frame_is_empty():
+    assert detect_bright_luma_score(_grainy(160, 160), 0.66, 4) is None
+
+
+def test_detect_bright_luma_score_threshold_off_is_empty():
+    assert detect_bright_luma_score(_unexposed_speck_source(), 1.0, 4) is None
+
+
+def test_bright_roundtrip_repairs_a_detected_speck():
+    """Bright speck → convert → manual bake finds something, like the dark side."""
+    img = _unexposed_speck_source()
+    score = detect_bright_luma_score(img, 0.66, 4)
+    assert score is not None
+    strokes = dust_detections_to_heal_strokes(score, [], img.shape[:2])
+    assert strokes
+    manual = strokes_to_score(img, strokes, [])
+    assert manual is not None and (manual < 1.0).any()
+    kept, dropped = filter_strokes_by_score(strokes, manual, img.shape[:2])
+    assert len(kept) == len(strokes) and not dropped
+
+
+def test_merged_dark_and_bright_scores_convert_both():
+    """The worker's minimum-merge of both sides converts every component."""
+    rng = np.random.default_rng(9)
+    h = w = 1600
+    img = (np.full((h, w, 3), 0.18) * (1.0 + rng.normal(0, 0.02, (h, w, 3)))).astype(np.float32)
+    img[400:403, 400:403] = 0.005  # scanner dust: dark on the scan
+    img[1200:1203, 1200:1203] = 0.70  # unexposed dust: bright on the scan
+    stats = compute_dust_stats(img, 4)
+    dark, _ = detect_luma_score(img, 0.66, 4, stats=stats, hair_threshold=1.0)
+    bright = detect_bright_luma_score(img, 0.66, 4)
+    assert dark is not None and bright is not None
+    merged = np.minimum(dark, bright).astype(np.float32)
+    strokes = dust_detections_to_heal_strokes(merged, [], img.shape[:2])
+    assert len(strokes) == 2
+    manual = strokes_to_score(img, strokes, [])
+    kept, dropped = filter_strokes_by_score(strokes, manual, img.shape[:2])
+    assert len(kept) == 2 and not dropped
 
 
 def test_filter_drops_strokes_on_clean_film():
