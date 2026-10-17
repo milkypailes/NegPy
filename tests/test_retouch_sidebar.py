@@ -29,6 +29,17 @@ def test_right_click_toggle_sits_beside_optical_removal(qapp):
     assert sb.right_click_btn.isCheckable() and sb.right_click_btn.text() == "", "an icon-only toggle"
 
 
+def test_the_two_dust_scans_sit_in_one_row(qapp):
+    _, sb = _sidebar()
+    row = next(
+        lay
+        for i in range(sb.layout.count())
+        if (lay := sb.layout.itemAt(i).layout()) is not None and any(lay.itemAt(j).widget() is sb.fullres_btn for j in range(lay.count()))
+    )
+    assert [row.itemAt(j).widget() for j in range(row.count())] == [sb.fullres_btn, sb.region_btn]
+    assert not sb.region_btn.isCheckable(), "a one-shot action, not a tool toggle"
+
+
 def test_right_click_toggle_reads_the_session_setting(qapp):
     controller, sb = _sidebar()
     controller.state.right_click_excludes = True

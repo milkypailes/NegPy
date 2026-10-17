@@ -525,19 +525,18 @@ class TestDustScanDispatch(unittest.TestCase):
 
         self.assertEqual(tasks, [])
 
-    def test_picked_region_returns_to_the_dialog(self):
+    def test_picked_region_returns_to_the_scan_dialog(self):
         self.controller.state.last_metrics["uv_grid"] = MagicMock()
         with (
             patch("negpy.desktop.controller.CoordinateMapping") as mock_map,
-            patch.object(self.controller, "open_dust_scan_dialog") as mock_open,
+            patch.object(self.controller, "_run_dust_scan_dialog") as mock_open,
         ):
             mock_map.map_click_to_raw.side_effect = [(0.1, 0.2), (0.4, 0.5)]
             self.controller.handle_scan_region_picked([(0.0, 0.0), (1.0, 1.0)])
 
         self.assertEqual(self.controller.state.active_tool, ToolMode.NONE)
-        self.assertEqual(self.controller._pending_scan_region, ("frame-hash", (0.1, 0.2, 0.4, 0.5)))
-        mock_open.assert_called_once()
+        mock_open.assert_called_once_with(region=(0.1, 0.2, 0.4, 0.5))
 
-    def test_begin_pick_arms_the_region_tool(self):
-        self.controller.begin_scan_region_pick()
+    def test_region_scan_button_arms_the_pick_tool(self):
+        self.controller.open_scan_region_dialog()
         self.assertEqual(self.controller.state.active_tool, ToolMode.SCAN_REGION)

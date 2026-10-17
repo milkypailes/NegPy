@@ -37,8 +37,13 @@ _RIGHT_CLICK_TIP = (
     "Right-drag paints a band either way."
 )
 _FULLRES_TIP = (
-    "Scan the full-resolution image for dust and keep each hit as a manual heal. "
-    "Pick bright dust, dark dust or both, over the whole image or a rectangle. "
+    "Scan the whole full-resolution image for dust and keep each hit as a manual heal. "
+    "Pick bright dust, dark dust or both. "
+    "Runs in the background; right-click a placed heal on the canvas to delete a false positive."
+)
+_REGION_SCAN_TIP = (
+    "Scan part of the full-resolution image: drag a rectangle over the photo, then pick the dust to find. "
+    "Only marks inside the rectangle are repaired. "
     "Runs in the background; right-click a placed heal on the canvas to delete a false positive."
 )
 
@@ -78,7 +83,12 @@ class RetouchSidebar(BaseSidebar):
         self.auto_size_slider = CompactSlider("Size", 2.0, 8.0, float(conf.dust_size), step=1.0, precision=1, unit=" px")
         self.layout.addWidget(SliderGroup(self.threshold_slider, self.hair_threshold_slider, self.auto_size_slider))
         self.fullres_btn = self._labeled_action("fa5s.search-plus", "Full-Res Scan", _FULLRES_TIP)
-        self.layout.addWidget(self.fullres_btn)
+        self.region_btn = self._labeled_action("fa5s.vector-square", "Scan Region", _REGION_SCAN_TIP)
+        self._scan_source = self.fullres_btn
+        scan_row = QHBoxLayout()
+        scan_row.addWidget(self.fullres_btn, 1)
+        scan_row.addWidget(self.region_btn, 1)
+        self.layout.addLayout(scan_row)
 
         self.ir_dust_btn = self._small_toggle("fa5s.broom", "IR Removal", conf.ir_dust_remove, _IR_REMOVAL_TIP, align_left=True)
         self.ir_method_btn = ChoiceButton(tuple(("", label) for label in _IR_METHOD_LABELS), "")
@@ -239,7 +249,8 @@ class RetouchSidebar(BaseSidebar):
         self.clone_clear_btn.clicked.connect(self.controller.clear_clones)
         self.undo_btn.clicked.connect(self.controller.undo_last_retouch)
         self.clear_btn.clicked.connect(self.controller.clear_retouch)
-        self.fullres_btn.clicked.connect(self.controller.open_dust_scan_dialog)
+        self.fullres_btn.clicked.connect(self._on_fullres_scan_clicked)
+        self.region_btn.clicked.connect(self._on_region_scan_clicked)
         self.controller.dust_scan_running_changed.connect(self._on_dust_scan_running)
         self.overlay_btn.currentChanged.connect(lambda i: self.controller.set_dust_overlay(_OVERLAY_MODES[i]))
 
@@ -289,9 +300,18 @@ class RetouchSidebar(BaseSidebar):
             w.setEnabled(enabled)
             w.setToolTip(tip if enabled else "No IR channel in this scan")
 
+    def _on_fullres_scan_clicked(self) -> None:
+        self._scan_source = self.fullres_btn
+        self.controller.open_dust_scan_dialog()
+
+    def _on_region_scan_clicked(self) -> None:
+        self._scan_source = self.region_btn
+        self.controller.open_scan_region_dialog()
+
     def _on_dust_scan_running(self, running: bool) -> None:
-        self.fullres_btn.setEnabled(not running)
-        self.fullres_btn.setText("Scanning…" if running else "Full-Res Scan")
+        for btn, label in ((self.fullres_btn, "Full-Res Scan"), (self.region_btn, "Scan Region")):
+            btn.setEnabled(not running)
+            btn.setText("Scanning…" if running and btn is self._scan_source else label)
 
     def sync_ui(self) -> None:
         conf = self.state.config.retouch

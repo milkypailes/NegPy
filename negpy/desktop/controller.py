@@ -731,7 +731,6 @@ class AppController(QObject):
         self.dust_scan_worker.moveToThread(self.norm_thread)
         self._dust_scan_running = False
         self._last_scan_polarity = "both"
-        self._pending_scan_region: Optional[tuple] = None  # (file key, raw-normalized rect)
 
         self.discovery_thread = QThread()
         self.discovery_worker = AssetDiscoveryWorker()
@@ -4532,40 +4531,39 @@ class AppController(QObject):
         self.request_render()
 
     def open_dust_scan_dialog(self) -> None:
-        """Offer the full-res dust scan options: which polarity to find, over the whole
-        image or a picked rectangle. Defaults repeat the previous run, so the plain
-        whole-image scan stays one accept away."""
+        """Whole-image full-res dust scan: offer the polarity, then scan end to end."""
+        self._run_dust_scan_dialog(region=None)
+
+    def open_scan_region_dialog(self) -> None:
+        """Arm the canvas rectangle picker; the polarity dialog opens when the drag ends."""
+        if self._dust_scan_running:
+            return
+        if not self.state.current_file_path:
+            self.set_status("Open a frame before scanning for dust", 3000, kind="warning")
+            return
+        self.set_status("Drag a rectangle over the photo to scan that area", 0)
+        self.set_active_tool(ToolMode.SCAN_REGION)
+
+    def _run_dust_scan_dialog(self, region: Optional[tuple]) -> None:
+        """Offer the polarity choices, then dispatch the scan over ``region`` or the whole frame."""
         from negpy.desktop.view.widgets.dust_scan_dialog import DustScanDialog
 
         if self._dust_scan_running or not self.state.current_file_path:
             if not self.state.current_file_path:
                 self.set_status("Open a frame before scanning for dust", 3000, kind="warning")
             return
-        file_key = self.state.current_file_hash or self.state.current_file_path
-        initial_region = self._pending_scan_region[1] if self._pending_scan_region and self._pending_scan_region[0] == file_key else None
         dialog = DustScanDialog(
             initial_polarity=self._last_scan_polarity,
-            initial_region=initial_region,
             parent=None,
             repo=self.session.repo,
         )
-        dialog.select_requested.connect(dialog.reject)
-        dialog.select_requested.connect(self.begin_scan_region_pick)
         if not dialog.exec():
             return
         self._last_scan_polarity = dialog.polarity_value()
-        self.scan_fullres_dust_to_heals(polarity=dialog.polarity_value(), region=dialog.region_value())
-
-    def begin_scan_region_pick(self) -> None:
-        """Close the dialog path and arm the canvas rectangle picker; the completed
-        drag reopens the dialog with the rectangle set."""
-        if self._dust_scan_running:
-            return
-        self.set_active_tool(ToolMode.SCAN_REGION)
-        self.set_status("Drag a rectangle over the photo to scan that area", 0)
+        self.scan_fullres_dust_to_heals(polarity=dialog.polarity_value(), region=region)
 
     def handle_scan_region_picked(self, viewport_pts: list) -> None:
-        """Store a picked scan rectangle (raw-frame normalized) and return to the dialog."""
+        """Map the picked rectangle into the raw frame and offer the scan options for it."""
         with self.state.metrics_lock:
             uv_grid = self.state.last_metrics.get("uv_grid")
         self.set_active_tool(ToolMode.NONE)
@@ -4575,9 +4573,8 @@ class AppController(QObject):
         raw_pts = [CoordinateMapping.map_click_to_raw(nx, ny, uv_grid) for nx, ny in viewport_pts[:2]]
         (x1, y1), (x2, y2) = raw_pts
         rect = (min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))
-        self._pending_scan_region = (self.state.current_file_hash or self.state.current_file_path, rect)
         self.set_status("", 0)
-        self.open_dust_scan_dialog()
+        self._run_dust_scan_dialog(region=rect)
 
     def scan_fullres_dust_to_heals(self, polarity: str = "both", region: Optional[tuple] = None) -> None:
         """Detect dust on the full-resolution decode and keep each hit as a manual heal.

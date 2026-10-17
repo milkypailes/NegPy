@@ -576,7 +576,7 @@ Spotting, as with a brush on a finished print. Marks are found by local contrast
 *   **Size** (2 to 8 px): max spot radius.
 *   To protect detail, right-drag on the canvas to paint an exclusion band, or right-click → **Exclude from Optical Removal** for one spot. Toggling **Optical Removal** clears every band.
 *   The cursor button beside **Optical Removal** makes a plain right-click exclude the spot; the canvas menu is then out of reach while removal is on.
-*   **Full-Res Scan** opens a dialog first: pick bright dust, dark dust or both, over the whole image or a rectangle dragged on the photo. Each hit is kept as a manual heal — a spot for specks, a traced outline for hairs. Catches sub-pixel specks the preview dilutes below the grain; right-click a placed heal on the canvas to delete a false positive.
+*   **Full-Res Scan** scans the whole frame. **Scan Region** beside it first asks you to drag a rectangle on the photo, then offers the same options over just that area. Either way a dialog picks bright dust, dark dust or both, and each hit is kept as a manual heal — a spot for specks, a traced outline for hairs. Catches sub-pixel specks the preview dilutes below the grain; right-click a placed heal on the canvas to delete a false positive.
 
 **IR Removal** uses the scanner's infrared channel, and is enabled only when the scan has one.
 

@@ -529,6 +529,7 @@ class ControlsPanel(QWidget):
         for btn, action_id in (
             (self.retouch_sidebar.auto_dust_btn, "toggle_optical_removal"),
             (self.retouch_sidebar.fullres_btn, "fullres_dust_scan"),
+            (self.retouch_sidebar.region_btn, "region_dust_scan"),
             (self.retouch_sidebar.right_click_btn, "toggle_right_click_excludes"),
             (self.retouch_sidebar.ir_dust_btn, "toggle_ir_removal"),
             (self.flatfield_sidebar.enable_btn, "toggle_flat_field"),

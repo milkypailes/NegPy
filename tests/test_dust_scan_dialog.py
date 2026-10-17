@@ -1,11 +1,11 @@
+from PyQt6.QtWidgets import QLabel
+
 from negpy.desktop.view.widgets.dust_scan_dialog import DustScanDialog
 
 
-def test_defaults_repeat_the_plain_scan(qapp) -> None:
+def test_defaults_to_both_polarities(qapp) -> None:
     dialog = DustScanDialog()
     assert dialog.polarity_value() == "both"
-    assert dialog.use_region() is False
-    assert dialog.region_value() is None
 
 
 def test_polarity_choice_reads_back(qapp) -> None:
@@ -13,31 +13,35 @@ def test_polarity_choice_reads_back(qapp) -> None:
     assert dialog.polarity_value() == "print_dark"
 
 
-def test_region_arrives_preset_with_scope(qapp) -> None:
-    dialog = DustScanDialog(initial_region=(0.1, 0.2, 0.4, 0.5))
-    assert dialog.use_region() is True
-    assert dialog.region_value() == (0.1, 0.2, 0.4, 0.5)
+def test_unknown_polarity_falls_back_to_both(qapp) -> None:
+    dialog = DustScanDialog(initial_polarity="sideways")
+    assert dialog.polarity_value() == "both"
 
 
-def test_scan_blocks_on_missing_rectangle(qapp) -> None:
+def test_switching_polarity_reads_back(qapp) -> None:
     dialog = DustScanDialog()
-    dialog._region_btn.setChecked(True)
-    assert dialog.use_region() is False
-    assert dialog.region_value() is None
-    assert dialog._scan_btn.isEnabled() is False
+    dialog._polarity_btns["print_bright"].setChecked(True)
+    assert dialog.polarity_value() == "print_bright"
 
 
-def test_select_arms_the_rectangle_scope(qapp) -> None:
+def test_scan_is_ready_without_a_rectangle(qapp) -> None:
     dialog = DustScanDialog()
-    emitted = []
-    dialog.select_requested.connect(lambda: emitted.append(True))
-    dialog._select_btn.click()
-    assert emitted == [True]
-    assert dialog._region_btn.isChecked()
-
-
-def test_picked_rectangle_enables_scan(qapp) -> None:
-    dialog = DustScanDialog()
-    dialog.set_region((0.1, 0.2, 0.4, 0.5))
-    assert dialog.use_region() is True
     assert dialog._scan_btn.isEnabled() is True
+
+
+def test_the_dialog_has_no_region_picker(qapp) -> None:
+    dialog = DustScanDialog()
+    assert not hasattr(dialog, "_region_btn")
+    assert not hasattr(dialog, "region_value")
+
+
+def test_the_header_does_not_take_a_taller_dialogs_slack(qapp) -> None:
+    """A stored geometry taller than the content must not stretch FIND over the radios."""
+    dialog = DustScanDialog()
+    dialog.resize(240, 320)
+    dialog.show()
+    qapp.processEvents()
+
+    label = next(child for child in dialog.findChildren(QLabel) if child.text() == "FIND")
+    assert label.height() <= label.sizeHint().height() + 2
+    dialog.close()
