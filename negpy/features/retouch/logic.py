@@ -290,21 +290,41 @@ def _u8(plane: np.ndarray) -> np.ndarray:
     return (np.clip(plane, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
 
 
-def _texture_win(shape: Tuple[int, ...], dust_size: int) -> int:
-    return int(max(7, max(1.0, float(dust_size)) * film_scale(shape) * 4.0)) * 2 + 1
+def _texture_win(scale: float, dust_size: int) -> int:
+    return int(max(7, max(1.0, float(dust_size)) * scale * 4.0)) * 2 + 1
 
 
-def compute_dust_stats(img: ImageBuffer, dust_size: int) -> Tuple[np.ndarray, ...]:
+def _detect_windows(scale: float, dust_size: int) -> Tuple[float, int, int]:
+    """``(base_size, v_win, w_win)`` of the detection maps: the defect footprint at ``scale``,
+    the median background window over it and the MAD/texture window (see ``compute_dust_stats``)."""
+    base_size = max(1.0, float(dust_size)) * scale
+    return base_size, int(max(3, base_size * 3.0)) * 2 + 1, _texture_win(scale, dust_size)
+
+
+def detection_margin(shape: Tuple[int, int], dust_size: int) -> int:
+    """Pixels of context the detection maps read around a pixel at this frame's film scale.
+
+    A region crop padded by this much sees the same film every window would on the full
+    frame, so its verdicts inside the crop match the full scan's."""
+    scale = film_scale(shape)
+    _base, v_win, w_win = _detect_windows(scale, dust_size)
+    reach = int(round(_DETECT_GROW_REACH * max(1, dust_size) * scale))
+    return v_win // 2 + w_win // 2 + reach + int(math.ceil(_DETECT_PAD_PX * scale)) + 2
+
+
+def compute_dust_stats(img: ImageBuffer, dust_size: int, *, reference: Optional[ImageBuffer] = None) -> Tuple[np.ndarray, ...]:
     """Threshold-independent detection maps ``(proxy, background, z, texture)``, the
     expensive part of a detection pass, cacheable across threshold changes. ``z`` is the
     3x3-averaged density excess over the median background in units of its own local MAD σ;
-    ``texture`` the wide-window σ of the density."""
-    lo, spread = _proxy_norm(img)
+    ``texture`` the wide-window σ of the density.
+
+    ``reference`` is the whole frame ``img`` is a crop of. The windows take its film scale
+    and the proxy its frame-wide normalization, so a region's maps match the full scan."""
+    ref = img if reference is None else reference
+    lo, spread = _proxy_norm(ref)
     proxy = np.clip((_density(img) - lo) / spread, 0.0, 1.0).astype(np.float32)
     # Size is film footprint at _IR_DETECT_REF; the windows follow the plane (see _ir_win).
-    base_size = max(1.0, float(dust_size)) * film_scale(proxy.shape)
-    v_win = int(max(3, base_size * 3.0)) * 2 + 1
-    w_win = _texture_win(proxy.shape, dust_size)
+    base_size, v_win, w_win = _detect_windows(film_scale(ref.shape[:2]), dust_size)
     # Median: the level of the film around a defect narrower than half the window. Opening:
     # identity on the soft ramp of a tonal edge and on anything wider than a speck, both of
     # which the median alone calls dense. Whichever is higher is the background.
@@ -334,19 +354,22 @@ def detect_luma_score(
     dust_size: int,
     stats: Optional[Tuple[np.ndarray, ...]] = None,
     hair_threshold: Optional[float] = None,
+    *,
+    reference: Optional[ImageBuffer] = None,
 ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
     """Statistical dust detection on the linear source → ``(score, hair_mask)``: a fill score for
     compact specks, an inpaint mask for hairs. A speck must clear ``dust_threshold``'s bar, a hair
-    ``hair_threshold``'s (default: the same), each raised by its own texture ramp."""
+    ``hair_threshold``'s (default: the same), each raised by its own texture ramp. ``reference`` is
+    the whole frame a crop belongs to (see ``compute_dust_stats``)."""
     if stats is None:
-        stats = compute_dust_stats(img, dust_size)
+        stats = compute_dust_stats(img, dust_size, reference=reference)
     proxy, background, z, texture = stats[:4]
     hi = detect_bar(dust_threshold)
     hi_hair = hi if hair_threshold is None else detect_bar(hair_threshold)
     seeds = (z >= min(hi, hi_hair)) & (proxy > _DETECT_PROXY_MIN)
     if not np.any(seeds):
         return None, None
-    scale = film_scale(proxy.shape)
+    scale = film_scale((img if reference is None else reference).shape[:2])
     lo = max(_DETECT_Z_GROW, min(hi, hi_hair) * _DETECT_Z_GROW_FRAC)
     reach = int(round(_DETECT_GROW_REACH * max(1, dust_size) * scale))
     near = cv2.dilate(seeds.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * reach + 1,) * 2)) > 0
@@ -368,7 +391,7 @@ def detect_luma_score(
     if hairs:
         is_hair = np.zeros(n_lbl, dtype=bool)
         is_hair[hairs] = True
-        _, filled = _box_mean_std(np.where(is_hair[lab], background, proxy), _texture_win(proxy.shape, dust_size))
+        _, filled = _box_mean_std(np.where(is_hair[lab], background, proxy), _texture_win(scale, dust_size))
         hair_tex = np.minimum(texture, _DETECT_HAIR_FILL_GAIN * filled)
         for i in hairs:
             x0, y0 = int(stats_cc[i, cv2.CC_STAT_LEFT]), int(stats_cc[i, cv2.CC_STAT_TOP])
@@ -383,7 +406,9 @@ def detect_luma_score(
     return score, hair_mask
 
 
-def detect_bright_luma_score(img: ImageBuffer, dust_threshold: float, dust_size: int) -> Optional[np.ndarray]:
+def detect_bright_luma_score(
+    img: ImageBuffer, dust_threshold: float, dust_size: int, *, reference: Optional[ImageBuffer] = None
+) -> Optional[np.ndarray]:
     """Bright-side mirror of ``detect_luma_score`` for unexposed dust: film the camera
     never exposed stays clear, so it reads as a luminance surplus against the exposed
     film around it. Measured in linear space, not density: density is logarithmic, so a
@@ -394,19 +419,23 @@ def detect_bright_luma_score(img: ImageBuffer, dust_threshold: float, dust_size:
     full sensitivity, busy film only reports strong outliers. Everything stays compact,
     since long marks tile into spots at conversion. Returns the fill score, or None
     when nothing clears the bar. Scan-only: highlights and speculars clear this bar,
-    so it runs where each hit stays individually deletable."""
+    so it runs where each hit stays individually deletable.
+
+    ``reference`` is the whole frame a crop belongs to: its white level normalizes the
+    proxy, and its size sets the film scale. A crop without the frame's bright film would
+    otherwise squash every speck against its own too-low white level."""
     hi_bar = detect_bar(dust_threshold)
     if not math.isfinite(hi_bar):
         return None
+    ref = img if reference is None else reference
     lin = get_luminance(img).astype(np.float32)
-    white = max(float(np.percentile(lin, 99.5)), 1e-6)
+    white = max(float(np.percentile(get_luminance(ref), 99.5)), 1e-6)
     # Gain-invariant like the density z: a gain scales the surplus and its σ together.
     # Normalized by level, not range, so flat film cannot squash the surplus the way
     # the density spread floor would.
     proxy = np.ascontiguousarray(lin / white)
-    base_size = max(1.0, float(dust_size)) * film_scale(proxy.shape)
-    v_win = int(max(3, base_size * 3.0)) * 2 + 1
-    w_win = _texture_win(proxy.shape, dust_size)
+    scale = film_scale(ref.shape[:2])
+    base_size, v_win, w_win = _detect_windows(scale, dust_size)
     clipped = np.clip(proxy, 0.0, 1.0)
     disk = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * int(round(base_size)) + 1,) * 2)
     background = np.minimum(
@@ -419,7 +448,6 @@ def detect_bright_luma_score(img: ImageBuffer, dust_threshold: float, dust_size:
     seeds = z >= hi_bar
     if not np.any(seeds):
         return None
-    scale = film_scale(proxy.shape)
     lo = max(_DETECT_Z_GROW, hi_bar * _DETECT_Z_GROW_FRAC)
     reach = int(round(_DETECT_GROW_REACH * max(1, dust_size) * scale))
     near = cv2.dilate(seeds.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * reach + 1,) * 2)) > 0

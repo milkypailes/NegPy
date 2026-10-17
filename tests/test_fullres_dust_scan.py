@@ -9,6 +9,7 @@ from negpy.features.retouch.logic import (
     compute_dust_stats,
     detect_bright_luma_score,
     detect_luma_score,
+    detection_margin,
     dust_detections_to_heal_strokes,
     filter_strokes_by_score,
     strokes_to_score,
@@ -431,6 +432,67 @@ def test_region_to_pixels_degenerate_is_no_region():
 
     assert region_to_pixels((0.5, 0.5, 0.5, 0.5), (100, 200)) is None
     assert region_to_pixels((0.0, 0.0, 0.001, 0.001), (100, 200)) is None
+
+
+def test_region_scan_matches_the_full_scan_inside_the_region():
+    """A region must find what a full scan finds. Its crop takes the frame's film scale and
+    normalization and is padded by ``detection_margin`` so every window reads the film the
+    full frame would. Sizing the windows on the crop alone shrinks the background and MAD
+    windows and drops specks the full scan keeps."""
+    rng = np.random.default_rng(5)
+    h = w = 3000
+    img = (np.full((h, w, 3), 0.18) * (1.0 + rng.normal(0, 0.02, (h, w, 3)))).astype(np.float32)
+    x0, y0, x1, y1 = 1000, 1000, 1800, 1800
+    img[1002:1005, 1002:1005] = 0.005  # on the region's own corner
+    img[1400:1403, 1600:1603] = 0.005  # mid-region
+
+    full_score, _ = detect_luma_score(img, 0.66, 4, stats=compute_dust_stats(img, 4), hair_threshold=1.0)
+    assert full_score is not None
+
+    margin = detection_margin(img.shape[:2], 4)
+    crop = np.ascontiguousarray(img[y0 - margin : y1 + margin, x0 - margin : x1 + margin])
+    crop_stats = compute_dust_stats(crop, 4, reference=img)
+    crop_score, _ = detect_luma_score(crop, 0.66, 4, stats=crop_stats, hair_threshold=1.0, reference=img)
+    assert crop_score is not None
+
+    region = crop_score[margin : margin + (y1 - y0), margin : margin + (x1 - x0)]
+    assert np.array_equal(full_score[y0:y1, x0:x1], region)
+
+    # The crop's own windows and normalization (no reference) diverge: the bug this fixes.
+    crop_only, _ = detect_luma_score(crop, 0.66, 4, stats=compute_dust_stats(crop, 4), hair_threshold=1.0)
+    assert crop_only is None or not np.array_equal(
+        full_score[y0:y1, x0:x1], crop_only[margin : margin + (y1 - y0), margin : margin + (x1 - x0)]
+    )
+
+
+def test_bright_region_uses_the_frames_white_level():
+    """A crop of dense scene carries no film base, so its own 99.5 percentile sits far below
+    the frame's white level: against it the unexposed speck saturates and the verdict diverges
+    from the full scan. Passing the frame as reference restores the full scan's answer."""
+    rng = np.random.default_rng(3)
+    h = w = 4000
+    lum = (np.full((h, w), 0.05) + rng.normal(0, 0.004, (h, w))).astype(np.float32)
+    lum[3500:] = 0.80  # film base, the frame's white level
+    img = np.repeat(lum[:, :, None], 3, axis=2)
+    img[700:703, 700:703] = 0.15  # an unexposed speck in the dense area
+
+    x0, y0, x1, y1 = 200, 200, 1200, 1200
+    full = detect_bright_luma_score(img, 0.66, 4)
+    assert full is not None
+
+    margin = detection_margin(img.shape[:2], 4)
+    crop = np.ascontiguousarray(img[y0 - margin : y1 + margin, x0 - margin : x1 + margin])
+    region = detect_bright_luma_score(crop, 0.66, 4, reference=img)
+    assert region is not None
+    assert np.array_equal(full[y0:y1, x0:x1], region[margin : margin + (y1 - y0), margin : margin + (x1 - x0)])
+
+    crop_only = detect_bright_luma_score(crop, 0.66, 4)
+    if crop_only is not None:
+        assert not np.array_equal(full[y0:y1, x0:x1], crop_only[margin : margin + (y1 - y0), margin : margin + (x1 - x0)])
+
+
+def test_detection_margin_grows_with_the_frame():
+    assert 0 < detection_margin((1600, 1600), 4) < detection_margin((6400, 6400), 4)
 
 
 class TestDustScanDispatch(unittest.TestCase):
