@@ -101,15 +101,21 @@ class DustScanWorker(QObject):
                     reference=reference,
                 )
             bright = None
+            bright_hair = None
             if task.polarity in ("print_dark", "both"):
-                bright = detect_bright_luma_score(
+                bright, bright_hair = detect_bright_luma_score(
                     detect_img,
                     float(ret.dust_threshold),
                     int(ret.dust_size),
+                    hair_threshold=float(ret.dust_hair_threshold),
                     reference=reference,
                 )
             sides = [s for s in (dark, bright) if s is not None]
             score = sides[0] if len(sides) == 1 else (np.minimum(*sides).astype(np.float32) if sides else None)
+            for side_hair in (hair, bright_hair):
+                if side_hair is None:
+                    continue
+                hair = side_hair if hair is None else np.maximum(hair, np.asarray(side_hair))
             if region is not None:
                 x0, y0, x1, y1, px0, py0 = region
                 sy0, sx0 = y0 - py0, x0 - px0

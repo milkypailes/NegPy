@@ -348,6 +348,50 @@ def detect_bar(slider: float) -> float:
     return _DETECT_Z_DEFAULT * (_DETECT_Z_TIGHT / _DETECT_Z_DEFAULT) ** t
 
 
+def _keep_components(
+    z: np.ndarray,
+    seeds: np.ndarray,
+    lab: np.ndarray,
+    comp_stats: np.ndarray,
+    background: np.ndarray,
+    proxy: np.ndarray,
+    texture: np.ndarray,
+    hi: float,
+    hi_hair: float,
+    scale: float,
+    dust_size: int,
+) -> np.ndarray:
+    """Per-component verdict: a compact candidate keeps its seed verdict, a hair-shaped one
+    is tested against the hair bar and its own texture ramp. Shared by both optical detectors,
+    which differ only in their proxy and morphology."""
+    n_lbl = int(comp_stats.shape[0])
+    bar = hi * (1.0 + _DETECT_TEXTURE_GAIN * np.maximum(texture - _DETECT_TEXTURE_KNEE, 0.0))
+    strong = np.zeros(n_lbl, dtype=bool)
+    strong[np.unique(lab[seeds & (z >= bar)])] = True
+    peak = np.zeros(n_lbl, dtype=np.float32)
+    np.maximum.at(peak, lab[seeds], z[seeds])
+    keep = np.zeros(n_lbl, dtype=bool)
+    hairs = []
+    for i in np.flatnonzero(peak[1:] > 0) + 1:
+        x0, y0 = int(comp_stats[i, cv2.CC_STAT_LEFT]), int(comp_stats[i, cv2.CC_STAT_TOP])
+        bw, bh = int(comp_stats[i, cv2.CC_STAT_WIDTH]), int(comp_stats[i, cv2.CC_STAT_HEIGHT])
+        if _is_hair(lab[y0 : y0 + bh, x0 : x0 + bw] == i, int(comp_stats[i, cv2.CC_STAT_AREA])):
+            hairs.append(i)
+        else:
+            keep[i] = strong[i]
+    if hairs:
+        is_hair = np.zeros(n_lbl, dtype=bool)
+        is_hair[hairs] = True
+        _, filled = _box_mean_std(np.where(is_hair[lab], background, proxy), _texture_win(scale, dust_size))
+        hair_tex = np.minimum(texture, _DETECT_HAIR_FILL_GAIN * filled)
+        for i in hairs:
+            x0, y0 = int(comp_stats[i, cv2.CC_STAT_LEFT]), int(comp_stats[i, cv2.CC_STAT_TOP])
+            bw, bh = int(comp_stats[i, cv2.CC_STAT_WIDTH]), int(comp_stats[i, cv2.CC_STAT_HEIGHT])
+            tex = float(np.median(hair_tex[y0 : y0 + bh, x0 : x0 + bw][lab[y0 : y0 + bh, x0 : x0 + bw] == i]))
+            keep[i] = peak[i] >= hi_hair * (1.0 + _DETECT_HAIR_TEXTURE_GAIN * max(tex - _DETECT_HAIR_TEXTURE_KNEE, 0.0))
+    return keep
+
+
 def detect_luma_score(
     img: ImageBuffer,
     dust_threshold: float,
@@ -374,30 +418,7 @@ def detect_luma_score(
     reach = int(round(_DETECT_GROW_REACH * max(1, dust_size) * scale))
     near = cv2.dilate(seeds.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * reach + 1,) * 2)) > 0
     n_lbl, lab, stats_cc, _ = cv2.connectedComponentsWithStats((near & (z >= lo)).astype(np.uint8), connectivity=8)
-    bar = hi * (1.0 + _DETECT_TEXTURE_GAIN * np.maximum(texture - _DETECT_TEXTURE_KNEE, 0.0))
-    strong = np.zeros(n_lbl, dtype=bool)
-    strong[np.unique(lab[seeds & (z >= bar)])] = True
-    peak = np.zeros(n_lbl, dtype=np.float32)
-    np.maximum.at(peak, lab[seeds], z[seeds])
-    keep = np.zeros(n_lbl, dtype=bool)
-    hairs = []
-    for i in np.flatnonzero(peak[1:] > 0) + 1:
-        x0, y0 = int(stats_cc[i, cv2.CC_STAT_LEFT]), int(stats_cc[i, cv2.CC_STAT_TOP])
-        bw, bh = int(stats_cc[i, cv2.CC_STAT_WIDTH]), int(stats_cc[i, cv2.CC_STAT_HEIGHT])
-        if _is_hair(lab[y0 : y0 + bh, x0 : x0 + bw] == i, int(stats_cc[i, cv2.CC_STAT_AREA])):
-            hairs.append(i)
-        else:
-            keep[i] = strong[i]
-    if hairs:
-        is_hair = np.zeros(n_lbl, dtype=bool)
-        is_hair[hairs] = True
-        _, filled = _box_mean_std(np.where(is_hair[lab], background, proxy), _texture_win(scale, dust_size))
-        hair_tex = np.minimum(texture, _DETECT_HAIR_FILL_GAIN * filled)
-        for i in hairs:
-            x0, y0 = int(stats_cc[i, cv2.CC_STAT_LEFT]), int(stats_cc[i, cv2.CC_STAT_TOP])
-            bw, bh = int(stats_cc[i, cv2.CC_STAT_WIDTH]), int(stats_cc[i, cv2.CC_STAT_HEIGHT])
-            tex = float(np.median(hair_tex[y0 : y0 + bh, x0 : x0 + bw][lab[y0 : y0 + bh, x0 : x0 + bw] == i]))
-            keep[i] = peak[i] >= hi_hair * (1.0 + _DETECT_HAIR_TEXTURE_GAIN * max(tex - _DETECT_HAIR_TEXTURE_KNEE, 0.0))
+    keep = _keep_components(z, seeds, lab, stats_cc, background, proxy, texture, hi, hi_hair, scale, dust_size)
     if not keep.any():
         return None, None
     hit = keep[lab].astype(np.uint8)
@@ -407,8 +428,13 @@ def detect_luma_score(
 
 
 def detect_bright_luma_score(
-    img: ImageBuffer, dust_threshold: float, dust_size: int, *, reference: Optional[ImageBuffer] = None
-) -> Optional[np.ndarray]:
+    img: ImageBuffer,
+    dust_threshold: float,
+    dust_size: int,
+    *,
+    hair_threshold: Optional[float] = None,
+    reference: Optional[ImageBuffer] = None,
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
     """Bright-side mirror of ``detect_luma_score`` for unexposed dust: film the camera
     never exposed stays clear, so it reads as a luminance surplus against the exposed
     film around it. Measured in linear space, not density: density is logarithmic, so a
@@ -416,17 +442,18 @@ def detect_bright_luma_score(
     excess is unbounded. Morphology mirrors too (close keeps bright marks, background
     takes the minimum), with the same seed bar, grain-relative σ and hysteresis. The
     texture ramp is measured on the same linear proxy: uniform areas (sky, walls) keep
-    full sensitivity, busy film only reports strong outliers. Everything stays compact,
-    since long marks tile into spots at conversion. Returns the fill score, or None
-    when nothing clears the bar. Scan-only: highlights and speculars clear this bar,
-    so it runs where each hit stays individually deletable.
+    full sensitivity, busy film only reports strong outliers. Returns ``(score, hair_mask)``
+    like the dark side: a bright hair is the same thin mark, so it takes the same hair bar
+    and texture ramp. Scan-only: highlights and speculars clear this bar, so it runs where
+    each hit stays individually deletable.
 
     ``reference`` is the whole frame a crop belongs to: its white level normalizes the
     proxy, and its size sets the film scale. A crop without the frame's bright film would
     otherwise squash every speck against its own too-low white level."""
-    hi_bar = detect_bar(dust_threshold)
-    if not math.isfinite(hi_bar):
-        return None
+    hi = detect_bar(dust_threshold)
+    hi_hair = hi if hair_threshold is None else detect_bar(hair_threshold)
+    if not math.isfinite(min(hi, hi_hair)):
+        return None, None
     ref = img if reference is None else reference
     lin = get_luminance(img).astype(np.float32)
     white = max(float(np.percentile(get_luminance(ref), 99.5)), 1e-6)
@@ -445,21 +472,21 @@ def detect_bright_luma_score(
     mad = cv2.medianBlur(_u8(np.abs(excess) * _DETECT_MAD_GAIN), w_win).astype(np.float32) / (255.0 * _DETECT_MAD_GAIN)
     z = excess / np.maximum(mad / 0.6745, _DETECT_SIGMA_MIN)
     _, texture = _box_mean_std(proxy, w_win)
-    seeds = z >= hi_bar
+    seed_bar = min(hi, hi_hair)
+    seeds = z >= seed_bar
     if not np.any(seeds):
-        return None
-    lo = max(_DETECT_Z_GROW, hi_bar * _DETECT_Z_GROW_FRAC)
+        return None, None
+    lo = max(_DETECT_Z_GROW, seed_bar * _DETECT_Z_GROW_FRAC)
     reach = int(round(_DETECT_GROW_REACH * max(1, dust_size) * scale))
     near = cv2.dilate(seeds.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * reach + 1,) * 2)) > 0
-    n_lbl, lab, _, _ = cv2.connectedComponentsWithStats((near & (z >= lo)).astype(np.uint8), connectivity=8)
-    bar = hi_bar * (1.0 + _DETECT_TEXTURE_GAIN * np.maximum(texture - _DETECT_TEXTURE_KNEE, 0.0))
-    keep = np.zeros(n_lbl, dtype=bool)
-    keep[np.unique(lab[seeds & (z >= bar)])] = True
-    keep[0] = False
+    _n_lbl, lab, stats_cc, _ = cv2.connectedComponentsWithStats((near & (z >= lo)).astype(np.uint8), connectivity=8)
+    keep = _keep_components(z, seeds, lab, stats_cc, background, proxy, texture, hi, hi_hair, scale, dust_size)
     if not keep.any():
-        return None
+        return None, None
     hit = keep[lab].astype(np.uint8)
-    return _mask_to_score(hit, _DETECT_PAD_PX * scale) if hit.any() else None
+    compact, hair_mask = split_hairs(hit)
+    score = _mask_to_score(compact, _DETECT_PAD_PX * scale) if compact.any() else None
+    return score, hair_mask
 
 
 def exclusion_cover(strokes: List[Tuple], shape: Tuple[int, int]) -> np.ndarray:

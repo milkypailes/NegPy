@@ -151,7 +151,7 @@ def _unexposed_speck_source(h=160, w=160, seed=42):
 
 def test_detect_bright_luma_score_finds_unexposed_speck():
     img = _unexposed_speck_source()
-    score = detect_bright_luma_score(img, dust_threshold=0.66, dust_size=4)
+    score, _hair = detect_bright_luma_score(img, dust_threshold=0.66, dust_size=4)
     assert score is not None
     assert score[80:83, 80:83].max() < 1.0, "the unexposed speck must be scored as a defect"
     ys, xs = np.where(score < 1.0)
@@ -159,17 +159,34 @@ def test_detect_bright_luma_score_finds_unexposed_speck():
 
 
 def test_detect_bright_luma_score_clean_frame_is_empty():
-    assert detect_bright_luma_score(_grainy(160, 160), 0.66, 4) is None
+    score, hair = detect_bright_luma_score(_grainy(160, 160), 0.66, 4)
+    assert score is None and hair is None
 
 
 def test_detect_bright_luma_score_threshold_off_is_empty():
-    assert detect_bright_luma_score(_unexposed_speck_source(), 1.0, 4) is None
+    score, hair = detect_bright_luma_score(_unexposed_speck_source(), 1.0, 4)
+    assert score is None and hair is None
+
+
+def test_bright_hair_takes_the_hair_bar_like_the_dark_side():
+    """A bright hair is the same thin mark as a dark one, so the loose hair bar reaches it
+    under the spot bar and it converts as a hair mask, not a compact score."""
+    rng = np.random.default_rng(42)
+    img = (np.full((200, 200, 3), 0.18) * (1.0 + rng.normal(0, 0.06, (200, 200, 3)))).astype(np.float32)
+    img[120:122, 30:170] = 0.30  # unexposed hair: bright on the scan
+
+    score, hair = detect_bright_luma_score(img, 1.0, 4, hair_threshold=0.66)
+    assert hair is not None and hair[120:122, 40:160].all()
+    assert score is None, "a hair must not land in the compact score"
+
+    _score, tight = detect_bright_luma_score(img, 1.0, 4, hair_threshold=1.0)
+    assert tight is None, "the tightest hair bar must drop it"
 
 
 def test_bright_roundtrip_repairs_a_detected_speck():
     """Bright speck → convert → manual bake finds something, like the dark side."""
     img = _unexposed_speck_source()
-    score = detect_bright_luma_score(img, 0.66, 4)
+    score, _hair = detect_bright_luma_score(img, 0.66, 4)
     assert score is not None
     strokes = dust_detections_to_heal_strokes(score, [], img.shape[:2])
     assert strokes
@@ -188,7 +205,7 @@ def test_merged_dark_and_bright_scores_convert_both():
     img[1200:1203, 1200:1203] = 0.70  # unexposed dust: bright on the scan
     stats = compute_dust_stats(img, 4)
     dark, _ = detect_luma_score(img, 0.66, 4, stats=stats, hair_threshold=1.0)
-    bright = detect_bright_luma_score(img, 0.66, 4)
+    bright, _ = detect_bright_luma_score(img, 0.66, 4)
     assert dark is not None and bright is not None
     merged = np.minimum(dark, bright).astype(np.float32)
     strokes = dust_detections_to_heal_strokes(merged, [], img.shape[:2])
@@ -477,16 +494,16 @@ def test_bright_region_uses_the_frames_white_level():
     img[700:703, 700:703] = 0.15  # an unexposed speck in the dense area
 
     x0, y0, x1, y1 = 200, 200, 1200, 1200
-    full = detect_bright_luma_score(img, 0.66, 4)
+    full, _ = detect_bright_luma_score(img, 0.66, 4)
     assert full is not None
 
     margin = detection_margin(img.shape[:2], 4)
     crop = np.ascontiguousarray(img[y0 - margin : y1 + margin, x0 - margin : x1 + margin])
-    region = detect_bright_luma_score(crop, 0.66, 4, reference=img)
+    region, _ = detect_bright_luma_score(crop, 0.66, 4, reference=img)
     assert region is not None
     assert np.array_equal(full[y0:y1, x0:x1], region[margin : margin + (y1 - y0), margin : margin + (x1 - x0)])
 
-    crop_only = detect_bright_luma_score(crop, 0.66, 4)
+    crop_only, _ = detect_bright_luma_score(crop, 0.66, 4)
     if crop_only is not None:
         assert not np.array_equal(full[y0:y1, x0:x1], crop_only[margin : margin + (y1 - y0), margin : margin + (x1 - x0)])
 
@@ -557,6 +574,20 @@ class TestDustScanDispatch(unittest.TestCase):
         self.assertEqual(tasks[0].polarity, "print_dark")
         self.assertEqual(tasks[0].region, (0.1, 0.2, 0.4, 0.5))
         self.assertEqual(self.controller._last_scan_polarity, "print_dark")
+
+    def test_region_pick_logs_its_frame_space_bounds(self):
+        """A reporter reads the miss location off the log, so the pick must print it."""
+        from negpy.services.view.coordinate_mapping import CoordinateMapping
+
+        self.controller.state.last_metrics["uv_grid"] = CoordinateMapping.create_uv_grid(4, 4, 0, 0.0)
+        self.controller.set_active_tool = MagicMock()
+        self.controller._run_dust_scan_dialog = MagicMock()
+
+        with self.assertLogs("negpy", level="INFO") as cm:
+            self.controller.handle_scan_region_picked([(0.25, 0.25), (0.75, 0.75)])
+
+        self.controller._run_dust_scan_dialog.assert_called_once()
+        self.assertTrue(any("scan-region raw x1=" in line for line in cm.output), cm.output)
 
     def test_unknown_polarity_falls_back_to_both(self):
         tasks = self._dispatched_task()
