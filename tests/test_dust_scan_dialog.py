@@ -20,7 +20,7 @@ def test_unknown_polarity_falls_back_to_both(qapp) -> None:
 
 def test_switching_polarity_reads_back(qapp) -> None:
     dialog = DustScanDialog()
-    dialog._polarity_btns["print_bright"].setChecked(True)
+    dialog._polarity.setCurrentIndex(dialog._polarity.findData("print_bright"))
     assert dialog.polarity_value() == "print_bright"
 
 
@@ -36,7 +36,7 @@ def test_the_dialog_has_no_region_picker(qapp) -> None:
 
 
 def test_the_header_does_not_take_a_taller_dialogs_slack(qapp) -> None:
-    """A stored geometry taller than the content must not stretch FIND over the radios."""
+    """A stored geometry taller than the content must not stretch FIND over the choices."""
     dialog = DustScanDialog()
     dialog.resize(240, 320)
     dialog.show()

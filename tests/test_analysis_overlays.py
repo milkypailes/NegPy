@@ -1,9 +1,9 @@
-"""Clipping Overlay and zone highlight: the masks they wash over the frame, the zone strip's
-hover that names a zone, and the wash itself."""
+"""Clipping Overlay: the masks it washes over the frame, the zone strip's hover that names a
+zone, and the wash itself."""
 
 import numpy as np
 
-from negpy.features.exposure.analysis import clip_masks, encoded_of_zone, zone_mask
+from negpy.features.exposure.analysis import clip_masks
 
 
 def test_clip_masks_use_the_histograms_end_bins() -> None:
@@ -18,14 +18,6 @@ def test_clip_masks_use_the_histograms_end_bins() -> None:
     assert high.tolist() == [[False, True, False], [False, False, False]]
 
 
-def test_zone_mask_picks_one_strip_cell_and_ix_holds_x() -> None:
-    zones = [0.5, 4.5, 5.5, 9.5, 10.0]
-    rgb = np.repeat(np.array([[encoded_of_zone(z)] for z in zones], dtype=np.float32)[:, :, None], 3, axis=2)
-
-    assert zone_mask(rgb, 5)[:, 0].tolist() == [False, False, True, False, False]
-    assert zone_mask(rgb, 9)[:, 0].tolist() == [False, False, False, True, True]
-
-
 def test_masks_are_strided_to_the_edge_cap() -> None:
     rgb = np.zeros((300, 1000, 3), dtype=np.float32)
 
@@ -33,7 +25,6 @@ def test_masks_are_strided_to_the_edge_cap() -> None:
 
     assert max(low.shape) <= 256
     assert low.all()
-    assert zone_mask(np.zeros((4, 4)), 0) is None
 
 
 def test_zone_strip_hover_names_the_cell_and_leaving_clears_it(qapp) -> None:
@@ -43,8 +34,8 @@ def test_zone_strip_hover_names_the_cell_and_leaving_clears_it(qapp) -> None:
     from negpy.desktop.view.widgets.charts import ZoneStripWidget
 
     strip = ZoneStripWidget()
-    strip.resize(100, 24)
-    strip.update_data(np.full(10, 0.1))
+    strip.resize(110, 24)
+    strip.update_data(np.full(11, 0.1))
     hovered: list = []
     strip.zone_hovered.connect(hovered.append)
 
@@ -57,10 +48,10 @@ def test_zone_strip_hover_names_the_cell_and_leaving_clears_it(qapp) -> None:
 
     move(55.0)
     move(56.0)  # same cell: no repeat
-    move(95.0)
+    move(105.0)
     strip.leaveEvent(QEvent(QEvent.Type.Leave))
 
-    assert hovered == [5, 9, None]
+    assert hovered == [5, 10, None]
 
 
 def test_tint_layers_paint_their_color_and_leave_the_rest_clear(qapp) -> None:

@@ -122,6 +122,84 @@ def test_pure_neutral_full_confidence_and_exact_refs():
     assert confidence > 0.9
 
 
+_FOLIAGE = (0.06, 0.0, 0.10)  # desaturated yellow-green: R and B denser than G, B most
+
+
+def _with_foliage(gray_cols: int) -> np.ndarray:
+    """Every band mostly foliage, with `gray_cols` columns of true gray."""
+    v = _val_img()
+    for ch, d in enumerate(_FOLIAGE):
+        v[:, gray_cols:, ch] += d
+    return v
+
+
+def test_foliage_is_not_taken_as_gray():
+    # Grays are a tenth of each band, so the lowest-chroma 30% is mostly foliage: without
+    # the foliage sector the axis lands on the leaves and the print goes magenta.
+    res = measure_neutral_axis_from_log(_to_log(_with_foliage(gray_cols=26)), _BOUNDS)
+    assert res is not None
+    for refs in res[:3]:
+        assert refs is not None
+        assert abs(_dev(refs, 0)) < 2e-3
+        assert abs(_dev(refs, 2)) < 2e-3
+
+
+def test_foliage_only_frame_has_no_axis():
+    assert measure_neutral_axis_from_log(_to_log(_with_foliage(gray_cols=0)), _BOUNDS) is None
+
+
+def test_pale_green_cast_is_still_removed():
+    # Below the foliage chroma floor a green cast is a cast, not content.
+    cast = 0.02
+    assert cast < float(EXPOSURE_CONSTANTS["neutral_axis_foliage_chroma"])
+    v = _val_img()
+    v[:, :, 0] += cast
+    v[:, :, 2] += cast
+    res = measure_neutral_axis_from_log(_to_log(v), _BOUNDS)
+    assert res is not None
+    assert abs(_dev(res[0], 0) - cast) < 2e-3
+    assert abs(_dev(res[0], 2) - cast) < 2e-3
+
+
+_SKY = (0.10, 0.0, -0.10)  # pale azure: R denser and B thinner than G (hue -90 deg)
+
+
+def _with_sky(gray_cols: int) -> np.ndarray:
+    """Every band mostly sky, with `gray_cols` columns of true gray."""
+    v = _val_img()
+    for ch, d in enumerate(_SKY):
+        v[:, gray_cols:, ch] += d
+    return v
+
+
+def test_sky_is_not_taken_as_gray():
+    # The palest sky is the lowest-chroma 30% of a band with few grays: without the sky
+    # sector the axis lands on it and the print goes yellow.
+    res = measure_neutral_axis_from_log(_to_log(_with_sky(gray_cols=26)), _BOUNDS)
+    assert res is not None
+    for refs in res[:3]:
+        assert refs is not None
+        assert abs(_dev(refs, 0)) < 2e-3
+        assert abs(_dev(refs, 2)) < 2e-3
+
+
+def test_sky_only_frame_has_no_axis():
+    assert measure_neutral_axis_from_log(_to_log(_with_sky(gray_cols=0)), _BOUNDS) is None
+
+
+def test_pale_blue_cast_is_still_removed():
+    # Below the sky chroma floor a blue cast is a cast, not content.
+    cast = 0.04
+    assert cast < float(EXPOSURE_CONSTANTS["neutral_axis_sky_chroma"])
+    v = _val_img()
+    v[:, :, 0] += cast
+    v[:, :, 2] -= cast
+    res = measure_neutral_axis_from_log(_to_log(v), _BOUNDS)
+    assert res is not None
+    assert abs(_dev(res[0], 0) - cast) < 2e-3
+    assert abs(_dev(res[0], 2) + cast) < 2e-3
+
+
 def _mixed_mid(spread: float) -> np.ndarray:
     """Mid band whose near-neutral set holds a gray cluster between two colored ones,
     offset from green by +spread and -spread in red."""

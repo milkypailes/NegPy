@@ -21,6 +21,7 @@ from dataclasses import replace
 from fnmatch import fnmatchcase
 from typing import TYPE_CHECKING, Any, Callable, Collection, Dict, List, Optional, Sequence
 
+from negpy.features.exposure.normalization import BOUNDS_VERSION
 from negpy.features.metadata.models import GEAR_FIELDS, PROCESS_FIELDS, SCANNING_FIELDS
 from negpy.features.geometry.models import with_auto_crop_field
 from negpy.features.process.models import neutral_axis_tuple, with_film_fields
@@ -268,10 +269,11 @@ def create_virtual_roll(repo: Any, name: str, member_paths: List[str]) -> str:
     return roll_id
 
 
-def add_extra_members(repo: Any, roll_id: str, paths: List[str]) -> None:
+def add_extra_members(repo: Any, roll_id: str, paths: List[str], parts: Sequence[str] = ()) -> None:
     """Extend a roll's membership, in one write: a folder roll's extra_paths, or a virtual
     roll's member_paths. Skips an unknown roll id, paths already members and files the
-    folder's own walk already finds."""
+    folder's own walk already finds. *parts* (a composite's or triplet's other files) leave
+    excluded_paths with *paths* but never join the membership."""
     store = _read(repo)
     entry = store.get(roll_id)
     if entry is None:
@@ -280,9 +282,63 @@ def add_extra_members(repo: Any, roll_id: str, paths: List[str]) -> None:
     known = set(entry[key])
     folder = _folder_key(entry["folder_path"]) if entry["kind"] == "folder" else None
     new = [p for p in dict.fromkeys(paths) if p not in known and _folder_key(os.path.dirname(p)) != folder]
-    if new:
+    added = {_folder_key(p) for p in (*paths, *parts)}
+    excluded = entry.get("excluded_paths", [])
+    kept = [p for p in excluded if _folder_key(p) not in added]
+    if new or kept != excluded:
         entry[key] = [*entry[key], *new]
+        if kept != excluded:
+            entry["excluded_paths"] = kept
         _write(repo, store)
+
+
+def remove_members(repo: Any, roll_id: str, paths: List[str], hashes: List[str]) -> List[str]:
+    """Take *paths* out of a roll, in one write, with every record the roll keeps for
+    *hashes* (unforked): card locks, scene membership and forks. A file in a folder roll's
+    own folder joins its excluded_paths, which every walk of that folder skips. Returns
+    the hashes whose fork edit the caller must delete."""
+    store = _read(repo)
+    entry = store.get(roll_id)
+    if entry is None:
+        return []
+    gone = {_folder_key(p) for p in paths}
+    for key in ("extra_paths", "member_paths"):
+        if key in entry:
+            entry[key] = [p for p in entry[key] if _folder_key(p) not in gone]
+    if entry["kind"] == "folder":
+        folder = _folder_key(entry["folder_path"])
+        own = [p for p in dict.fromkeys(paths) if _folder_key(os.path.dirname(p)) == folder]
+        excluded = entry.get("excluded_paths", [])
+        known = {_folder_key(p) for p in excluded}
+        entry["excluded_paths"] = [*excluded, *(p for p in own if _folder_key(p) not in known)]
+    drop = set(hashes)
+    if "frame_overrides" in entry:
+        entry["frame_overrides"] = {h: cards for h, cards in entry["frame_overrides"].items() if h not in drop}
+    if "scenes" in entry:
+        scenes = dict(entry["scenes"])
+        _pull_members(scenes, list(drop))
+        entry["scenes"] = scenes
+    forked = [h for h in entry.get("forked_hashes", []) if h in drop]
+    if forked:
+        entry["forked_hashes"] = [h for h in entry["forked_hashes"] if h not in drop]
+    _write(repo, store)
+    return forked
+
+
+def excluded_paths(repo: Any, folders: Sequence[str]) -> frozenset:
+    """The files a walk of *folders* skips: those removed from the roll of each, in
+    `_folder_key` form. A folder that is no roll's adds nothing."""
+    keys = {_folder_key(f) for f in folders}
+    return frozenset(
+        _folder_key(p)
+        for entry in _view(repo).values()
+        if entry.get("kind") == "folder" and _folder_key(entry.get("folder_path") or "") in keys
+        for p in entry.get("excluded_paths", ())
+    )
+
+
+def is_excluded_key(path: str, excluded: Collection[str]) -> bool:
+    return _folder_key(path) in excluded
 
 
 def roll_edit_hash(from_hash: str, roll_id: str) -> str:
@@ -379,6 +435,8 @@ def rolls_containing_path(repo: Any, path: str) -> List[str]:
             folder = entry.get("folder_path", "")
             folder_norm = os.path.normcase(os.path.abspath(folder)) if folder else ""
             in_folder = bool(folder_norm) and norm.startswith(folder_norm + os.sep)
+            if in_folder and _folder_key(path) in {_folder_key(p) for p in entry.get("excluded_paths", ())}:
+                continue
             if in_folder or path in entry.get("extra_paths", []):
                 out.append(roll_id)
         elif path in entry.get("member_paths", []):
@@ -507,7 +565,7 @@ def rehome_paths(repo: Any, move: Callable[[str], str]) -> None:
     for entry in store.values():
         if entry.get("folder_path"):
             entry["folder_path"] = move(entry["folder_path"])
-        for key in ("member_paths", "extra_paths"):
+        for key in ("member_paths", "extra_paths", "excluded_paths"):
             if key in entry:
                 entry[key] = [move(p) for p in entry[key]]
     _write(repo, store)
@@ -555,7 +613,6 @@ ROLL_DEFAULT_FIELDS: Dict[str, tuple] = {
         "process",
         (
             "linear_raw",
-            "narrowband_scan",
             "sensor_profile",
             "sensor_matrix",
             "sensor_unmix",
@@ -841,6 +898,7 @@ def set_roll_normalization(
     cast: tuple = (0.0, 0.0, 0.0),
     outliers: tuple = (),
     axis: Optional[tuple] = None,
+    bounds_version: int = BOUNDS_VERSION,
 ) -> None:
     """Records a Roll Analysis result as the roll's own baseline, overwriting
     whatever was there. No-op for an unknown roll id."""
@@ -848,8 +906,55 @@ def set_roll_normalization(
     entry = store.get(roll_id)
     if entry is None:
         return
-    entry["normalization"] = {"floors": list(floors), "ceils": list(ceils), "cast": list(cast), "outliers": list(outliers), "axis": axis}
+    entry["normalization"] = {
+        "floors": list(floors),
+        "ceils": list(ceils),
+        "cast": list(cast),
+        "outliers": list(outliers),
+        "axis": axis,
+        "bounds_version": bounds_version,
+    }
     _write(repo, store)
+
+
+def baseline_stale(saved: Optional[dict]) -> bool:
+    """Whether a saved roll or scene baseline was measured under an older BOUNDS_VERSION."""
+    return bool(saved) and int(saved.get("bounds_version", 0)) < BOUNDS_VERSION
+
+
+def frame_baseline_stale(repo: Any, process: Any) -> bool:
+    """Whether the roll or scene baseline a frame rides is stale. False for one taken
+    from a frame or saved before sources were recorded: neither can tell."""
+    kind, _, ref = process.baseline_source.partition(":")
+    if kind == "roll":
+        entry = roll_for_id(repo, ref)
+        return baseline_stale(entry.get("normalization") if entry else None)
+    if kind == "scene":
+        for entry in _view(repo).values():
+            scene = entry.get("scenes", {}).get(ref)
+            if scene:
+                return baseline_stale(scene.get("normalization"))
+    return False
+
+
+def roll_film_base(repo: Any, roll_id: Optional[str]) -> Optional[tuple]:
+    """The clear film base the user set on the roll with the Film Base tool, as per-channel
+    raw log10 transmittance (every render unmixes it like the rebate reader's), or None."""
+    entry = roll_for_id(repo, roll_id) if roll_id else None
+    saved = entry.get("film_base") if entry else None
+    return tuple(float(v) for v in saved) if saved else None
+
+
+def set_roll_film_base(repo: Any, roll_id: str, base_log: Optional[tuple]) -> bool:
+    """Records the roll's clear film base in raw log space; None clears it. False for an
+    unknown roll id."""
+    store = _read(repo)
+    entry = store.get(roll_id)
+    if entry is None:
+        return False
+    entry["film_base"] = None if base_log is None else [float(v) for v in base_log]
+    _write(repo, store)
+    return True
 
 
 def roll_scenes(repo: Any, roll_id: Optional[str]) -> List[tuple]:
@@ -945,7 +1050,13 @@ def set_scene_normalization(
 ) -> None:
     def edit(scenes: Dict[str, dict]) -> None:
         if scene_id in scenes:
-            saved = {"floors": list(floors), "ceils": list(ceils), "outliers": list(outliers), "axis": axis}
+            saved = {
+                "floors": list(floors),
+                "ceils": list(ceils),
+                "outliers": list(outliers),
+                "axis": axis,
+                "bounds_version": BOUNDS_VERSION,
+            }
             scenes[scene_id] = {**scenes[scene_id], "normalization": saved}
 
     _edit_scenes(repo, roll_id, edit)

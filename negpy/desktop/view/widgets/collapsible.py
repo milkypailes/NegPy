@@ -1,3 +1,4 @@
+from negpy.kernel.system.i18n import tr
 from typing import Optional
 from PyQt6.QtWidgets import (
     QWidget,
@@ -20,7 +21,7 @@ import qtawesome as qta
 
 # Said by every card's Roll half where no roll spans the loaded frames, so the disabled
 # control carries the reason once rather than each sidebar wording it again.
-NO_ROLL_SCOPE_HINT = "These frames are not one roll, so there is no roll to hold a shared value. Save as Roll to make one."
+NO_ROLL_SCOPE_HINT = tr("These frames are not one roll, so there is no roll to hold a shared value. Save as Roll to make one.")
 
 
 def roll_revert_icon(color: str) -> QIcon:
@@ -99,14 +100,15 @@ class CollapsibleSection(QWidget):
             self.select_box = QCheckBox()
             self.select_box.setTristate(True)
             self.select_box.setCursor(Qt.CursorShape.PointingHandCursor)
-            self.select_box.setToolTip(f"Select every {title} setting")
+            self.select_box.setToolTip(tr("Select every {title} setting", title=title))
             self.select_box.clicked.connect(self._on_select_clicked)
             btn_layout.addWidget(self.select_box)
 
+        self.icon_label: Optional[QLabel] = None
         if icon:
-            icon_label = QLabel()
-            icon_label.setPixmap(icon.pixmap(14, 14))
-            btn_layout.addWidget(icon_label)
+            self.icon_label = QLabel()
+            self.icon_label.setPixmap(icon.pixmap(14, 14))
+            btn_layout.addWidget(self.icon_label)
 
         self.title_label = QLabel(self._title_text)
         self.title_label.setStyleSheet(
@@ -120,17 +122,19 @@ class CollapsibleSection(QWidget):
         if info:
             # Nested in the header button, like reset_btn: it eats its own clicks, so opening the help
             # does not also collapse the section.
-            self.info_btn = header_button(qta.icon("fa5s.info-circle", color=THEME.text_muted), f"What am I looking at? — {title} guide")
+            self.info_btn = header_button(
+                qta.icon("fa5s.info-circle", color=THEME.text_muted), tr("What am I looking at? — {title} guide", title=title)
+            )
             self.info_btn.clicked.connect(self.info_requested)
             btn_layout.addWidget(self.info_btn)
 
-        self.reset_btn = header_button(qta.icon("fa5s.undo", color=THEME.text_muted), f"Reset {title} to defaults")
+        self.reset_btn = header_button(qta.icon("fa5s.undo", color=THEME.text_muted), tr("Reset {title} to defaults", title=title))
         self.reset_btn.setVisible(False)
         self.reset_btn.clicked.connect(self._on_reset_clicked)
         btn_layout.addWidget(self.reset_btn)
 
         # Hidden until set_roll_revert: most cards on most frames already follow the roll.
-        self.roll_revert_btn = header_button(roll_revert_icon(THEME.text_muted), f"Reset {title} to the roll's settings")
+        self.roll_revert_btn = header_button(roll_revert_icon(THEME.text_muted), tr("Reset {title} to the roll's settings", title=title))
         self.roll_revert_btn.setVisible(False)
         self.roll_revert_btn.clicked.connect(self.roll_revert_requested)
         btn_layout.addWidget(self.roll_revert_btn)

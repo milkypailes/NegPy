@@ -34,7 +34,7 @@ Actions with no default key are not listed; every one of them can still be bound
 ## Tools
 | Key | Action |
 |-----|--------|
-| `\` | Before/after split (auto baseline) |
+| `\` | Before/after split (auto baseline); hold for the whole frame as the baseline |
 | `Shift + W` | Toggle WB picker |
 | `Shift + C` | Toggle manual crop |
 | `Shift + D` | Toggle heal tool |
@@ -43,16 +43,17 @@ Actions with no default key are not listed; every one of them can still be bound
 | `Shift + J` | Toggle clone tool |
 | `Shift + B` | Toggle dodge & burn mask draw |
 | `Ctrl + R` | Toggle analysis region draw |
-| `M` | Peek flat scan (digital intermediate) |
-| `N` | Peek negative (source as loaded) |
-| `P` | Peek the camera's embedded preview |
+| `M` | Peek flat scan (digital intermediate); hold to peek only while down |
+| `N` | Peek negative (source as loaded); hold to peek only while down |
+| `P` | Peek the camera's embedded preview; hold to peek only while down |
 | `Shift + Z` | Adams zone overlay |
 | `Shift + T` | Density × grade test strip |
 | `Shift + F` | Color ring-around (M/Y filtration) |
 | `Shift + L` | Grain focuser loupe |
 | `Shift + N` | Printing notes (dodge/burn map + print recipe) |
+| `Shift + I` | Probe at cursor (zone, print density and ΔD beside the pointer) |
 | `Shift + P` | Soft proof the print on screen |
-| `Esc` | Leave the current view (peek, split, strip) or cancel the active tool |
+| `Esc` | Leave the current view (peek, split, strip, zone overlay) or cancel the active tool |
 
 ## Geometry
 | Key | Action |
@@ -71,6 +72,7 @@ Actions with no default key are not listed; every one of them can still be bound
 ## View
 | Key | Action |
 |-----|--------|
+| `I` | Frame info on the canvas: off, basic or full |
 | `Ctrl + [` | Toggle session panel (re-docks when floating) |
 | `Ctrl + ]` | Toggle controls panel (re-docks when floating) |
 | `Ctrl + Shift + L` | Dock session and controls panels |
@@ -169,6 +171,7 @@ Actions with no default key are not listed; every one of them can still be bound
 | Key | Action |
 |-----|--------|
 | `S` | Scan, or stop the capture |
+| `Space` | Scan, or stop the capture (second key) |
 | `R` | Retake the current frame |
 | `M` | Meter: set the shutter from one RAW probe |
 | `H` | Show the live histogram |
@@ -180,7 +183,7 @@ Actions with no default key are not listed; every one of them can still be bound
 | `?` | Show shortcuts |
 <!-- shortcuts:end -->
 
-While a test strip or ring-around is up, `[` and `]` turn that proof's ladder instead of the image. The first `Esc` clears in-progress points; the second puts the tool down.
+While a test strip or ring-around is up, `[` and `]` turn that proof's ladder instead of the image. While the paper test strip is up, `←` and `→` step to the neighbor paper instead of the neighbor file, `Enter` keeps the paper shown full frame, and `Esc` goes back to the strip. The first `Esc` clears in-progress points; the second puts the tool down.
 
 ## Mouse
 | Input | Action |

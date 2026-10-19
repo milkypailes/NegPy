@@ -17,14 +17,3 @@ def test_every_dodge_and_burn_color_reads_as_text_on_the_panel():
     for palette in PALETTES:
         for color in palette.dodge_burn:
             assert (_luminance(color) + 0.05) / (bg + 0.05) >= 3.0, (palette.key, color)
-
-
-def test_the_spot_mark_keeps_clear_of_foliage_and_sky():
-    """A single mark washed over the picture must not take a scene's own commonest hues."""
-    import colorsys
-
-    for palette in PALETTES:
-        r, g, b = (int(palette.spot[i : i + 2], 16) / 255 for i in (1, 3, 5))
-        hue, _lightness, saturation = colorsys.rgb_to_hls(r, g, b)
-        if saturation > 0.1:
-            assert not 60 <= hue * 360 <= 240, (palette.key, palette.spot)

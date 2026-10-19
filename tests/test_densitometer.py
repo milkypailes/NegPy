@@ -46,12 +46,54 @@ class TestMapDisplayToNorm(unittest.TestCase):
 class TestComputeReading(unittest.TestCase):
     _BOUNDS = LogNegativeBounds(floors=(0.0, 0.0, 0.0), ceils=(1.2, 1.0, 0.8))
 
+    def _assert_dd(self, reading, expected) -> None:
+        for got, want in zip(reading.dd_rgb, expected):
+            self.assertAlmostEqual(got, want, places=6)
+
     def test_delta_density_scales_with_bounds(self):
         r = compute_reading((0.5, 0.5, 0.5), self._BOUNDS, (0.5, 0.5, 0.5))
         self.assertAlmostEqual(r.dd_rgb[0], 0.6, places=6)
         self.assertAlmostEqual(r.dd_rgb[1], 0.5, places=6)
         self.assertAlmostEqual(r.dd_rgb[2], 0.4, places=6)
         self.assertAlmostEqual(r.val_luma, 0.5, places=6)
+
+    def test_delta_density_reads_up_from_the_thinnest_tone(self):
+        thin = compute_reading((1.0, 1.0, 1.0), self._BOUNDS, (0.5, 0.5, 0.5))
+        dense = compute_reading((0.0, 0.0, 0.0), self._BOUNDS, (0.5, 0.5, 0.5))
+        self._assert_dd(thin, (0.0, 0.0, 0.0))
+        self._assert_dd(dense, (1.2, 1.0, 0.8))
+
+    def test_a_positive_reads_the_same_way(self):
+        # A slide's window is reversed (floor > ceil): the floor is the thin end.
+        bounds = LogNegativeBounds(floors=(1.2, 1.0, 0.8), ceils=(0.0, 0.0, 0.0))
+        thin = compute_reading((0.0, 0.0, 0.0), bounds, (0.5, 0.5, 0.5))
+        dense = compute_reading((1.0, 1.0, 1.0), bounds, (0.5, 0.5, 0.5))
+        self._assert_dd(thin, (0.0, 0.0, 0.0))
+        self._assert_dd(dense, (1.2, 1.0, 0.8))
+
+    def test_one_crossed_channel_keeps_the_window_orientation(self):
+        # A trim that pushes one channel's ceiling under its floor does not flip that channel:
+        # the ceiling stays the thin end for all three, so the ceiling reads 0.0 on every channel.
+        bounds = LogNegativeBounds(floors=(0.0, 0.0, 0.0), ceils=(1.2, -0.1, 0.8))
+        at_ceiling = compute_reading((1.0, 1.0, 1.0), bounds, (0.5, 0.5, 0.5))
+        self._assert_dd(at_ceiling, (0.0, 0.0, 0.0))
+
+    def test_the_transfer_window_reads_from_decoder_white(self):
+        from negpy.features.transparency.logic import transfer_bounds
+
+        floors, ceils = transfer_bounds()
+        bounds = LogNegativeBounds(floors=floors, ceils=ceils)
+        white = compute_reading((0.0, 0.0, 0.0), bounds, (0.5, 0.5, 0.5))
+        dense = compute_reading((1.0, 1.0, 1.0), bounds, (0.5, 0.5, 0.5))
+        self._assert_dd(white, (0.0, 0.0, 0.0))
+        self._assert_dd(dense, tuple(-c for c in ceils))
+
+    def test_thinner_than_the_window_reads_below_zero(self):
+        # The rebate on a negative scanned with its border in frame: minus how far the
+        # frame's thinnest tone sits above it.
+        r = compute_reading((1.2, 1.2, 1.2), self._BOUNDS, (0.5, 0.5, 0.5))
+        for got, rng in zip(r.dd_rgb, (1.2, 1.0, 0.8)):
+            self.assertAlmostEqual(got, -0.2 * rng, places=6)
 
     def test_mid_gray_reads_zone_five(self):
         enc = float(working_oetf_encode(np.asarray([0.18], dtype=np.float32))[0])

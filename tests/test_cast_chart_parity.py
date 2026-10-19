@@ -15,7 +15,6 @@ from negpy.domain.models import WorkspaceConfig
 from negpy.features.exposure.logic import (
     cast_solve_inputs,
     curve_params_from_metrics,
-    normalized_shadow_refs,
     per_channel_curve_params,
 )
 from negpy.features.exposure.processor import NormalizationProcessor, PhotometricProcessor
@@ -55,19 +54,17 @@ def test_chart_wiring_matches_render():
     assert max(abs(c) for c in curvs) > 1e-6  # curved fixture engages the quadratic
 
     # Anti-vacuity: the old wiring (raw slider strength, no neutral axis) diverges.
-    bounds = metrics["final_bounds"]
     old_slopes, _, old_curvs = per_channel_curve_params(
         config.grade,
         config.density,
         config.auto_normalize_contrast,
         config.cast_removal_strength,
         metrics.get("norm_density_range"),
-        normalized_shadow_refs(bounds, metrics.get("shadow_log_refs")),
         metrics.get("textural_range"),
         anchor=metrics.get("metered_anchor"),
         grade_trims=(config.grade_trim_red, config.grade_trim_green, config.grade_trim_blue),
     )
-    assert max(abs(c) for c in old_curvs) == 0.0  # shadow-tie branch: no curvature
+    assert max(abs(c) for c in old_curvs) == 0.0  # no axis: the base curve
     assert max(abs(a - b) for a, b in zip(old_slopes, slopes)) > 1e-6
 
 
@@ -75,9 +72,8 @@ def test_confidence_derates_chart_strength():
     metrics, config = _metrics_and_config()
     confidence = metrics["neutral_axis_refs"][3]
     assert 0.0 < confidence < 1.0  # content block makes the grey set imperfect
-    strength, _, _ = cast_solve_inputs(
+    strength, _ = cast_solve_inputs(
         metrics["final_bounds"],
-        metrics.get("shadow_log_refs"),
         metrics.get("neutral_axis_refs"),
         config.cast_removal_strength,
     )

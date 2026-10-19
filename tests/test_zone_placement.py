@@ -560,8 +560,8 @@ class TestZoneStripArming(unittest.TestCase):
         from negpy.desktop.view.widgets.charts import ZoneStripWidget
 
         strip = ZoneStripWidget()
-        strip.resize(100, 24)
-        strip.update_data(np.full(10, 0.1))
+        strip.resize(110, 24)
+        strip.update_data(np.full(11, 0.1))
         return strip
 
     def _click(self, strip, x: float):
@@ -601,11 +601,11 @@ class TestZoneStripArming(unittest.TestCase):
         strip = self._strip()
         zones: list = []
         strip.zone_clicked.connect(zones.append)
-        for n, x in enumerate((5.0, 55.0, 99.0)):  # cells 0, V, IX
+        for n, x in enumerate((5.0, 55.0, 109.0)):  # cells 0, V, X
             self._click(strip, x)
             self.assertEqual(len(zones), n)  # nothing yet: the double-click interval is still running
             self._settle(strip)
-        self.assertEqual(zones, [0, 5, 9])
+        self.assertEqual(zones, [0, 5, 10])
 
     def test_a_double_click_toggles_the_overlay_and_arms_nothing(self):
         strip = self._strip()
@@ -649,7 +649,7 @@ class TestZoneStripArming(unittest.TestCase):
         from negpy.desktop.view.widgets.charts import ZoneStripWidget
 
         strip = ZoneStripWidget()
-        strip.resize(100, 24)
+        strip.resize(110, 24)
         zones: list = []
         strip.zone_clicked.connect(zones.append)
         self._click(strip, 55.0)

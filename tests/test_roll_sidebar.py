@@ -8,7 +8,8 @@ from dataclasses import replace
 from unittest.mock import MagicMock
 
 from negpy.desktop.session import AppState
-from negpy.desktop.view.sidebar.roll import RollAnalysisSidebar
+from negpy.desktop.view.sidebar.roll import STALE_ROLL_HINT, STALE_SCENE_TOOLTIP, RollAnalysisSidebar
+from negpy.desktop.view.styles.theme import THEME
 from negpy.infrastructure.storage.repository import StorageRepository
 from negpy.services.assets import rolls
 
@@ -199,6 +200,18 @@ def test_status_hint_is_blank_without_an_active_roll(qapp):
     assert sidebar.roll_status_hint.text() == ""
 
 
+def test_status_hint_flags_a_baseline_from_an_older_analysis_until_reanalyze(qapp, monkeypatch):
+    controller, sidebar, ids = _sidebar(roll_names=["Tri-X"], analyzed=["Tri-X"], active_name="Tri-X")
+    monkeypatch.setattr(rolls, "BOUNDS_VERSION", rolls.BOUNDS_VERSION + 1)
+    sidebar.sync_ui()
+    assert sidebar.roll_status_hint.text() == STALE_ROLL_HINT
+    assert sidebar.roll_status_hint.property("hint") == "warning"
+
+    rolls.set_roll_normalization(controller.session.repo, ids["Tri-X"], (0.1,) * 3, (0.9,) * 3, bounds_version=rolls.BOUNDS_VERSION)
+    sidebar.sync_ui()
+    assert sidebar.roll_status_hint.text() == ""
+
+
 def _scene_labels(sidebar):
     layout = sidebar._scene_rows_layout
     return [layout.itemAt(i).widget().layout().itemAt(0).widget().text() for i in range(layout.count())]
@@ -218,6 +231,20 @@ def test_scene_list_shows_each_scene_with_its_loaded_frames(qapp):
     assert "Beach · 2 frames · ✓" in labels[0]
     assert "Night · 0 frames" in labels[1] and "✓" not in labels[1]
     assert not sidebar.scenes_hint.isVisibleTo(sidebar)
+
+
+def test_a_scene_from_an_older_analysis_gets_an_amber_tick(qapp, monkeypatch):
+    controller, sidebar, ids = _sidebar(roll_names=["Tri-X"], active_name="Tri-X")
+    repo = controller.session.repo
+    beach = rolls.create_scene(repo, ids["Tri-X"], "Beach", ["h1"])
+    rolls.set_scene_normalization(repo, ids["Tri-X"], beach, (0.1, 0.1, 0.1), (0.9, 0.9, 0.9))
+    monkeypatch.setattr(rolls, "BOUNDS_VERSION", rolls.BOUNDS_VERSION + 1)
+
+    sidebar._refresh_scenes()
+
+    label = sidebar._scene_rows_layout.itemAt(0).widget().layout().itemAt(0).widget()
+    assert f'<span style="color:{THEME.warn_amber}">✓</span>' in label.text()
+    assert label.toolTip() == STALE_SCENE_TOOLTIP
 
 
 def test_scene_row_analyze_runs_scene_analysis(qapp):

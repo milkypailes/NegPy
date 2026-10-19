@@ -18,7 +18,6 @@ METER_KEYS = (
     "highlight_point",
     "final_bounds",
     "log_bounds",
-    "shadow_log_refs",
     "neutral_axis_refs",
 )
 

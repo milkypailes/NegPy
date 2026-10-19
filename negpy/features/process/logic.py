@@ -61,28 +61,17 @@ def demosaic_token(mode: str) -> str:
 def should_fold_camera_wb(process: ProcessConfig) -> bool:
     """Whether `camera_to_working_matrix` should fold the as-shot multipliers back in.
 
-    True when the decode skipped white balance (`effective_linear_raw`) *and* the capture
-    was not made under narrowband light. A camera's as-shot WB is a continuous-spectrum
-    estimate, and narrowband light has no color temperature that estimate can describe — the
-    same reason white balance cannot fix the hue rotation narrowband light imposes (see
-    docs/USER_GUIDE.md's Hue Trim). Folding it back in for a narrowband capture is not a
-    milder version of the correct fix, it is the wrong correction: there is no scene white
-    balance for the fold to reconstruct, whatever the camera happened to read.
-
-    The narrowband condition is `narrowband_profile_active`, not the stored flag: the flag
-    survives a mode switch and is inert on a slide, where nothing narrowband applies.
-
-    Also false whenever `highlight_reconstruction_bakes_wb` is true: the decode already
-    carries the real white balance in that case, and folding it again would double-apply
-    it — the same "decode and matrix must agree" rule this function exists for in the
-    first place.
+    True when the decode skipped white balance (`effective_linear_raw`). False whenever
+    `highlight_reconstruction_bakes_wb` is true: the decode already carries the real white
+    balance in that case, and folding it again would double-apply it — the same "decode and
+    matrix must agree" rule this function exists for in the first place.
 
     Every site that folds `camera_wb` into the capture matrix must ask this one question,
     the same way every decode asks `effective_linear_raw`.
     """
     if highlight_reconstruction_bakes_wb(process):
         return False
-    return effective_linear_raw(process) and not narrowband_profile_active(process)
+    return effective_linear_raw(process)
 
 
 VALID_HIGHLIGHT_LEVELS = frozenset({0, 2, 3, 4, 5, 6, 7, 8, 9})
@@ -99,10 +88,6 @@ def effective_highlight_reconstruction(process: ProcessConfig) -> int:
     never a level this control should expose. An out-of-range stored value resolves to 0
     rather than raising or passing a bogus number to rawpy.
 
-    Also 0 under `narrowband_scan`: a triplet's single raw channel per exposure carries no
-    "highlight color" for libraw to reconstruct — the same reasoning `should_fold_camera_wb`
-    applies to the WB fold.
-
     On a merged bracket the stored value is already 0 (`WorkspaceConfig.__post_init__`), so
     nothing here has to ask: a reconstructed pixel no longer reads near the sensor ceiling,
     which is what the merge's own clip detection trusts to find a genuine highlight.
@@ -110,7 +95,7 @@ def effective_highlight_reconstruction(process: ProcessConfig) -> int:
     Every site that sets `highlight_mode` on a decode must ask this one question, the same
     way every decode asks `effective_linear_raw`.
     """
-    if process.process_mode != ProcessMode.E6 or process.narrowband_scan:
+    if process.process_mode != ProcessMode.E6:
         return 0
     value = int(process.highlight_reconstruction)
     return value if value in VALID_HIGHLIGHT_LEVELS else 0
@@ -186,28 +171,6 @@ def highlight_reconstruction_bright_gain(wb: Optional[Sequence[float]], highligh
     if len(values) != 3 or not all(v > 0.0 and np.isfinite(v) for v in values):
         return 1.0
     return max(values) / min(values)
-
-
-def narrowband_allowed(process: ProcessConfig) -> bool:
-    """Whether narrowband capture applies to this film at all. Never to a transparency.
-
-    The bundled profile characterises narrowband capture of *negative* dyes; E-6 is a
-    different dye set, so on a slide it is a fixed 3x3 derived from the wrong film — an
-    approximate correction for dyes that are not there, which is worse than none.
-    Narrowband's real payoffs (defeating the orange mask, clean separation ahead of a
-    high-gain inversion) belong to negatives, and a slide has neither.
-
-    Single source of truth for the rule: the sensor panel greys Narrowband and the scan
-    setup on it, `narrowband_profile_active` and `unmix_block_reason` refuse on it.
-    """
-    return process.process_mode != ProcessMode.E6
-
-
-def narrowband_profile_active(process: ProcessConfig) -> bool:
-    """Whether the bundled RGBScan input profile applies (`effective_input_icc` reads it).
-    An explicit Input ICC is a deliberate choice about the user's own source and still
-    wins — that decision is not made here."""
-    return process.narrowband_scan and narrowband_allowed(process)
 
 
 # Tuned against real sample scans; see tests/test_process_detect.py.

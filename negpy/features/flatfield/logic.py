@@ -26,9 +26,10 @@ _BLUR_DIVISOR = 64.0
 _CHECK_COPY_SIZE = 512
 
 # Below _LIT_FRACTION of the _LIT_PERCENTILE luminance is carrier (a percentile, so a carrier that fills
-# most of the frame still reads dark). Under _MIN_LIT_FRACTION lit pixels the whole frame is used.
+# most of the frame still reads dark). The fraction puts a carrier's soft shadow edge on the carrier side
+# and keeps a light source's corner falloff lit. Under _MIN_LIT_FRACTION lit pixels the whole frame is used.
 _LIT_PERCENTILE = 95.0
-_LIT_FRACTION = 0.2
+_LIT_FRACTION = 0.35
 _MIN_LIT_FRACTION = 0.02
 # Below this blurred lit weight a pixel is too far from the lit area for the normalized blur
 # to hold, and takes the value of the nearest pixel that is not.
@@ -120,9 +121,10 @@ def _lit_mask(ref: np.ndarray) -> np.ndarray:
     """1 where the reference sees the light source, 0 on carrier or mask edges in frame."""
     lum = ref.mean(axis=2)
     lit = (lum > _LIT_FRACTION * np.percentile(lum, _LIT_PERCENTILE)).astype(np.uint8)
-    # Drop the soft transition the downsample leaves at the carrier edge. Outside the image
-    # counts as dark, so a partly lit carrier lip on the outermost row or column goes too.
-    lit = cv2.erode(lit, np.ones((3, 3), np.uint8), borderType=cv2.BORDER_CONSTANT, borderValue=0)
+    # Drop the soft transition at the carrier edge: a holder's shadow edge spans about two pixels
+    # here above the fraction. Outside the image counts as dark, so a partly lit carrier lip on the
+    # outermost rows or columns goes too.
+    lit = cv2.erode(lit, np.ones((5, 5), np.uint8), borderType=cv2.BORDER_CONSTANT, borderValue=0)
     if lit.sum() < _MIN_LIT_FRACTION * lit.size:
         logger.warning("Flat-field: reference is almost all dark; computing the gain over the whole frame")
         return np.ones(lum.shape, np.float32)

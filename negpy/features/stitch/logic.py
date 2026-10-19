@@ -161,8 +161,10 @@ def gain_compensate(ref: np.ndarray, ref_mask: np.ndarray, mov: np.ndarray, mov_
     overlap = ref_mask & mov_mask
     if int(overlap.sum()) < _MIN_OVERLAP_PX:
         return mov
-    ref_mean = ref[overlap].mean(axis=0)
-    mov_mean = mov[overlap].mean(axis=0)
+    # float64: a full-res overlap is tens of millions of rows, and a float32 axis-0 sum
+    # drifts per channel, so export gains would differ from the preview's.
+    ref_mean = ref[overlap].mean(axis=0, dtype=np.float64)
+    mov_mean = mov[overlap].mean(axis=0, dtype=np.float64)
     if np.any(mov_mean < 1e-6):
         return mov
     mov *= (ref_mean / mov_mean).astype(np.float32)

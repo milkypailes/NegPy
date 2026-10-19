@@ -52,7 +52,7 @@ def test_tone_carries_its_print_rows_but_not_the_tonal_range():
 
 def test_paper_response_owns_the_paper_curve_rows_and_tone_does_not():
     paper = {r.label for r in _rows_for("paper")}
-    assert {"Paper Profile", "Paper White", "Snap", "Toe Trim", "Dye Separation", "Separation Damping"} <= paper
+    assert {"Print Stock", "Paper White", "Snap", "Toe Trim", "Dye Separation", "Separation Damping"} <= paper
     assert paper & {r.label for r in _rows_for("tone")} == set()
 
 

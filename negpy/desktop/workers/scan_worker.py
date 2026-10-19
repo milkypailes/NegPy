@@ -1,3 +1,4 @@
+from negpy.kernel.system.i18n import tr
 import dataclasses
 import threading
 from dataclasses import dataclass, field
@@ -96,6 +97,7 @@ class ScanWorker(QObject):
     error = pyqtSignal(str)
     ejected = pyqtSignal(bool)
     eject_error = pyqtSignal(str)
+    media_polled = pyqtSignal(str, object)  # device id; True, False, or None where the backend cannot tell
     # Emitted after the operation's own error, so a listener that clears the frame state has the last word.
     strip_returned = pyqtSignal(bool)  # the strip is back in the holder
     roll_preview_ready = pyqtSignal(object)  # roll preview: one RollPreview per slot
@@ -221,7 +223,7 @@ class ScanWorker(QObject):
         elif kind == "cancelled":
             self.cancelled.emit()
         else:
-            self.error.emit(payload or "Unknown scan error")
+            self.error.emit(payload or tr("Unknown scan error"))
         if returned is not None:
             self.strip_returned.emit(returned.loaded)
 
@@ -308,7 +310,7 @@ class ScanWorker(QObject):
         if kind == "cancelled":
             self.cancelled.emit()
         elif kind == "error":
-            self.error.emit(payload or "Unknown scan error")
+            self.error.emit(payload or tr("Unknown scan error"))
             if returned is not None:
                 self.strip_returned.emit(returned.loaded)
         elif kind == "finished" and req.eject_when_done:
@@ -318,7 +320,7 @@ class ScanWorker(QObject):
 
     def _whole_strip(self, service: ScannerService, req: BatchRequest) -> list[int]:
         """Every frame on the loaded film, for a request that named none."""
-        count = service.detect_frames(req.device_id, film_format=req.params.film_format)
+        count = service.detect_frames(req.device_id, film_format=req.params.film_format, film_type=req.params.film_type)
         if count <= 0:
             raise RuntimeError("No frames were detected on the loaded film")
         return list(range(1, count + 1))
@@ -348,7 +350,7 @@ class ScanWorker(QObject):
                 try:
                     for slot, offset in req.offsets.items():
                         session.set_offset(slot, offset)
-                    for preview in session.preview(req.slots, cancel=self._cancel_event):
+                    for preview in session.preview(req.slots, cancel=self._cancel_event, progress=self.progress.emit):
                         self.roll_preview_ready.emit(preview)
                 finally:
                     session.close()
@@ -366,7 +368,7 @@ class ScanWorker(QObject):
         if kind == "cancelled":
             self.cancelled.emit()
         elif kind == "error":
-            self.error.emit(payload or "Unknown scan error")
+            self.error.emit(payload or tr("Unknown scan error"))
         else:
             self.roll_preview_finished.emit()
         if returned is not None:
@@ -488,6 +490,16 @@ class ScanWorker(QObject):
     def cancel(self) -> None:
         """Signal the scan to stop."""
         self._cancel_event.set()
+
+    @pyqtSlot(str)
+    def poll_media(self, device_id: str) -> None:
+        """Whether film is loaded. Always emits media_polled, None if the poll failed."""
+        try:
+            loaded = self._ensure_service().media_loaded(device_id)
+        except Exception as error:
+            logger.debug("Film poll of %s failed: %s", device_id, error)
+            loaded = None
+        self.media_polled.emit(device_id, loaded)
 
     @pyqtSlot(str)
     def eject(self, device_id: str) -> None:

@@ -1,6 +1,8 @@
+from PyQt6.QtCore import Qt
+from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QHBoxLayout, QWidget
 
-from negpy.desktop.view.styles.templates import ICON_BUTTON_WIDTH, labeled_action, labeled_toggle, tool_toggle
+from negpy.desktop.view.styles.templates import ICON_BUTTON_WIDTH, clearable_tool_toggle, labeled_action, labeled_toggle, tool_toggle
 
 
 def _row(width: int, *buttons) -> QWidget:
@@ -38,3 +40,20 @@ def test_text_only_and_icon_only_buttons_keep_their_own_minimum(qapp):
     icon_only = tool_toggle("fa5s.magic", "", "tip")
     assert text_only.minimumSizeHint().width() > ICON_BUTTON_WIDTH
     assert not icon_only._compact()
+
+
+def test_clearable_tool_toggle_pins_a_hidden_clear_inside_its_right_edge(qapp):
+    btn = clearable_tool_toggle("fa5s.crosshairs", "Film Base", "tip", "clear tip")
+    root = _row(240, btn)
+    clear = btn.clear_btn
+
+    assert clear.parentWidget() is btn and not clear.isVisibleTo(btn)
+    clear.show()
+    qapp.processEvents()
+    assert clear.geometry().right() < btn.width() and clear.geometry().left() > btn.width() // 2
+
+    clicks = []
+    clear.clicked.connect(lambda: clicks.append(1))
+    QTest.mouseClick(clear, Qt.MouseButton.LeftButton)
+    assert clicks == [1] and not btn.isChecked(), "a click on the clear never toggles the tool"
+    root.close()

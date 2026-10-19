@@ -583,8 +583,8 @@ class TestDyeSeparationReference(unittest.TestCase):
 
 
 class TestCaptureTogglesAreInert(unittest.TestCase):
-    """Linear RAW and Narrowband are both sticky global settings that would otherwise
-    change this render invisibly. Hiding them is only safe because they do nothing here."""
+    """Linear RAW is a sticky global setting that would otherwise change this render
+    invisibly. Hiding it is only safe because it does nothing here."""
 
     def _wb_applied(self):
         rng = np.random.default_rng(23)

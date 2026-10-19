@@ -3,6 +3,8 @@ expand that reach all of them at once. Cards keep their own headers."""
 
 from unittest.mock import MagicMock, patch
 
+from PyQt6.QtGui import QIcon
+
 from negpy.desktop.settings_catalog import COLOR_FIELDS, GEOMETRY_FIELDS, rows_for_fields, rows_for_section
 from negpy.desktop.view.sidebar.controls_panel import ControlsPanel
 from negpy.desktop.view.widgets.collapsible import CollapsibleSection
@@ -208,3 +210,26 @@ def test_reset_to_roll_on_the_roll_tab_reaches_both_optics_cards():
     ControlsPanel.revert_cards_to_roll(panel, ("process", "optics"))
 
     panel.controller.revert_to_roll.assert_called_once_with(["process", "lens", "flatfield"])
+
+
+def test_a_lead_toggle_takes_the_layers_icons_place():
+    header = TabHeader("Exposure")
+    row = header._header_row
+
+    btn = header.add_lead_toggle(QIcon(), "Pick Better")
+
+    assert btn.isCheckable()
+    assert header.icon_label.isHidden()
+    assert row.indexOf(btn) < row.indexOf(header.title_label)
+
+
+def test_pick_better_leads_the_exposure_header():
+    header = TabHeader("Exposure")
+    panel = MagicMock()
+    panel._pick_better_tooltip = ControlsPanel._pick_better_tooltip
+
+    ControlsPanel._add_pick_better(panel, header)
+    panel.pick_better_btn.click()
+
+    assert header._header_row.indexOf(panel.pick_better_btn) == 0
+    panel.controller.toggle_pick_better.assert_called_once_with(force=True)

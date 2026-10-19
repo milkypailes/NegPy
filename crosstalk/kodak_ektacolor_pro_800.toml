@@ -1,7 +1,12 @@
 name = "Kodak Ektacolor Pro 800 / Portra 800 (approx)"
 type = "specsheet-based"
+
+# 3x3 row-major density unmixing matrix (out R/G/B × in R/G/B)
+# Estimated: datasheet E-4040 plots only a midscale neutral, so its curve above D-min is fitted
+# with the Vision3 dye curves (scripts/fit_crosstalk_estimates.py), sampled at 650/550/450 nm per
+# the crosstalk-from-datasheet skill.
 matrix = [
-  [1.0000,  -0.0201,   0.0008],
-  [-0.1368,   1.0000,  -0.0400],
-  [-0.0578,  -0.1588,   1.0000],
+  [ 1.0000, -0.0734, -0.0005 ],
+  [-0.0922,  1.0000, -0.0699 ],
+  [-0.1111,  0.0134,  1.0000 ],
 ]

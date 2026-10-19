@@ -29,9 +29,9 @@ Scanner support (optional):
     brew install sane-backends
     ```
 
-- **Plustek USB** (Windows/macOS/Linux): the [pyopticfilm](https://github.com/jboneng/pyopticfilm) driver: `uv sync --group plustek` or `pip install negpy[plustek]`. On Windows, pyopticfilm installs `libusb-package`, and the scanner needs WinUSB bound with Zadig in place of the vendor/SilverFast driver (`07b3:1825` 8200i SE, `07b3:1824` 8100 V2). See [docs/PLUSTEK_WINDOWS.md](docs/PLUSTEK_WINDOWS.md).
+- **Plustek USB** (Windows/macOS/Linux): the [pyopticfilm](https://github.com/jboneng/pyopticfilm) driver (**1.3.6** or later): `uv sync --group plustek` or `pip install negpy[plustek]`. On Windows, pyopticfilm installs `libusb-package`, and the scanner needs WinUSB bound with Zadig in place of the vendor/SilverFast driver (`07b3:1825` 8200i SE, `07b3:1824` 8100 V2, `07b3:181f` 8300i SE, `07b3:0c3b` 7600i v1). See [docs/PLUSTEK_WINDOWS.md](docs/PLUSTEK_WINDOWS.md).
 
-- **Nikon Coolscan** (Windows/macOS/Linux): [nkscan](https://github.com/activexray/nkscan) 0.12 or newer, shipped as wheels: `uv sync --group nkscan` or `pip install negpy[nkscan]`. On Linux, USB needs a udev rule for vendor `04b0`, and FireWire/SCSI needs the `sg` module.
+- **Nikon Coolscan** (Windows/macOS/Linux): [nkscan](https://github.com/activexray/nkscan) 0.14 or newer, shipped as wheels: `uv sync --group nkscan` or `pip install negpy[nkscan]`. On Linux, USB needs a udev rule for vendor `04b0`, and FireWire/SCSI needs the `sg` module.
 
 
 ### 2. Python Environment
@@ -155,6 +155,15 @@ Every developer command runs through `uv run`:
 - `make run-sim`: run with simulated scanning hardware (see [above](#running-without-scanning-hardware)).
 - `make clear-devhome`: delete the development user directory (see [above](#a-separate-user-directory-for-development)).
 
+
+## Translations
+
+Wrap display text in `tr("English source", name=value)` and translate the whole template before inserting values. Use `mark` for catalog labels that also serve as lookup keys, then call `tr` when displaying them. Keep enum values, settings keys, paths and user text unchanged. Language is an application preference and takes effect after a restart.
+
+Register languages in `LANGUAGES` (`negpy/kernel/system/i18n.py`), using the matching Qt catalog locale, and set their count forms in `kernel/system/text.py`. `make translations` updates every registered JSON catalog under `negpy/translations/`. Fill new entries, then run `make translations-check` to check coverage and placeholders for all catalogs. Localized panel guides use the same `<!-- panel:key -->` markers as `docs/USER_GUIDE.md`, plus `src:<hash>` of the English section they translate; `tests/test_i18n.py` names each stale panel and its new marker. Missing panels fall back to English. Include new catalog and guide files in the packaged resources.
+
+For translation updates after releases or upstream merges, use the
+[update-translations skill](.claude/skills/update-translations/SKILL.md).
 
 ## Building and Packaging
 

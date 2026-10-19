@@ -86,6 +86,25 @@ def test_half_lit_carrier_on_the_image_border_is_masked():
     assert np.abs(ratio / np.median(ratio) - 1.0).max() < 0.01
 
 
+def test_soft_carrier_edge_stays_out_of_the_gain():
+    h, w = 128, 192
+    clean = _radial_falloff(h, w)
+    soft = clean.copy()
+    soft[-6:] *= 0.15  # carrier rail, lit by stray light
+    soft[-9:-6] *= np.linspace(1.0, 0.15, 5, dtype=np.float32)[1:-1, None, None]  # its shadow edge
+
+    ratio = (soft * ff.compute_gain(soft))[:-13] / (clean * ff.compute_gain(clean))[:-13]
+    assert np.abs(ratio / np.median(ratio) - 1.0).max() < 0.01
+
+
+def test_strong_corner_falloff_stays_lit():
+    yy, xx = np.mgrid[0:128, 0:192].astype(np.float32)
+    r = np.sqrt(((yy - 63.5) / 63.5) ** 2 + ((xx - 95.5) / 95.5) ** 2) / np.sqrt(2)
+    reference = np.repeat((1.0 - 0.6 * r)[:, :, None], 3, axis=2)  # corners at 0.4 of the center
+
+    assert ff._lit_mask(reference)[2:-2, 2:-2].all()
+
+
 def test_carrier_filling_most_of_the_reference_is_masked():
     h, w = 128, 192
     reference = np.full((h, w, 3), 0.01, dtype=np.float32)

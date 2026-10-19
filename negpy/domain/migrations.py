@@ -78,6 +78,8 @@ DROPPED_KEYS: frozenset[str] = frozenset(
         "e6_normalize",
         # Batch metadata sync: Metadata cards are roll defaults, so every frame already carries the roll's values.
         "sync_to_batch",
+        # Narrowband and its bundled input profile became the Pakon print stock (migrate_flat_config).
+        "narrowband_scan",
         # The pixel-grid contact sheet; the darkroom sheet keeps its settings app-wide, not per edit.
         "contact_sheet_cell_px",
         "contact_sheet_gap",
@@ -94,6 +96,8 @@ DROPPED_KEYS: frozenset[str] = frozenset(
         "contact_sheet_default_show_labels",
         "contact_sheet_default_background_color",
         "contact_sheet_default_label_color",
+        # The on-export bake is now an app-global toggle, not a per-edit field.
+        "export_bake_auto_density_grade",
     }
 )
 
@@ -210,6 +214,15 @@ def migrate_flat_config(data: Dict[str, Any]) -> Dict[str, Any]:
     # of a bool each. The three lith_* sliders kept their names.
     if "lith_enabled" in data and "alt_process" not in data:
         data["alt_process"] = "lith" if data["lith_enabled"] else "none"
+
+    # Narrowband applied RGBScan.icc on a negative's print, which the Pakon stock reproduces on
+    # Digital's curve. Another stock or a slide or B&W edit keeps its paper.
+    if (
+        data.get("narrowband_scan")
+        and str(data.get("process_mode", "")) not in ("B&W Negative", "B&W", "Transparency", "E-6")
+        and data.get("paper_profile", "neutral") == "neutral"
+    ):
+        data["paper_profile"] = "pakon"
 
     if "export_fmt" in data:
         data["export_fmt"] = migrate_export_fmt(str(data["export_fmt"]))

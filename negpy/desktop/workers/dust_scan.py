@@ -6,6 +6,7 @@ import numpy as np
 from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
 
 from negpy.domain.models import WorkspaceConfig
+from negpy.kernel.system.i18n import tr
 from negpy.services.rendering.image_processor import ImageProcessor
 
 
@@ -141,7 +142,7 @@ class DustScanWorker(QObject):
             kept, dropped = filter_strokes_by_score(strokes, manual, f32.shape[:2])
             self.finished.emit(kept, len(dropped), task.key)
         except Exception as e:
-            self.error.emit(f"Full-res dust scan failed: {e}", task.key)
+            self.error.emit(tr("Full-res dust scan failed: {e}", e=e), task.key)
         finally:
             self._processor.cleanup(release_source_cache=True, collect=False)
             gc.collect()

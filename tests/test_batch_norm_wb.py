@@ -151,6 +151,44 @@ def test_batch_analysis_meters_each_frames_own_region(qapp, monkeypatch):
     assert by_roi == {(2, 6, 2, 6): 0.0, None: 0.12}
 
 
+def test_batch_analysis_meters_the_meter_rect_of_a_frame_with_no_crop(qapp, monkeypatch):
+    """As its render does: a frozen meter rect stands in for a crop, a crop outranks it, and a
+    rect frozen under another detection is found again (here: no film box, so the whole frame)."""
+    import negpy.features.exposure.normalization as norm_mod
+    from negpy.features.geometry.logic import meter_detection_key
+
+    captured_kwargs: list[dict] = []
+
+    class _Bounds:
+        floors = (0.0, 0.0, 0.0)
+        ceils = (1.0, 1.0, 1.0)
+
+    def _spy(transformed, **kwargs):
+        captured_kwargs.append(kwargs)
+        return _Bounds()
+
+    monkeypatch.setattr(norm_mod, "analyze_log_exposure_bounds", _spy)
+
+    base = WorkspaceConfig()
+    meter = dict(meter_rect=(0.25, 0.25, 0.75, 0.75), meter_key=meter_detection_key(base.geometry, (8, 8)))
+    settings = {
+        "h_meter": replace(base, process=replace(base.process, **meter)),
+        "h_crop": replace(base, geometry=replace(base.geometry, crop_rect=(0.0, 0.0, 0.5, 1.0)), process=replace(base.process, **meter)),
+        "h_stale": replace(base, process=replace(base.process, meter_rect=(0.25, 0.25, 0.75, 0.75), meter_key="stale")),
+    }
+    task = NormalizationTask(
+        frames=_frames(settings),
+        workspace_color_space="sRGB",
+        override_analysis_buffer=0.12,
+        override_luma_range_clip=0.0,
+        override_color_range_clip=0.0,
+    )
+
+    NormalizationWorker(_FakePreviewService()).process(task)
+
+    assert sorted((kw["roi"] for kw in captured_kwargs), key=str) == sorted([(2, 6, 2, 6), (0, 8, 0, 4), None], key=str)
+
+
 class _VaryingPreviewService(_FakePreviewService):
     """Decodes each file to a flat color driven by `fills`, so a mocked analysis
     function can derive deterministic, per-file bounds straight from the pixel data."""

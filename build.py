@@ -70,16 +70,20 @@ params = [
     # lookup actually looks.
     "--hidden-import=pieusb",
     "--collect-all=libusb_package",
-    # Plustek / pyopticfilm: ship PyUSB + bundled libusb on Windows only.
-    # Linux/macOS use host libusb via PyUSB (same stack SANE needs).
+    # Plustek / pyopticfilm on every platform. --collect-all pulls in
+    # pyopticfilm.device.data (7600i V1 capture tables via importlib.resources);
+    # a bare analysis miss leaves Linux/macOS freezes without that package.
+    "--hidden-import=pyopticfilm",
+    "--hidden-import=pyopticfilm.device.data",
+    "--collect-all=pyopticfilm",
+    # Ship PyUSB + bundled libusb on Windows only. Linux/macOS use host libusb
+    # via PyUSB (same stack SANE needs).
     *(
         [
             "--hidden-import=usb",
             "--hidden-import=usb.core",
             "--hidden-import=usb.backend.libusb1",
-            "--hidden-import=pyopticfilm",
             "--collect-all=usb",
-            "--collect-all=pyopticfilm",
         ]
         if is_windows
         else []
@@ -95,6 +99,7 @@ params = [
     "--collect-all=onnxruntime",
     # Data files
     "--add-data=negpy/features/exposure/shaders:negpy/features/exposure/shaders",
+    "--add-data=negpy/features/exposure/print_luts:negpy/features/exposure/print_luts",
     "--add-data=negpy/features/geometry/shaders:negpy/features/geometry/shaders",
     "--add-data=negpy/features/toning/shaders:negpy/features/toning/shaders",
     "--add-data=negpy/features/lab/shaders:negpy/features/lab/shaders",
@@ -104,6 +109,7 @@ params = [
     "--add-data=negpy/features/finish/shaders:negpy/features/finish/shaders",
     "--add-data=negpy/features/transparency/shaders:negpy/features/transparency/shaders",
     "--add-data=negpy/desktop/view/styles:negpy/desktop/view/styles",
+    "--add-data=negpy/translations:negpy/translations",
     "--add-data=icc:icc",
     "--add-data=media:media",
     "--add-data=crosstalk:crosstalk",

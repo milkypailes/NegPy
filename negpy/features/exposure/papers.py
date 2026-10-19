@@ -22,13 +22,12 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 from negpy.features.exposure.models import EXPOSURE_CONSTANTS
+from negpy.features.exposure.print_lut import DyeLut, DyeMatrix, DyeMatrixRows, PrintColor, PrintLut, load_print_lut
 from negpy.features.process.models import ProcessMode
 
 DEFAULT_PROFILE_KEY = "neutral"
 
-DyeMatrix = Tuple[Tuple[float, float, float], Tuple[float, float, float], Tuple[float, float, float]]
-
-_IDENTITY_DYE: DyeMatrix = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+_IDENTITY_DYE: DyeMatrixRows = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
 
 # Lith hue path: four (a*, b*) anchors at the density fractions in
 # LITH_CONSTANTS["path_u"], reading peach, ochre, olive, neutral. The olive knot is not
@@ -36,19 +35,13 @@ _IDENTITY_DYE: DyeMatrix = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
 # signature of a lith print on warmtone paper.
 LithPath = Tuple[Tuple[float, float], Tuple[float, float], Tuple[float, float], Tuple[float, float]]
 
-# The default belongs to the *Neutral* profile, so it stays restrained: a hint of warmth,
+# The default belongs to the *Digital* profile, so it stays restrained: a hint of warmth,
 # not a look. Pick a warmtone paper to get the color.
 _DEFAULT_LITH_PATH: LithPath = ((4.0, 8.0), (2.0, 8.0), (-1.0, 4.0), (0.0, 0.0))
 
-# Kodak Endura dye coupling, estimated, not measured: cyan absorbs some green, magenta some blue.
-# Shared by every Kodak RA4 paper. A matrix integrated from a datasheet's dye-density curves
-# holds the unwanted absorptions but not the interimage effects that offset them, so it renders
-# duller than the print.
-_ENDURA_DYE: DyeMatrix = (
-    (0.95, 0.04, 0.01),
-    (0.08, 0.88, 0.04),
-    (0.04, 0.14, 0.82),
-)
+# A color stock's dyes are a LUT baked by scripts/build_print_luts.py (negpy/features/exposure/print_luts/):
+# a datasheet's spectral dye density curves, or a minilab's measured profile. Stocks on one datasheet's
+# dyes share its LUT.
 
 # Paper-character keys a profile overrides in the effective constants dict.
 _TONAL_KEYS = (
@@ -71,14 +64,17 @@ class PaperProfile:
 
     channel_gamma — per-channel (R, G, B) slope multipliers (dye-layer contrast
     crossover). base_tint_cmy — per-channel (C, M, Y) additions to the minimum
-    density floor (base tint, shows in highlights). dye_matrix — dye coupling
-    D_rgb = M · D_dye above base (unwanted absorptions), row-normalized at use.
+    density floor (base tint, shows in highlights). print_color — the stock's dyes: a
+    DyeMatrix coupling D_rgb = M · D_dye above base, or a DyeLut from dye density to color.
     lith_path — the paper's lith color path, read by the Lith stage.
-    kind drives dropdown grouping.
+    kind picks the process mode the paper shows in; medium is its group in the dropdown;
+    short names it on a paper test strip band.
     """
 
     label: str
+    short: str = ""
     kind: str = "ra4"  # "default" | "bw" | "ra4"
+    medium: str = "paper"  # "digital" | "paper" | "film"
     d_max: float = EXPOSURE_CONSTANTS["d_max"]
     d_min: float = EXPOSURE_CONSTANTS["d_min"]
     toe_sharpness_base: float = EXPOSURE_CONSTANTS["toe_sharpness_base"]
@@ -89,15 +85,18 @@ class PaperProfile:
     paper_gamma_width: float = EXPOSURE_CONSTANTS["paper_gamma_width"]
     channel_gamma: Tuple[float, float, float] = (1.0, 1.0, 1.0)
     base_tint_cmy: Tuple[float, float, float] = (0.0, 0.0, 0.0)
-    dye_matrix: DyeMatrix = _IDENTITY_DYE
+    print_color: PrintColor = DyeMatrix(_IDENTITY_DYE)
     lith_path: LithPath = _DEFAULT_LITH_PATH
 
 
 PAPER_PROFILES: Dict[str, PaperProfile] = {
-    DEFAULT_PROFILE_KEY: PaperProfile(label="Neutral (default)", kind="default"),
+    DEFAULT_PROFILE_KEY: PaperProfile(label="Digital (Adobe RGB)", short="Digital", kind="default", medium="digital"),
+    # Digital's curve with a Pakon minilab's colors: the LUT is RGBScan.icc applied to Digital's print.
+    "pakon": PaperProfile(label="Digital (Pakon Minilab)", short="Pakon", kind="ra4", medium="digital", print_color=DyeLut("pakon")),
     # ── B&W (tonal only) ──────────────────────────────────────────────────────
     "ilford_mg_rc": PaperProfile(
         label="Ilford Multigrade RC",
+        short="MG RC",
         toe_sharpness_base=4.0,
         kind="bw",
         # Neutral VC workhorse; Dmax ~2.1, normal contrast.
@@ -110,6 +109,7 @@ PAPER_PROFILES: Dict[str, PaperProfile] = {
     ),
     "ilford_fb_classic": PaperProfile(
         label="Ilford Multigrade FB Classic",
+        short="MG FB",
         kind="bw",
         # Baryta, deeper blacks + crisper shadow knee than RC.
         d_max=2.15,
@@ -119,6 +119,7 @@ PAPER_PROFILES: Dict[str, PaperProfile] = {
     ),
     "foma_fomatone": PaperProfile(
         label="Foma Fomatone MG Classic",
+        short="Fomatone",
         kind="bw",
         # Warm chlorobromide; gentler rendering, Dmax ~2.0.
         d_max=2.0,
@@ -131,6 +132,7 @@ PAPER_PROFILES: Dict[str, PaperProfile] = {
     ),
     "foma_fomabrom": PaperProfile(
         label="Foma Fomabrom Variant",
+        short="Fomabrom",
         toe_sharpness_base=4.0,
         kind="bw",
         # Neutral baryta, Dmax 2.0.
@@ -143,6 +145,7 @@ PAPER_PROFILES: Dict[str, PaperProfile] = {
     # Fitted to Kodak G-26 (seven filter grades, F surface, Dektol 1:2).
     "kodak_polymax_ii": PaperProfile(
         label="Kodak Polymax II RC",
+        short="Polymax II",
         kind="bw",
         d_max=2.13,
         d_min=0.062,
@@ -154,6 +157,7 @@ PAPER_PROFILES: Dict[str, PaperProfile] = {
     # Fitted to Kodak G-4037 (four filter grades, E surface, Dektol 1:2).
     "kodak_polycontrast_iv": PaperProfile(
         label="Kodak Polycontrast IV RC",
+        short="Polycontrast IV",
         kind="bw",
         d_max=2.15,
         d_min=0.062,
@@ -165,6 +169,7 @@ PAPER_PROFILES: Dict[str, PaperProfile] = {
     # ── RA4 color ───────────────────────────────────────────────────────────
     "kodak_endura": PaperProfile(
         label="Kodak Endura Premier",
+        short="Endura Premier",
         kind="ra4",
         # Neutral, with deep blacks and a punchy midtone S. The datasheet R/G/B diverge only at
         # Dmax, red densest, which cools the deep shadows. Approximated with a small
@@ -174,30 +179,42 @@ PAPER_PROFILES: Dict[str, PaperProfile] = {
         toe_sharpness_base=3.5,
         paper_midtone_gamma=0.22,
         channel_gamma=(1.04, 1.0, 0.98),
-        dye_matrix=_ENDURA_DYE,
+        # Dyes from E-4070's spectral dye density curves, under D50.
+        print_color=DyeLut("kodak_e4070"),
     ),
+    # Fuji publishes no characteristic curve. The knees are fitted to the grey wedge koraks.nl
+    # measured on ADOX Color Mission, a Crystal Archive paper; the midtone takes Endura Premier's
+    # shape, a consumer RA4 paper of like contrast. Paper white, base tint, Dmax and dyes come from
+    # Fujifilm's Frontier-PD profile for the paper; the HD stock keeps this curve with its own profile.
     "fuji_crystal": PaperProfile(
         label="Fujicolor Crystal Archive",
-        toe_sharpness_base=4.0,
+        short="Crystal Archive",
         kind="ra4",
-        # No published curve, so this is a rough estimate: brilliant whites, vivid blue and
-        # green, a slightly cool base. The tint is a per-channel density offset, where positive
-        # darkens that channel, so a negative M/Y lifts green and blue for the vivid look.
-        d_max=2.35,
-        d_min=0.03,
-        paper_midtone_gamma=0.15,
-        channel_gamma=(1.0, 1.03, 1.05),
-        base_tint_cmy=(0.0, -0.01, -0.015),
-        # Estimated, not measured: slightly cleaner dyes than Endura.
-        dye_matrix=(
-            (0.96, 0.03, 0.01),
-            (0.06, 0.91, 0.03),
-            (0.03, 0.11, 0.86),
-        ),
+        d_max=2.42,
+        d_min=0.083,
+        toe_sharpness_base=5.96,
+        shoulder_sharpness_base=2.89,
+        paper_midtone_gamma=0.22,
+        base_tint_cmy=(0.008, 0.007, -0.016),
+        print_color=DyeLut("fuji_ca_dpii"),
     ),
-    # Fitted to Kodak E-4021 (Status A R/G/B, shared with Supra Endura).
+    "fuji_crystal_hd": PaperProfile(
+        label="Fujicolor Crystal Archive HD",
+        short="Crystal HD",
+        kind="ra4",
+        d_max=2.14,
+        d_min=0.071,
+        toe_sharpness_base=5.96,
+        shoulder_sharpness_base=2.89,
+        paper_midtone_gamma=0.22,
+        base_tint_cmy=(0.015, 0.011, -0.026),
+        print_color=DyeLut("fuji_ca_hd"),
+    ),
+    # Fitted to Kodak E-4021 (Status A R/G/B, shared with Supra Endura), with its dyes: spektrafilm's
+    # trace of the 2009 sheet (CC BY-SA 4.0, NOTICE.md), under D50.
     "kodak_portra_endura": PaperProfile(
         label="Kodak Portra Endura",
+        short="Portra Endura",
         kind="ra4",
         d_max=2.65,
         d_min=0.093,
@@ -207,10 +224,11 @@ PAPER_PROFILES: Dict[str, PaperProfile] = {
         paper_gamma_width=0.89,
         channel_gamma=(0.968, 1.0, 1.013),
         base_tint_cmy=(-0.002, 0.012, -0.009),
-        dye_matrix=_ENDURA_DYE,
+        print_color=DyeLut("kodak_e4021"),
     ),
     "kodak_supra_endura": PaperProfile(
         label="Kodak Supra Endura",
+        short="Supra Endura",
         kind="ra4",
         d_max=2.60,
         d_min=0.095,
@@ -220,11 +238,14 @@ PAPER_PROFILES: Dict[str, PaperProfile] = {
         paper_gamma_width=0.62,
         channel_gamma=(1.008, 1.0, 1.0),
         base_tint_cmy=(0.011, -0.009, -0.003),
-        dye_matrix=_ENDURA_DYE,
+        print_color=DyeLut("kodak_e4021"),
     ),
-    # Fitted to Kodak E-4020 (Status A R/G/B).
+    # Fitted to Kodak E-4020 (Status A R/G/B). Dyes are E-4070's: the E-4020 sheet draws each dye
+    # over a density floor in every band, which desaturates past any RA4 print, and spektrafilm's
+    # Ultra Endura is the later High Definition paper (E-4044).
     "kodak_ultra_endura": PaperProfile(
         label="Kodak Ultra Endura",
+        short="Ultra Endura",
         kind="ra4",
         d_max=2.61,
         d_min=0.096,
@@ -234,25 +255,62 @@ PAPER_PROFILES: Dict[str, PaperProfile] = {
         paper_gamma_width=0.60,
         channel_gamma=(1.109, 1.0, 1.051),
         base_tint_cmy=(-0.003, -0.003, 0.005),
-        dye_matrix=_ENDURA_DYE,
+        print_color=DyeLut("kodak_e4070"),
+    ),
+    # ── Color print film (kind "ra4": the kind gates the C-41 mode) ─────────
+    # Fitted to Kodak H-1-2383 (Status A R/G/B) with the `print` fit, which scales the
+    # projection Dmax (near 4) into the paper range. The datasheet draws one shared base, so
+    # no tint. Dyes from its spectral dye density curves, viewed under a xenon projector.
+    "kodak_2383": PaperProfile(
+        label="Kodak Vision 2383",
+        short="2383",
+        kind="ra4",
+        medium="film",
+        d_max=2.29,
+        d_min=0.065,
+        toe_sharpness_base=2.65,
+        shoulder_sharpness_base=2.86,
+        paper_midtone_gamma=-0.019,
+        paper_gamma_width=0.31,
+        channel_gamma=(1.034, 1.0, 0.989),
+        print_color=DyeLut("kodak_2383"),
+    ),
+    # Fitted like 2383 to Kodak H-1-2393t (1998); its curves and dyes are spektrafilm's trace of
+    # that sheet (CC BY-SA 4.0, NOTICE.md). The base tint is within the trace's noise.
+    "kodak_2393": PaperProfile(
+        label="Kodak Vision Premier 2393",
+        short="2393",
+        kind="ra4",
+        medium="film",
+        d_max=2.25,
+        d_min=0.025,
+        toe_sharpness_base=3.22,
+        shoulder_sharpness_base=2.28,
+        paper_midtone_gamma=0.074,
+        paper_gamma_width=0.58,
+        channel_gamma=(1.075, 1.0, 1.049),
+        print_color=DyeLut("kodak_2393"),
     ),
 }
 
 
 def resolve_paper(key: str) -> PaperProfile:
-    """Profile for `key`, falling back to the neutral default on unknown keys."""
+    """Profile for `key`, falling back to the Digital default on unknown keys."""
     return PAPER_PROFILES.get(key, PAPER_PROFILES[DEFAULT_PROFILE_KEY])
 
 
-def resolve_dye_matrix(paper: PaperProfile | None) -> Optional[np.ndarray]:
+def resolve_print_color(paper: PaperProfile | None) -> Tuple[Optional[np.ndarray], Optional[PrintLut]]:
     """
-    Row-normalized dye coupling matrix (rows sum to 1, so neutrals are preserved),
-    or None for identity so the default path stays byte-exact.
+    (dye matrix, LUT) for the print kernel. The matrix is row-normalized (rows sum to 1, so
+    neutrals are preserved) and None for identity, so the default path stays byte-exact.
     """
-    if paper is None or paper.dye_matrix == _IDENTITY_DYE:
-        return None
-    m = np.array(paper.dye_matrix, dtype=np.float64)
-    return m / np.maximum(m.sum(axis=1, keepdims=True), 1e-6)
+    color = None if paper is None else paper.print_color
+    if isinstance(color, DyeLut):
+        return None, load_print_lut(color.key)
+    if color is None or color.rows == _IDENTITY_DYE:
+        return None, None
+    m = np.array(color.rows, dtype=np.float64)
+    return m / np.maximum(m.sum(axis=1, keepdims=True), 1e-6), None
 
 
 # Achromatic projection in density space (all rows 1/3) -- see resolve_saturation_matrix.
@@ -262,7 +320,7 @@ _ACHROMATIC_J = np.full((3, 3), 1.0 / 3.0, dtype=np.float64)
 def resolve_saturation_matrix(k_rgb: Tuple[float, float, float]) -> Optional[np.ndarray]:
     """
     Density-domain saturation matrix, applied to density above paper base
-    (same coordinate as dye_matrix). Row ch is k_rgb[ch]*I[ch] + (1-k_rgb[ch])*J[ch]
+    (same coordinate as a dye matrix). Row ch is k_rgb[ch]*I[ch] + (1-k_rgb[ch])*J[ch]
     — each row still sums to 1 regardless of its own k, so per-channel k's
     diverge (R/G/B pushed independently) without breaking neutral preservation;
     no per-row normalization needed. k=1 on every channel is identity (returns
@@ -279,16 +337,12 @@ def resolve_saturation_matrix(k_rgb: Tuple[float, float, float]) -> Optional[np.
 def compose_density_matrices(dye: Optional[np.ndarray], sat: Optional[np.ndarray]) -> Optional[np.ndarray]:
     """
     Composite density-domain matrix for the dye_mix kernel slot, or None if
-    both factors are identity (mirrors resolve_dye_matrix's allocation-free
+    both factors are identity (mirrors resolve_print_color's allocation-free
     common case).
 
-    sat is applied outermost, dye innermost (sat @ dye): dye_matrix keeps
-    acting on the print curve's real density exactly as it always has, and
-    saturation is layered on top as a final creative step rather than being
-    fed back through the paper's physical crosstalk (that would make the
-    slider's effective strength paper-dependent, since some of the push
-    would get reabsorbed by the crosstalk before it reaches display). Do not
-    flip this order.
+    sat is applied outermost, dye innermost (sat @ dye), so a matrix stock's coupling
+    does not reabsorb the push. A LUT stock passes dye=None: separation then acts on the
+    dye amounts before the LUT, as a more saturated negative would on that paper.
     """
     if dye is None and sat is None:
         return None
@@ -298,13 +352,13 @@ def compose_density_matrices(dye: Optional[np.ndarray], sat: Optional[np.ndarray
 
 
 # Which paper kind each process mode exposes. E-6 (slide) has no entry and gets only the
-# neutral default. Keyed by ProcessMode, a StrEnum, so plain-string process_mode values
+# Digital default. Keyed by ProcessMode, a StrEnum, so plain-string process_mode values
 # look up fine.
 _MODE_KIND: Dict[str, str] = {ProcessMode.C41: "ra4", ProcessMode.BW: "bw"}
 
 
 def profiles_for_mode(process_mode: str) -> List[Tuple[str, PaperProfile]]:
-    """Selectable (key, profile) pairs for `process_mode`: neutral default first,
+    """Selectable (key, profile) pairs for `process_mode`: the Digital default first,
     then the papers whose kind matches the mode (default only for E-6)."""
     allowed = _MODE_KIND.get(process_mode)
     out = [(DEFAULT_PROFILE_KEY, PAPER_PROFILES[DEFAULT_PROFILE_KEY])]
@@ -315,7 +369,7 @@ def profiles_for_mode(process_mode: str) -> List[Tuple[str, PaperProfile]]:
 
 def effective_paper_profile(key: str, process_mode: str | None) -> PaperProfile:
     """Mode-aware resolve: the stored profile only when its kind matches the mode,
-    otherwise the neutral default. E-6 and any cross-mode/stale value collapse to
+    otherwise the Digital default. E-6 and any cross-mode/stale value collapse to
     default, so an incompatible `paper_profile` can never leak into a render."""
     paper = resolve_paper(key)
     if paper.kind == "default":
@@ -328,7 +382,7 @@ def effective_paper_profile(key: str, process_mode: str | None) -> PaperProfile:
 def effective_constants(paper: PaperProfile | None) -> Dict[str, Any]:
     """
     EXPOSURE_CONSTANTS with the profile's tonal overrides applied. Returns the
-    shared dict unchanged when paper is None or the neutral default, so the
+    shared dict unchanged when paper is None or the Digital default, so the
     common path stays allocation-free and byte-for-byte identical.
     """
     if paper is None or paper.kind == "default":

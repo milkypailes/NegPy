@@ -1,11 +1,15 @@
 # Windows USB setup (Plustek OpticFilm)
 
-NegPy's Plustek USB backend uses the external [pyopticfilm](https://github.com/jboneng/pyopticfilm) driver (libusb through PyUSB), version **1.3.3** or later. The stock Plustek Windows driver must not own the device.
+NegPy's Plustek USB backend uses the external [pyopticfilm](https://github.com/jboneng/pyopticfilm) driver (libusb through PyUSB), version **1.3.6** or later. The stock Plustek Windows driver must not own the device.
 
 ## Requirements
 
 - Windows 10 or 11
-- Supported Plustek OpticFilm scanners: **8200i SE** (`07B3:1825`, GL128) and **8100 V2** (`07B3:1824`, GL128)
+- Supported Plustek OpticFilm scanners:
+  - **8200i SE** (`07B3:1825`, GL128)
+  - **8100 V2** (`07B3:1824`, GL128)
+  - **8300i SE** (`07B3:181F`, GL128)
+  - **7600i v1** (`07B3:0C3B`, GL843; `bcdDevice` `0x0400`)
 - WinUSB (or libusbK) bound with [Zadig](https://zadig.akeo.ie/)
 - NegPy with the `plustek` optional dependency (`uv sync --group plustek` or `pip install negpy[plustek]`). On Windows, pyopticfilm also pulls in `libusb-package`
 
@@ -15,13 +19,13 @@ Power the scanner and plug it in, then:
 
 1. Open **Device Manager**
 2. Look under imaging or USB devices for Plustek
-3. Properties → Details → Hardware Ids must include `VID_07B3&PID_1825`
+3. Properties → Details → Hardware Ids must include `VID_07B3&PID_1825`, `PID_1824`, `PID_181F` or `PID_0C3B` for your model
 
 ## 2. Bind WinUSB (Zadig)
 
 1. Download [Zadig](https://zadig.akeo.ie/)
 2. Select **Options → List All Devices**
-3. Select the Plustek Film Scanner (`07B3:1825`)
+3. Select the Plustek Film Scanner (`07B3:1825`, `07B3:1824`, `07B3:181F` or `07B3:0C3B`)
 4. Replace the driver with **WinUSB**. libusbK also works
 5. Keep the stock Plustek driver installer. You need it to restore VueScan or the vendor software later
 
@@ -68,4 +72,5 @@ A Windows release build also works. It bundles pyopticfilm, PyUSB and libusb. In
 | Strong green cast on the positive | The border clamp ceiling must be **per channel**. A single joint percentile flattens the margin to neutral gray at a level the dimmest channel never reaches in the film (session 004: joint 27432 against green's own 19306), so auto Dmin meters green off chrome and lifts it 1.4x. Check `border highlight clamp peak_p99.7=(r,g,b)`. Each figure must sit just above that channel's own film peak |
 | `white clipped at the rail` | The white strip is pinned near `0xFFFF`, so it has no shape to flatten. Lower the AFE gains. DVDSET stays off and the host stretch runs |
 | Scan fails: white mean below 20000 | The post-unity strip is too dim to reach target within the 4x gain clamp. Often a stale AHB strip: dark and AFE wait until the buffer has data **at home**, and a motor-busy `0xa5` is not ready there. Also check that the lamp is off for dark and that the head is on clear home chrome. Cache v6+ ignores collapsed calibration |
+| `GL128 motor stayed enabled` while the scan starts | The motor did not stop after a positioning feed, so the driver does not start the next move. Check that the holder moves freely, then scan again. The log records each feed as `GL128 feed of N steps complete in …s, idle at …s` |
 | Scan fails: color ASIC shading / clear home field | The carriage is not on the clear home sensor. Park or power-cycle, then retry. The film may stay loaded |

@@ -36,9 +36,8 @@ def _densities(value: float, slopes, pivots, curvatures) -> np.ndarray:
 
 
 def _regimes(grade_trims):
-    """The three cast-removal regimes of per_channel_curve_params."""
-    base = per_channel_curve_params(115.0, 1.0, False, 0.0, 1.3, None, None, grade_trims=grade_trims)
-    shadow_tie = per_channel_curve_params(115.0, 1.0, False, 1.0, 1.3, (0.88, 0.9, 0.92), None, grade_trims=grade_trims)
+    """The two cast-removal regimes of per_channel_curve_params."""
+    base = per_channel_curve_params(115.0, 1.0, False, 0.0, 1.3, None, grade_trims=grade_trims)
     neutral_axis = per_channel_curve_params(
         115.0,
         1.0,
@@ -46,11 +45,10 @@ def _regimes(grade_trims):
         1.0,
         1.3,
         None,
-        None,
         neutral_axis_norm=((_ANCHOR,) * 3, (0.9,) * 3, (0.2,) * 3),
         grade_trims=grade_trims,
     )
-    return {"base": base, "shadow_tie": shadow_tie, "neutral_axis": neutral_axis}
+    return {"base": base, "neutral_axis": neutral_axis}
 
 
 class TestGradeTrimMult(unittest.TestCase):

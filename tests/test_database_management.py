@@ -77,7 +77,7 @@ def test_clear_saved_edits_makes_reloaded_image_start_fresh(tmp_path):
     """The user's actual goal: after clearing, loading the same hash returns nothing,
     so hydration falls back to defaults instead of the previous look."""
     repo = _repo(tmp_path)
-    edited = replace(WorkspaceConfig(), process=replace(WorkspaceConfig().process, narrowband_scan=True))
+    edited = replace(WorkspaceConfig(), process=replace(WorkspaceConfig().process, linear_raw=True))
     repo.save_file_settings("hash-x", edited, file_path="/photos/x.raw")
     assert repo.load_file_settings("hash-x") is not None
 

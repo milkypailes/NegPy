@@ -7,6 +7,8 @@ base-sampling patch (or a drag draws a box); in the scan pop-up a click just
 emits its fractional position to aim the hardware focus magnifier.
 """
 
+from negpy.kernel.system.i18n import tr
+
 from typing import Optional
 
 import numpy as np
@@ -19,6 +21,11 @@ from negpy.services.capture.calibration import Roi
 
 #: px, drawn just outside the frame.
 _FRAME_BORDER = 1
+#: px reserved around the frame for the Pick Better hover ring, which is drawn outside the photo.
+_RING_MARGIN = 7
+#: px the ring sits outside the photo edge; its stroke stays inside the reserved margin.
+_RING_OFFSET = 4
+_RING_RADIUS = 4  # corner radius of the ring
 _CLICK_SLOP = 5  # px: a release within this of the press counts as a click (scan pop-up magnifier)
 _CROSSHAIR_FRAC = 0.012  # a click samples a patch this wide (fraction of frame) — the rebate is narrow
 _CROSSHAIR_ASPECT = 2.5  # patch height : width in pixels → a vertical strip that fits the rebate bar
@@ -63,6 +70,7 @@ class RoiImageLabel(QLabel):
         # so the policy must let the label fill the window.
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setMouseTracking(True)  # the hover ring follows a plain (no-button) cursor move
         # roi_mode=True drops the calibration crosshair patch on click, in the calib window.
         # False only emits `clicked`, which the scan pop-up uses to aim the focus magnifier.
         self.roi_mode = True
@@ -71,6 +79,8 @@ class RoiImageLabel(QLabel):
         self._zebra: Optional[QImage] = None  # clipping overlay for the current frame, scan pop-up only
         self._roi: Optional[tuple[float, float, float, float]] = None
         self._drag_start: Optional[QPoint] = None
+        self.hover_ring = False  # when True a cursor hover draws the red selection ring (Pick Better)
+        self._hover = False
         # Video-player-style buffering spinner drawn on the black frame while a stream spins up.
         self._loading = False
         self._spin_angle = 0
@@ -151,12 +161,19 @@ class RoiImageLabel(QLabel):
         pw, ph = self._pixmap.width(), self._pixmap.height()
         if pw <= 0 or ph <= 0:
             return None
-        room_w, room_h = self.width() - 2 * _FRAME_BORDER, self.height() - 2 * _FRAME_BORDER
+        # Pick Better's hover ring is drawn outside the photo, so when it is on the frame is inset
+        # by a ring margin (not just the frame border) to leave room for the ring.
+        margin = _RING_MARGIN if self.hover_ring else _FRAME_BORDER
+        room_w, room_h = self.width() - 2 * margin, self.height() - 2 * margin
         scale = min(room_w / pw, room_h / ph)
         dw, dh = int(pw * scale), int(ph * scale)
         if dw <= 0 or dh <= 0:
             return None
         return QRect((self.width() - dw) // 2, (self.height() - dh) // 2, dw, dh)
+
+    def frame_rect(self) -> Optional[QRect]:
+        """The letterboxed photo's rect in widget px; the public view of `_display` for layout callers."""
+        return self._display()
 
     @staticmethod
     def _to_fraction(p: QPoint, draw_rect: QRect) -> tuple[float, float]:
@@ -179,9 +196,28 @@ class RoiImageLabel(QLabel):
                 if not self._roi_locked:  # locked while a calibration meters the patch
                     self._set_crosshair(cx, cy)  # calibration: drop the small base-sampling patch (no drag-box)
             elif (ev.pos() - self._drag_start).manhattanLength() < _CLICK_SLOP:
-                self.clicked.emit(cx, cy)  # scan pop-up: a click toggles the focus magnifier
+                # A click counts only over the drawn photo, like the hover ring; a margin click is not a selection.
+                if not self.hover_ring or draw_rect.contains(ev.pos()):
+                    self.clicked.emit(cx, cy)  # scan pop-up: a click toggles the focus magnifier
         self._drag_start = None
         self.update()
+
+    def mouseMoveEvent(self, ev: QMouseEvent) -> None:
+        # The ring lights only over the drawn photo, not the letterbox margins above and below it.
+        if not self.hover_ring:
+            return
+        display = self._display()
+        hover = display is not None and display.contains(ev.position().toPoint())
+        if hover != self._hover:
+            self._hover = hover
+            self.update()
+
+    def leaveEvent(self, event) -> None:
+        # No mouse move fires on leave, so a last move in a margin would otherwise leave the ring on.
+        if self.hover_ring and self._hover:
+            self._hover = False
+            self.update()
+        super().leaveEvent(event)
 
     # ── paint ─────────────────────────────────────────────────────────
 
@@ -194,6 +230,15 @@ class RoiImageLabel(QLabel):
                 painter.drawImage(draw_rect, self._zebra)
             painter.setPen(QPen(QColor(THEME.border_indicator), _FRAME_BORDER))
             painter.drawRect(draw_rect.adjusted(-_FRAME_BORDER, -_FRAME_BORDER, 0, 0))
+            if self.hover_ring and self._hover:  # cursor hover → the red selection ring (Pick Better)
+                # Drawn outside the photo edge, in the ring margin reserved by _display.
+                painter.setPen(QPen(QColor(THEME.accent_primary), 2))
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawRoundedRect(
+                    QRectF(draw_rect).adjusted(-_RING_OFFSET, -_RING_OFFSET, _RING_OFFSET, _RING_OFFSET),
+                    _RING_RADIUS,
+                    _RING_RADIUS,
+                )
             if self._roi is not None:  # just the box outline — no centre cross (cleaner)
                 painter.setPen(QPen(QColor(THEME.status_success), 2))
                 painter.drawRect(self._roi_in_widget(self._roi, draw_rect))
@@ -203,7 +248,7 @@ class RoiImageLabel(QLabel):
                 self._paint_spinner(painter)
             elif self.roi_mode:  # calibration window: guide the user to pick the film base
                 painter.setPen(QColor(THEME.text_hint))
-                painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Live View → click the clear film base")
+                painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, tr("Live View → click the clear film base"))
         painter.end()
 
     def _paint_spinner(self, painter: QPainter) -> None:
@@ -217,7 +262,7 @@ class RoiImageLabel(QLabel):
         # drawArc angles are 1/16°; sweep a 90° arc rotating with _spin_angle.
         painter.drawArc(QRectF(cx - r, cy - r, 2 * r, 2 * r), -self._spin_angle * 16, 90 * 16)
         painter.setPen(QColor(THEME.text_hint))
-        painter.drawText(QRect(0, int(cy + r + 6), self.width(), 22), Qt.AlignmentFlag.AlignHCenter, "Loading live view…")
+        painter.drawText(QRect(0, int(cy + r + 6), self.width(), 22), Qt.AlignmentFlag.AlignHCenter, tr("Loading live view…"))
 
     @staticmethod
     def _roi_in_widget(roi, draw_rect: QRect) -> QRect:

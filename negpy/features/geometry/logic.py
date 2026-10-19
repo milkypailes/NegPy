@@ -1253,7 +1253,7 @@ def _edge_border_depth(box: np.ndarray, side: str, limit: int, deep_limit: int =
     margin = int(round((1.0 - _EDGE_CORE) * 0.5 * n))
     if n - 2 * margin >= 8:
         lines = lines[:, margin : n - margin]
-    if lines.shape[0] < limit + 8 or lines.shape[1] < 8:
+    if limit <= 0 or lines.shape[0] < limit + 8 or lines.shape[1] < 8:
         return 0
 
     near = _pool_border_depth(_walk_border_depth(lines, limit, _EDGE_BRIDGE, False), limit)
@@ -1520,6 +1520,30 @@ def _refine_film_roi_by_tiers(lum: np.ndarray, film_roi: ROI) -> Optional[Tuple[
     col_occ_full[x1:x2] = col_occ
 
     return (y1 + vt, y1 + vb, x1 + hl, x1 + hr), row_occ_full, col_occ_full
+
+
+def film_and_picture(det: np.ndarray) -> Tuple[Optional[ROI], ROI]:
+    """The film box (None when the scan shows no film edge) and the picture gate inside it,
+    at detection resolution. With no film box the gate is refined over the whole frame; a
+    degenerate gate (a blank or dark frame) falls back to the whole frame."""
+    h, w = det.shape[:2]
+    film = detect_film_bounds_with_confidence(det)
+    gate, _, _ = _refine_roi_to_image(det, film.roi if film.roi is not None else (0, h, 0, w))
+    if gate[1] <= gate[0] or gate[3] <= gate[2]:
+        gate = (0, h, 0, w)
+    return film.roi, gate
+
+
+def rebate_mask(shape: Tuple[int, int], film_roi: Optional[ROI], gate: ROI) -> np.ndarray:
+    """The clear rebate: inside the film box, outside the picture gate. All False without a
+    film box, because the ring would then be whatever surrounds the picture, bare light included."""
+    rebate = np.zeros(shape, bool)
+    if film_roi is not None:
+        fy1, fy2, fx1, fx2 = film_roi
+        gy1, gy2, gx1, gx2 = gate
+        rebate[fy1:fy2, fx1:fx2] = True
+        rebate[gy1:gy2, gx1:gx2] = False
+    return rebate
 
 
 def _refine_roi_to_image(img: ImageBuffer, film_roi: ROI) -> Tuple[ROI, Optional[np.ndarray], Optional[np.ndarray]]:
@@ -2253,14 +2277,29 @@ def autocrop_detection_key(geometry: GeometryConfig) -> str:
     )
 
 
+def meter_detection_key(geometry: GeometryConfig, shape: Tuple[int, ...]) -> str:
+    """autocrop_detection_key plus the source's aspect, since a half-frame split or a stitch puts
+    another picture under the same geometry."""
+    h, w = shape[:2]
+    return f"{autocrop_detection_key(geometry)}|{w / h:.2f}"
+
+
+def resolve_meter_rect(img: ImageBuffer, geometry: GeometryConfig, preview_size: float) -> Optional[Tuple[float, float, float, float]]:
+    """The picture box the meters read on a frame with no crop: the rect Auto Crop would keep, when the film
+    sits in an opaque holder or on bare light. None when the film fills the frame, which is metered whole."""
+    return resolve_autocrop_rect(img, geometry, preview_size, require_film_box=True)
+
+
 def resolve_autocrop_rect(
     img: ImageBuffer,
     geometry: GeometryConfig,
     preview_size: float,
+    require_film_box: bool = False,
 ) -> Optional[Tuple[float, float, float, float]]:
     """The auto crop as a normalized rect in transformed-image space; the caller freezes it, so later renders crop
     the same at any resolution. Runs at AUTOCROP_DETECT_RES in GeometryProcessor order (rot90 -> flips -> fine
-    rotation -> distortion -> keystone). Excludes Crop Offset, which get_manual_rect_coords adds per render; None when too small."""
+    rotation -> distortion -> keystone). Excludes Crop Offset, which get_manual_rect_coords adds per render; None when
+    too small, or with `require_film_box` when no film box stands out from a holder or bed."""
     h, w = img.shape[:2]
     det_s = min(1.0, AUTOCROP_DETECT_RES / max(h, w))
     if det_s < 1.0:
@@ -2284,6 +2323,8 @@ def resolve_autocrop_rect(
 
     rh, rw = tmp.shape[:2]
     if rh < 2 or rw < 2:
+        return None
+    if require_film_box and _detect_film_bounds(_normalize_detection_input(tmp, AUTOCROP_DETECT_RES)[0]) is None:
         return None
     y1, y2, x1, x2 = get_autocrop_coords(
         tmp,

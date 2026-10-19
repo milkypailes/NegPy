@@ -2,9 +2,8 @@
 
 A baked matrix is inert while Linear RAW is off, and on any transparency (see
 unmix_block_reason), so the panel shows "None" and disables its controls rather than
-leaving a profile that looks selected but does nothing. The capture toggles grey out the
-same way instead of hiding: a hidden sticky setting is one whose state the user cannot
-see, which is how a negative rig's narrowband pair followed a frame into Transparency.
+leaving a profile that looks selected but does nothing. The capture choice greys out the
+same way instead of hiding: a hidden sticky setting is one whose state the user cannot see.
 """
 
 import os
@@ -166,34 +165,33 @@ def _to_rgbscan(w, **rgbscan):
 
 
 def test_capture_row_stays_visible_and_greys_out_per_reason():
-    """Hiding these is what let a rig's narrowband pair follow a frame into Transparency
-    without the user being able to see it. They stay visible and grey out instead."""
+    """A hidden sticky setting follows a frame into Transparency unseen, so the row stays
+    visible and greys out instead."""
     w = _sidebar(linear_raw=True)
     w.sync_ui()
-    assert w.linear_raw_btn.isChecked()
-    for widget in (w.capture_header, w.linear_raw_btn, w.narrowband_scan_btn, w.scan_setup_btn):
+    assert w.linear_raw_btn.currentData() is True
+    for widget in (w.capture_header, w.linear_raw_btn, w.scan_setup_btn):
         assert not widget.isHidden()
         assert widget.isEnabled()
     assert w.capture_hint.isHidden()
 
-    # Transparency transfer: Narrowband refused for the film, Linear RAW inert here.
+    # Transparency transfer: Linear RAW is inert here, and the scanning setup describes a negative rig.
     _to_mode(w, process_mode=ProcessMode.E6)
-    for widget in (w.capture_header, w.linear_raw_btn, w.narrowband_scan_btn, w.scan_setup_btn):
+    for widget in (w.capture_header, w.linear_raw_btn, w.scan_setup_btn):
         assert not widget.isHidden()
-    assert not w.narrowband_scan_btn.isEnabled()
     assert not w.linear_raw_btn.isEnabled()
+    assert not w.scan_setup_btn.isEnabled()
     assert not w.capture_hint.isHidden()
 
-    # Positive decodes on the source's own profile, so Linear RAW decides the decode once
-    # more — but Narrowband is refused for the dye set, which Positive does not change.
+    # Positive decodes on the source's own profile, so Linear RAW decides the decode once more.
     _to_mode(w, positive_source=True)
     assert w.linear_raw_btn.isEnabled()
-    assert not w.narrowband_scan_btn.isEnabled()
+    assert not w.scan_setup_btn.isEnabled()
     assert not w.capture_hint.isHidden()
 
     _to_mode(w, process_mode=ProcessMode.C41)
-    assert w.narrowband_scan_btn.isEnabled()
     assert w.linear_raw_btn.isEnabled()
+    assert w.scan_setup_btn.isEnabled()
     assert w.capture_hint.isHidden()
 
 
@@ -208,16 +206,15 @@ def test_linear_raw_unlocks_on_the_transfer_with_positive_source_on():
 
     _to_mode(w, positive_source=True)
     assert w.linear_raw_btn.isEnabled()
-    assert w.linear_raw_btn.isChecked()
+    assert w.linear_raw_btn.currentData() is True
 
     _to_mode(w, positive_source=False)
     assert not w.linear_raw_btn.isEnabled()
 
 
 def test_linear_raw_locks_for_an_rgb_scan_triplet():
-    """Every triplet exposure decodes neutral regardless of this toggle (see
-    tests/test_rgbscan_white_balance.py), so it locks rather than sitting live with no
-    effect — narrowband correction itself stays fully in the user's control."""
+    """Every triplet exposure decodes neutral regardless of this choice (see
+    tests/test_rgbscan_white_balance.py), so it locks rather than sitting live with no effect."""
     w = _sidebar(linear_raw=True)
     w.sync_ui()
     assert w.linear_raw_btn.isEnabled()
@@ -225,8 +222,7 @@ def test_linear_raw_locks_for_an_rgb_scan_triplet():
 
     _to_rgbscan(w, enabled=True, green_path="/x/g.arw", blue_path="/x/b.arw")
     assert w.linear_raw_btn.isEnabled() is False
-    assert w.linear_raw_btn.isChecked()  # the sticky value is still shown, just not editable
-    assert w.narrowband_scan_btn.isEnabled()
+    assert w.linear_raw_btn.currentData() is True  # the sticky value is still shown, just not editable
     assert w.scan_setup_btn.isEnabled()
     assert not w.capture_hint.isHidden()
 
@@ -259,21 +255,21 @@ def test_the_profile_comes_back_on_a_negative():
     assert w.sensor_hint.isHidden()
 
 
-def test_capture_toggles_reach_the_controller():
-    """Both are Calibration-card, roll-eligible fields -- set_roll_default, not a bare
+def test_the_capture_choice_reaches_the_controller():
+    """A Calibration-card, roll-eligible field -- set_roll_default, not a bare
     apply_config, so a roll (if any) and its other frames pick the change up too."""
     w = _sidebar(linear_raw=False)
     w.sync_ui()
+    assert w.linear_raw_btn.currentData() is False
 
-    w.narrowband_scan_btn.setChecked(True)
-    args, kwargs = w.controller.set_roll_default.call_args
-    assert args[0] == "sensor"
-    assert kwargs["narrowband_scan"] is True
-
-    w.linear_raw_btn.setChecked(True)
+    w.linear_raw_btn.setCurrentIndex(w.linear_raw_btn.findData(True))
     args, kwargs = w.controller.set_roll_default.call_args
     assert args[0] == "sensor"
     assert kwargs["linear_raw"] is True
+
+    w.linear_raw_btn.setCurrentIndex(w.linear_raw_btn.findData(False))
+    _args, kwargs = w.controller.set_roll_default.call_args
+    assert kwargs["linear_raw"] is False
 
 
 def test_cast_removal_is_colour_only(qapp):

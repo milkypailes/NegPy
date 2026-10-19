@@ -1,10 +1,14 @@
+from negpy.kernel.system.i18n import mark, tr
+from collections.abc import Iterable
 import dataclasses
 import html
+import math
 
 import qtawesome as qta
-from PyQt6.QtCore import QEvent, QSize, Qt
-from PyQt6.QtGui import QIcon
+from PyQt6.QtCore import QEvent, QObject, QPoint, QRect, QSize, Qt
+from PyQt6.QtGui import QColor, QIcon, QIconEngine, QImage, QLinearGradient, QPainter, QPixmap
 from PyQt6.QtWidgets import (
+    QComboBox,
     QDialogButtonBox,
     QHBoxLayout,
     QLabel,
@@ -20,6 +24,41 @@ from PyQt6.QtWidgets import (
 
 from negpy.desktop.view.styles.fonts import ui_font_family
 from negpy.desktop.view.styles.theme import THEME
+
+_CHOICE_LABELS = {
+    "Other": mark("Other"),
+    "ColorNegative": mark("Color Negative"),
+    "ColorSlide": mark("Color Slide"),
+    "B&W Negative": mark("B&W Negative"),
+    "B&W Slide": mark("B&W Slide"),
+    "Normal": mark("Normal"),
+    "Push +1": mark("Push +1"),
+    "Push +2": mark("Push +2"),
+    "Push +3": mark("Push +3"),
+    "Pull -1": mark("Pull -1"),
+    "Pull -2": mark("Pull -2"),
+    "Pull -3": mark("Pull -3"),
+    "Original": mark("Original"),
+    "Same as Source": mark("Same as Source"),
+    "Free": mark("Free"),
+}
+
+
+def choice_label(value: str) -> str:
+    """Translate static enum labels; exclude file names and user gear names."""
+    return tr(_CHOICE_LABELS.get(value, value))
+
+
+def add_choice_items(combo: QComboBox, values: Iterable[str]) -> None:
+    """Show translated labels and store the original enum values in itemData."""
+    for value in values:
+        combo.addItem(choice_label(value), value)
+
+
+def select_choice(combo: QComboBox, value: str) -> None:
+    """Normalize StrEnum values to strings for Qt's QVariant lookup."""
+    combo.setCurrentIndex(max(0, combo.findData(str(value))))
+
 
 # One width for every icon-only button, so mixed rows keep a common right edge.
 ICON_BUTTON_WIDTH = 36
@@ -66,7 +105,7 @@ def default_button_height() -> int:
     mixed button rows stair-step)."""
     global _default_btn_height
     if _default_btn_height is None:
-        ref = QPushButton(" Ref")
+        ref = QPushButton(tr(" Ref"))
         ref.setIcon(qta.icon("fa5s.circle"))
         _default_btn_height = ref.sizeHint().height()
     return _default_btn_height
@@ -152,6 +191,35 @@ def tool_toggle(icon_name: str, label: str, tooltip: str, align_left: bool = Fal
     return btn
 
 
+class _PinRight(QObject):
+    """Holds an overlay child centered on its parent's right edge."""
+
+    def __init__(self, child: QWidget, margin: int) -> None:
+        super().__init__(child)
+        self._margin = margin
+        child.parentWidget().installEventFilter(self)
+
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802
+        if event.type() == QEvent.Type.Resize:
+            child = self.parent()
+            child.move(obj.width() - child.width() - self._margin, (obj.height() - child.height()) // 2)
+        return False
+
+
+def clearable_tool_toggle(icon_name: str, label: str, tooltip: str, clear_tooltip: str) -> QPushButton:
+    """tool_toggle for a tool that leaves a saved result. btn.clear_btn, an inline × at its right
+    edge, clears that result; show it while the result exists, in place of the edited dot."""
+    btn = tool_toggle(icon_name, label, tooltip)
+    inset = THEME.space_sm
+    # Both sides, so the label stays centered and never runs under the ×.
+    btn.setStyleSheet(f"QPushButton {{padding-left: {HEADER_BUTTON_SIZE + inset}px; padding-right: {HEADER_BUTTON_SIZE + inset}px;}}")
+    btn.clear_btn = header_button(qta.icon("fa5s.times", color=THEME.text_primary), clear_tooltip)
+    btn.clear_btn.setParent(btn)
+    btn.clear_btn.hide()
+    _PinRight(btn.clear_btn, inset)
+    return btn
+
+
 def labeled_toggle(icon_name: str, label: str, checked: bool, tooltip: str) -> QPushButton:
     """Labeled checkable button (icon + text), the Pick WB / Linear RAW look."""
     btn = _LabeledButton(label)
@@ -198,6 +266,81 @@ def icon_button(icon_name: str, tooltip: str, width: int | None = ICON_BUTTON_WI
     return btn
 
 
+@dataclasses.dataclass(frozen=True)
+class Sweep:
+    """A gradient icon's fill: theme-token stops, evenly spaced, running at `angle` degrees
+    (0 is left to right, 90 top to bottom)."""
+
+    colors: tuple[str, ...]
+    angle: float = 0.0
+
+
+# Each sweep shows what its tool changes or paints.
+# Red to green to blue, for a tool that works on the whole image at once (Pick Better).
+RGB_SWEEP = Sweep((THEME.channel_red_text, THEME.channel_green_text, THEME.channel_blue_text))
+# The two filters a ring-around varies.
+RING_AROUND_SWEEP = Sweep((THEME.filter_magenta, THEME.filter_yellow))
+# Light to dark on the diagonal: a test strip's density runs across it and its grade down it.
+TEST_STRIP_SWEEP = Sweep((THEME.canvas_bg_white, THEME.mode_bw), angle=45)
+# Paper white to a warm print, across the bands: a paper test strip prints one stock per band.
+PAPER_STRIP_SWEEP = Sweep((THEME.canvas_bg_white, THEME.mode_c41))
+# The clipping overlay's own two colors: clipped highlights, then clipped shadows.
+CLIPPING_SWEEP = Sweep((THEME.clip_warning, THEME.clip_shadow))
+
+
+class _GradientIconEngine(QIconEngine):
+    """Paints a qtawesome glyph, then fills its shape with a sweep. A disabled or checked glyph
+    stays flat, gray or `text_on_accent`, so it reads like every other toggle in that state."""
+
+    def __init__(self, icon_name: str, sweep: Sweep):
+        super().__init__()
+        self._icon_name, self._sweep = icon_name, sweep
+        self._glyph = qta.icon(icon_name, color=THEME.text_primary, color_on=THEME.text_on_accent, color_disabled=THEME.text_muted)
+
+    def paint(self, painter: QPainter | None, rect: QRect, mode: QIcon.Mode, state: QIcon.State) -> None:
+        if painter is None or rect.isEmpty():
+            return
+        device = painter.device()
+        dpr = device.devicePixelRatioF() if device is not None else 1.0
+        local = QRect(QPoint(0, 0), rect.size())
+        image = QImage(rect.size() * dpr, QImage.Format.Format_ARGB32_Premultiplied)
+        image.setDevicePixelRatio(dpr)
+        image.fill(Qt.GlobalColor.transparent)
+        layer = QPainter(image)
+        self._glyph.paint(layer, local, Qt.AlignmentFlag.AlignCenter, mode, state)
+        if mode != QIcon.Mode.Disabled and state != QIcon.State.On:
+            # The gradient line spans the box's projection on the sweep direction, so the
+            # first and last stops touch its corners at any angle.
+            dx, dy = math.cos(math.radians(self._sweep.angle)), math.sin(math.radians(self._sweep.angle))
+            cx, cy = rect.width() / 2, rect.height() / 2
+            half = abs(dx) * cx + abs(dy) * cy
+            gradient = QLinearGradient(cx - dx * half, cy - dy * half, cx + dx * half, cy + dy * half)
+            colors = self._sweep.colors
+            for i, color in enumerate(colors):
+                gradient.setColorAt(i / max(len(colors) - 1, 1), QColor(color))
+            layer.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceIn)
+            layer.fillRect(local, gradient)
+        layer.end()
+        painter.drawImage(rect, image)
+
+    def pixmap(self, size: QSize, mode: QIcon.Mode, state: QIcon.State) -> QPixmap:
+        pixmap = QPixmap(size)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        self.paint(painter, QRect(QPoint(0, 0), size), mode, state)
+        painter.end()
+        return pixmap
+
+    def clone(self) -> QIconEngine:
+        return _GradientIconEngine(self._icon_name, self._sweep)
+
+
+def gradient_icon(icon_name: str, sweep: Sweep = RGB_SWEEP) -> QIcon:
+    """A qtawesome glyph filled with `sweep`, for an icon that has to stand out from the flat
+    gray ones beside it."""
+    return QIcon(_GradientIconEngine(icon_name, sweep))
+
+
 def header_button(icon: QIcon, tooltip: str) -> QPushButton:
     """A section header's small flat icon button (reset, scope pair, header toggles), also for a
     help or row icon that sits in a line of text."""
@@ -222,7 +365,7 @@ def wrap_tooltip(text: str, footer: str = "") -> str:
     a boilerplate line don't have to re-implement the escape/passthrough rule."""
     if not text.startswith("<qt>"):
         body = text if ("<" in text and ">" in text) else html.escape(text).replace("\n", "<br>")
-        text = f"<qt>{body}</qt>"
+        text = tr("<qt>{body}</qt>", body=body)
     if footer:
         text = text.removesuffix("</qt>") + footer + "</qt>"
     return text
@@ -243,6 +386,15 @@ def set_hint_kind(lbl: QLabel, kind: str) -> None:
     style = lbl.style()
     style.unpolish(lbl)
     style.polish(lbl)
+
+
+def caption_label(text: str) -> QLabel:
+    """A white, bold caption that sits directly above an image (the A/Skip/B frames in Pick Better)."""
+    lbl = QLabel(text)
+    lbl.setStyleSheet(
+        f"color: {THEME.text_on_accent}; font-size: {THEME.font_size_small}px; font-weight: {THEME.weight_bold}; border: none;"
+    )
+    return lbl
 
 
 def toast_qss(kind: str = "info") -> str:
@@ -403,7 +555,7 @@ def header_row(header: QLabel, *buttons: QWidget) -> QHBoxLayout:
 
 def section_subheader(text: str) -> QLabel:
     """Small all-caps label for section grouping in sidebars; wraps in a panel too narrow for it."""
-    lbl = QLabel(text.upper())
+    lbl = QLabel(tr(text).upper())
     lbl.setWordWrap(True)
     lbl.setStyleSheet(
         f"font-size: {THEME.font_size_small}px; "
@@ -425,7 +577,7 @@ class FieldLabel(QLabel):
 
 def field_label(text: str, width: int | None = None) -> QLabel:
     """Muted semibold label for a combo/entry field."""
-    lbl = FieldLabel(text)
+    lbl = FieldLabel(tr(text))
     lbl.setStyleSheet(field_label_qss())
     if width is not None:
         lbl.setFixedWidth(width)

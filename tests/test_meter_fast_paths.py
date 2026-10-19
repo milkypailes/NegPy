@@ -10,7 +10,6 @@ import numpy as np
 
 from negpy.features.exposure.normalization import (
     analyze_log_exposure_bounds_from_log,
-    measure_shadow_refs_from_log,
     percentile_from_sorted,
     prefilter_log_grid,
     sorted_channel_grid,
@@ -44,7 +43,7 @@ class TestPercentileFromSorted(unittest.TestCase):
 
 
 class TestSortedGridMeters(unittest.TestCase):
-    def test_bounds_and_shadow_refs_identical_with_and_without_the_sort(self):
+    def test_bounds_identical_with_and_without_the_sort(self):
         g = prefilter_log_grid(np.clip(_grid((600, 900, 3), seed=3, scale=0.4) + 0.5, 1e-4, 1.0), None, 0.0)
         srt = sorted_channel_grid(g)
         for luma_clip in (-0.5, 0.0, 0.35, 2.5):
@@ -53,17 +52,15 @@ class TestSortedGridMeters(unittest.TestCase):
                 fast = analyze_log_exposure_bounds_from_log(g, None, 0.0, percentile_clip=luma_clip, color_clip=color_clip, sorted_grid=srt)
                 self.assertEqual(slow.floors, fast.floors)
                 self.assertEqual(slow.ceils, fast.ceils)
-        self.assertEqual(measure_shadow_refs_from_log(g, None, 0.0), measure_shadow_refs_from_log(g, None, 0.0, sorted_grid=srt))
 
     def test_sorted_grid_is_ignored_when_a_roi_still_has_to_be_applied(self):
         """The sort describes the whole grid, so a caller that still crops must not use it."""
         g = prefilter_log_grid(np.clip(_grid((600, 900, 3), seed=4, scale=0.4) + 0.5, 1e-4, 1.0), None, 0.0)
         roi = (10, 300, 20, 400)
         wrong = sorted_channel_grid(g)
-        self.assertEqual(
-            measure_shadow_refs_from_log(g, roi, 0.0),
-            measure_shadow_refs_from_log(g, roi, 0.0, sorted_grid=wrong),
-        )
+        slow = analyze_log_exposure_bounds_from_log(g, roi, 0.0, percentile_clip=0.35, color_clip=0.35)
+        fast = analyze_log_exposure_bounds_from_log(g, roi, 0.0, percentile_clip=0.35, color_clip=0.35, sorted_grid=wrong)
+        self.assertEqual((slow.floors, slow.ceils), (fast.floors, fast.ceils))
 
 
 class TestToLogDensity(unittest.TestCase):

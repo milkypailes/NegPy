@@ -13,6 +13,10 @@ Workflow
        uv run --with scipy python scripts/fit_paper_profile.py bw g0.csv g1.csv ... g5.csv
        # RA4: one paper's Status A R, G, B curves
        uv run --with scipy python scripts/fit_paper_profile.py ra4 r.csv g.csv b.csv
+       # Color print film (2383): Status A R, G, B; the profile still takes kind="ra4"
+       uv run --with scipy python scripts/fit_paper_profile.py print r.csv g.csv b.csv
+       # A paper whose Dmax is published apart from its curve: pin it
+       uv run --with scipy python scripts/fit_paper_profile.py ra4 --d-max 2.0 r.csv g.csv b.csv
 3. Copy the printed PaperProfile kwargs into PAPER_PROFILES. Reject the fit if the RMS
    residual exceeds ~0.05 D: the parametric family cannot represent that paper.
 
@@ -50,11 +54,18 @@ def iso_r(x, d, d_max=None):
     return 100.0 * (np.interp(hi, d, x) - np.interp(d.min() + 0.04, d, x))
 
 
+def peak_grade(x, d):
+    """Grade whose slope k is the curve's steepest gamma. ISO R spans to 0.9 · Dmax, which a
+    print film's projection Dmax stretches past any paper's, so R would read far too soft."""
+    gamma = np.convolve(np.gradient(d, x), np.ones(9) / 9, "same")
+    return 100.0 * EXPOSURE_CONSTANTS["grade_contrast_scale"] / float(gamma.max())
+
+
 def render(shape, d_min, kind, grade, x, x0, gain=1.0):
     d_max, toe, shoulder, mg, gw = shape
     papers.PAPER_PROFILES["_fit"] = papers.PaperProfile(
         label="fit",
-        kind=kind,
+        kind="bw" if kind == "bw" else "ra4",
         d_min=d_min,
         d_max=d_max,
         toe_sharpness_base=toe,
@@ -71,17 +82,19 @@ def render(shape, d_min, kind, grade, x, x0, gain=1.0):
     return np.asarray(curve(xn.reshape(1, -1, 1).repeat(3, 2)), dtype=np.float64)[0, :, 0]
 
 
-def fit(kind, curves):
+def fit(kind, curves, d_max=None):
     """One paper shape shared by every curve; d_min is the measured base, x0 is per curve."""
     d_min = float(np.mean([d.min() for _, d in curves]))
-    top = max(d.max() for _, d in curves)
-    grades = [iso_r(x, d, top) for x, d in curves]
+    top = max(d.max() for _, d in curves) if d_max is None else d_max
+    grades = [peak_grade(x, d) if kind == "print" else iso_r(x, d, top) for x, d in curves]
     lo_r, hi_r = EXPOSURE_CONSTANTS["iso_r_min"], EXPOSURE_CONSTANTS["iso_r_max"]
     if any(not lo_r < g < hi_r for g in grades):
         sys.exit(f"ISO R {[round(g) for g in grades]} outside the Grade range {lo_r:.0f}-{hi_r:.0f}: drop those curves")
     x0s = [float(np.interp(0.7, d, x)) for x, d in curves]
     lo = [1.5, 0.5, 0.5, -MIDTONE_GAMMA_LIMIT, 0.2] + [-10.0] * len(curves)
-    hi = [3.0, 20.0, 20.0, MIDTONE_GAMMA_LIMIT, 2.0] + [10.0] * len(curves)
+    hi = [max(3.0, top + 0.3), 20.0, 20.0, MIDTONE_GAMMA_LIMIT, 2.0] + [10.0] * len(curves)
+    if d_max is not None:
+        lo[0], hi[0] = d_max - 1e-9, d_max + 1e-9
 
     def residuals(p):
         return np.concatenate([render(p[:5], d_min, kind, g, x, p[5 + i]) - d for i, ((x, d), g) in enumerate(zip(curves, grades))])
@@ -111,16 +124,27 @@ def load(path):
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Fit NegPy paper-profile constants to digitized datasheet curves.")
-    ap.add_argument("kind", choices=("bw", "ra4"))
-    ap.add_argument("csvs", nargs="+", help="bw: one CSV per grade; ra4: R, G, B")
+    ap.add_argument("kind", choices=("bw", "ra4", "print"))
+    ap.add_argument("csvs", nargs="+", help="bw: one CSV per grade; ra4, print: R, G, B")
+    ap.add_argument("--d-max", type=float, help="pin Dmax instead of fitting it")
     args = ap.parse_args()
 
     curves = [load(p) for p in args.csvs]
-    if args.kind == "ra4" and len(curves) != 3:
-        sys.exit("ra4 takes exactly three curves: R, G, B")
+    color = args.kind != "bw"
+    if color and len(curves) != 3:
+        sys.exit(f"{args.kind} takes exactly three curves: R, G, B")
+    if args.kind == "print":
+        # A print-film datasheet plots each layer at its own speed; the printer lights cancel it.
+        x_g, d_g = curves[1]
+        mid = 0.5 * (d_g.min() + d_g.max())
+        curves = [(x - np.interp(mid, d, x) + np.interp(mid, d_g, x_g), d) for x, d in curves]
+        # Black point compensation maps the profile's d_max to display black, so a projection
+        # Dmax the image never reaches lifts the blacks. Scale the print into the paper range.
+        scale = EXPOSURE_CONSTANTS["d_max"] / max(d.max() for _, d in curves)
+        curves = [(x, d * scale) for x, d in curves]
     xs = np.linspace(max(x.min() for x, _ in curves), min(x.max() for x, _ in curves), 150)
     chans = [np.interp(xs, x, d) for x, d in curves]
-    shape, d_min, grades, rms = fit(args.kind, [(xs, np.mean(chans, axis=0))] if args.kind == "ra4" else curves)
+    shape, d_min, grades, rms = fit(args.kind, [(xs, np.mean(chans, axis=0))] if color else curves, args.d_max)
 
     d_max, toe, shoulder, mg, gw = shape
     total = float(np.sqrt(np.mean(np.square(rms))))
@@ -130,7 +154,7 @@ def main() -> None:
     print(f"    d_max={d_max:.2f},\n    d_min={d_min:.3f},")
     print(f"    toe_sharpness_base={toe:.2f},\n    shoulder_sharpness_base={shoulder:.2f},")
     print(f"    paper_midtone_gamma={mg:.3f},\n    paper_gamma_width={gw:.2f},")
-    if args.kind == "ra4":
+    if color:
         g = [channel_gain(shape, d_min, grades[0], xs, d) for d in chans]
         print(f"    channel_gamma=({g[0] / g[1]:.3f}, 1.0, {g[2] / g[1]:.3f}),")
         tint = [float(d.min()) - d_min for d in chans]

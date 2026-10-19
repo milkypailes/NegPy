@@ -57,6 +57,12 @@ class TestThumbnailFingerprint:
         )
         assert _fp(edited) == _fp(config)
 
+    def test_a_frozen_meter_rect_leaves_it_current(self) -> None:
+        """The rect is derived from the source and the geometry; what it changes reaches the stored bounds."""
+        config = WorkspaceConfig()
+        frozen = replace(config, process=replace(config.process, meter_rect=(0.2, 0.2, 0.8, 0.8), meter_key="k|1.50"))
+        assert _fp(frozen) == _fp(config)
+
     def test_unhashed_fields_exist(self) -> None:
         config = WorkspaceConfig()
         for section, names in tf._UNHASHED_FIELDS.items():

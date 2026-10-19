@@ -14,9 +14,6 @@ from negpy.infrastructure.display.color_spaces import ColorSpaceRegistry
 
 logger = get_logger(__name__)
 
-# Bundled profiles applied by app features (never offered as a user choice).
-_INTERNAL_PROFILES = {"RGBScan.icc"}
-
 
 @lru_cache(maxsize=8)
 def open_profile_from_bytes(data: bytes) -> Any:
@@ -233,18 +230,12 @@ class ColorService:
     @staticmethod
     def get_available_profiles() -> list[str]:
         """
-        Returns list of available ICC profile paths. Bundled internal profiles
-        (applied by app features, e.g. Narrowband Scan) are excluded from the
-        user-facing list.
+        Returns list of available ICC profile paths.
         """
         icc_root = get_resource_path("icc")
         built_in_icc = []
         if os.path.exists(icc_root):
-            built_in_icc = [
-                os.path.join(icc_root, f)
-                for f in os.listdir(icc_root)
-                if f.lower().endswith((".icc", ".icm")) and f not in _INTERNAL_PROFILES
-            ]
+            built_in_icc = [os.path.join(icc_root, f) for f in os.listdir(icc_root) if f.lower().endswith((".icc", ".icm"))]
 
         user_icc = []
         if os.path.exists(APP_CONFIG.user_icc_dir):

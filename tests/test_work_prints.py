@@ -12,6 +12,11 @@ def _variant(density: float) -> WorkspaceConfig:
     return replace(base, exposure=replace(base.exposure, density=density))
 
 
+def _meta_variant(film: str) -> WorkspaceConfig:
+    base = WorkspaceConfig()
+    return replace(base, metadata=replace(base.metadata, film=film))
+
+
 class TestWorkPrintStore(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -162,3 +167,41 @@ class TestWorkPrintRenameCollision(unittest.TestCase):
         self.session.rename_work_print("a", "b", replace_existing=True)
         self.assertEqual(self.repo.list_work_prints("h"), ["b"])
         self.assertEqual(self.repo.load_work_print("h", "b").exposure.density, 1.0)
+
+
+class TestWorkPrintApplyMetadata(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.repo = StorageRepository(f"{self._tmp.name}/edits.db", f"{self._tmp.name}/settings.db")
+        self.repo.initialize()
+        self.session = DesktopSessionManager(self.repo)
+        self.session.state.current_file_hash = "h"
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_default_is_off(self):
+        self.assertFalse(self.session.work_print_apply_metadata())
+
+    def test_setting_persists(self):
+        self.session.set_work_print_apply_metadata(True)
+        self.assertTrue(self.session.work_print_apply_metadata())
+        self.session.set_work_print_apply_metadata(False)
+        self.assertFalse(self.session.work_print_apply_metadata())
+
+    def test_off_keeps_the_live_metadata(self):
+        # A work print carries one metadata; the live edit then carries another.
+        self.session.state.config = _meta_variant("Film A")
+        self.session.save_work_print("wp")
+        self.session.state.config = _meta_variant("Film B")
+        # Off (default): the print's density applies, its metadata is ignored.
+        self.session.load_work_print("wp")
+        self.assertEqual(self.session.state.config.metadata.film, "Film B")
+
+    def test_on_restores_the_saved_metadata(self):
+        self.session.set_work_print_apply_metadata(True)
+        self.session.state.config = _meta_variant("Film A")
+        self.session.save_work_print("wp")
+        self.session.state.config = _meta_variant("Film B")
+        self.session.load_work_print("wp")
+        self.assertEqual(self.session.state.config.metadata.film, "Film A")

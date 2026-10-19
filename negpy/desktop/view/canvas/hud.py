@@ -1,8 +1,13 @@
+from negpy.kernel.system.i18n import tr
+from typing import Any, Tuple
+
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import QGridLayout, QLabel, QProgressBar, QWidget
 
 from negpy.desktop.view.styles.templates import toast_qss
 from negpy.desktop.view.styles.theme import THEME
+from negpy.domain.models import ExportResolutionMode
+from negpy.features.geometry.models import AspectRatio
 
 _DEFAULT_TOAST_MS = 2500
 #: Toast wrapping bounds. The ratio keeps a long message clear of the corner pills, and
@@ -11,6 +16,51 @@ _TOAST_WIDTH_RATIO = 0.55
 _TOAST_MIN_WIDTH = 320
 #: Horizontal padding in toast_qss(), so a one-line measurement matches the rendered pill.
 _TOAST_PADDING = 40
+
+INFO_OFF, INFO_BASIC, INFO_FULL = range(3)
+INFO_LEVEL_LABELS = (tr("Off"), tr("Basic"), tr("Full"))
+
+
+def _film_line(meta: Any) -> str:
+    film = meta.film.strip()
+    if film and meta.push_pull and meta.film_iso:
+        return f"{film} @ EI {int(meta.film_iso * 2**meta.push_pull)}"
+    return film or (f"ISO {meta.film_iso}" if meta.film_iso else "")
+
+
+def _camera_line(meta: Any) -> str:
+    make, model = meta.camera_make.strip(), meta.camera_model.strip()
+    camera = model if make and model.lower().startswith(make.lower()) else " ".join(p for p in (make, model) if p)
+    lens = meta.lens_model.strip()
+    if not lens and meta.focal_length_mm:
+        lens = f"{meta.focal_length_mm:g}mm" + (f" f/{meta.max_aperture:g}" if meta.max_aperture else "")
+    return " · ".join(p for p in (camera, lens) if p)
+
+
+def _export_line(export: Any) -> str:
+    mode = export.export_resolution_mode
+    if mode == ExportResolutionMode.PRINT:
+        size = f"Print {export.export_print_size:g} cm @ {export.export_dpi} dpi"
+    elif mode == ExportResolutionMode.TARGET_PX:
+        size = f"Export {export.export_target_long_edge_px} px"
+    else:
+        size = ""
+    paper = export.paper_aspect_ratio
+    paper = f"{paper} paper" if paper and paper not in (AspectRatio.ORIGINAL, AspectRatio.FREE) else ""
+    return " · ".join(p for p in (size, paper) if p)
+
+
+def frame_info(level: int, config: Any, filename: str, res: str, mode: str, position: str = "", proof: str = "") -> Tuple[str, str, str]:
+    """Top-left, top-right and bottom-left pill text for an info level."""
+    if level == INFO_OFF or not filename:
+        return "", "", ""
+    if level == INFO_BASIC:
+        return " · ".join(s for s in (filename, res) if s), mode, ""
+    head = " · ".join(s for s in (position, filename, res) if s)
+    top_left = "\n".join(s for s in (head, _film_line(config.metadata), _camera_line(config.metadata)) if s)
+    top_right = "\n".join(s for s in (mode, f"Proof: {proof}" if proof else "") if s)
+    return top_left, top_right, _export_line(config.export)
+
 
 _PILL_QSS = (
     f"color: {THEME.text_secondary}; font-size: {THEME.font_size_small}px; font-weight: 500; "
@@ -50,6 +100,7 @@ class CanvasHud(QWidget):
         top = Qt.AlignmentFlag.AlignTop
         bottom = Qt.AlignmentFlag.AlignBottom
         layout.addWidget(self.lbl_top_left, 0, 0, top | Qt.AlignmentFlag.AlignLeft)
+        self.lbl_top_right.setAlignment(Qt.AlignmentFlag.AlignRight)
         layout.addWidget(self.lbl_top_right, 0, 2, top | Qt.AlignmentFlag.AlignRight)
         # Own row so a long toast never squeezes the corner pills.
         layout.addWidget(self.toast, 1, 0, 1, 3, top | Qt.AlignmentFlag.AlignHCenter)
@@ -88,10 +139,10 @@ class CanvasHud(QWidget):
         lbl.setText(text)
         lbl.setVisible(bool(text))
 
-    def update_info(self, filename: str, res: str, mode: str, edits: str) -> None:
-        self._set_pill(self.lbl_top_left, " · ".join(s for s in (filename, res) if s))
-        self._set_pill(self.lbl_top_right, mode)
-        self._set_pill(self.lbl_bottom_left, edits)
+    def update_info(self, top_left: str, top_right: str, bottom_left: str) -> None:
+        self._set_pill(self.lbl_top_left, top_left)
+        self._set_pill(self.lbl_top_right, top_right)
+        self._set_pill(self.lbl_bottom_left, bottom_left)
 
     def set_zoom_note(self, note: str) -> None:
         """Qualifier for what the canvas shows at this zoom."""

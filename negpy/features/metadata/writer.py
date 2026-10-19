@@ -13,7 +13,7 @@ import tifffile
 from PIL import Image, PngImagePlugin
 
 from negpy.features.metadata.capture import exif_gps_rationals
-from negpy.features.metadata.exif_read import strip_scan_exif_for_capture, strip_scan_gps
+from negpy.features.metadata.exif_read import XMP_PACKET_TAG, strip_scan_exif_for_capture, strip_scan_gps, xmp_packet_from_exif
 from negpy.features.metadata.gear_models import GearLibrary
 from negpy.features.metadata.models import MetadataConfig
 from negpy.features.metadata.resolution import Resolution
@@ -33,7 +33,7 @@ from negpy.services.assets.gear import GearProfiles
 _log = logging.getLogger(__name__)
 
 _XMP_APP1_HEADER = b"http://ns.adobe.com/xap/1.0/\x00"
-_TIFF_XMP_TAG = 700  # XMLPacket
+_TIFF_XMP_TAG = XMP_PACKET_TAG
 
 _JXL_FTYP = b"jxl \x00\x00\x00\x00jxl "
 _JXL_CODESTREAM_BOXES = frozenset({b"jxlc", b"jxlp"})
@@ -284,6 +284,10 @@ def _sanitize_exif(exif_dict: dict) -> dict:
                 continue
             if ifd_name == "0th" and tag > _MAX_SAFE_0TH_TAG:
                 continue
+            if ifd_name == "0th" and tag == _TIFF_XMP_TAG:
+                # A TIFF-based RAW's XMP packet. The export writes XMP in its own slot,
+                # so a copy here is a second, contradicting packet.
+                continue
             if ifd_name == "Exif" and tag in _RAW_CAPTURE_EXIF_TAGS:
                 continue
             if ifd_name == "Exif" and tag == piexif.ExifIFD.ColorSpace:
@@ -354,6 +358,12 @@ def _read_xmp_from_source(source_path: str) -> Optional[bytes]:
     except Exception:
         pass
     return None
+
+
+def _source_xmp(source_path: str, exif_dict: dict) -> Optional[bytes]:
+    """The source's XMP for passthrough. Falls back to the EXIF's packet for a
+    TIFF-based RAW that tifffile cannot open (RW2, ORF)."""
+    return _read_xmp_from_source(source_path) or xmp_packet_from_exif(exif_dict)
 
 
 def _extract_jpeg_xmp(data: bytes) -> Optional[bytes]:
@@ -450,7 +460,7 @@ def preserve_source_metadata(
     if not exif_dict:
         return image_bytes
 
-    xmp_bytes = _read_xmp_from_source(source_path)
+    xmp_bytes = _source_xmp(source_path, exif_dict)
 
     try:
         output = io.BytesIO()
@@ -786,7 +796,7 @@ def export_embed_plan(
             exif_dict = _load_source_exif(source_path, source_exif)
             if not exif_dict:
                 return None
-            return piexif.dump(_sanitize_exif(exif_dict)), _read_xmp_from_source(source_path), False
+            return piexif.dump(_sanitize_exif(exif_dict)), _source_xmp(source_path, exif_dict), False
         merged, payload = _merged_exif_and_payload(config, source_exif, gear)
         xmp_bytes = build_xmp_bytes(payload) if payload.has_any_data() else None
         return piexif.dump(_sanitize_exif(_with_resolution(merged, resolution))), xmp_bytes, True

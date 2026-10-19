@@ -48,6 +48,11 @@ APP_CONFIG = AppConfig(
 )
 
 
+def render_scale_factor(shape: tuple[int, ...]) -> float:
+    """A buffer's long edge over the preview render size: the unit of the pixel settings (crop margin)."""
+    return max(shape[:2]) / float(APP_CONFIG.preview_render_size)
+
+
 DEFAULT_WORKSPACE_CONFIG = WorkspaceConfig(
     process=ProcessConfig(
         process_mode=ProcessMode.C41,

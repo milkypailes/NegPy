@@ -44,6 +44,8 @@ class ExposureConfig:
     # Ranges are asymmetric: density is log10, so an equal ΔD reads smaller near d_max.
     shadow_density: float = 0.0
     highlight_density: float = 0.0
+    # A shadow lift fades to nothing at paper black, so the black point barely moves.
+    hold_black: bool = False
     # Unsharp mask gamma: positive sandwiches a blurred positive and reduces contrast,
     # negative a blurred negative and increases it. [-0.5, 0.5]; 0 = no mask.
     contrast_mask: float = 0.0
@@ -228,6 +230,8 @@ EXPOSURE_CONSTANTS: Dict[str, Any] = {
     "zone_density_sharpness": 4.0,
     "zone_density_shadow_offset": 0.75,
     "zone_density_highlight_offset": -0.40,
+    # Hold Black: the density span below the paper-black ceiling over which a shadow lift fades.
+    "zone_black_hold_taper": 0.6,
     # Default normalized midtone reference in [0,1] log space (auto_exposure off).
     "assumed_anchor": 0.46,
     # ISO R bounds: hardest and softest grade allowed.
@@ -265,16 +269,12 @@ EXPOSURE_CONSTANTS: Dict[str, Any] = {
     # Neutral per-tail clip for per-channel balance (orange-mask cast removal),
     # independent of luma range. The slider spans percentiles around this.
     "base_color_clip": 1.0,
-    # Percentile sampled as the per-channel shadow reference for cast detection.
-    "shadow_neutral_percentile": 98.0,
     # Scan-exposure warning: linear level treated as sensor-white clipping. Film
     # base and scene shadows sit near sensor white, so clipped pixels collapse
     # distinct densities to D=0.
     "scan_clip_level": 0.99,
     # Per-channel clipped fraction above which the Analysis panel warns.
     "scan_clip_warn": 0.01,
-    # Max normalized shadow cast (green - channel) that Cast Removal corrects.
-    "cast_removal_max_offset": 0.1,
     # Cast Removal neutral axis: per-channel refs at a highlight/midtone/shadow luma
     # band, each over the band's lowest-chroma pixels. R/B fit green's axis with a
     # quadratic through all three, else a line through mid+shadow. Bands are
@@ -290,6 +290,15 @@ EXPOSURE_CONSTANTS: Dict[str, Any] = {
     # Pass-1 chroma ceiling: admits strong correctable casts, rejects saturated content.
     "neutral_axis_first_pass_cap": 0.55,
     "neutral_axis_min_pixels": 64,
+    # Foliage sector: cells whose offset from the stretched neutral exceeds this chroma at a
+    # hue in this range never enter a near-neutral set. Hue is atan2(-s, t) in degrees, with
+    # t = (dR + dB) / 2 and s = (dR - dB) / 2 the offsets from green: 0 is green, 45 yellow.
+    "neutral_axis_foliage_chroma": 0.03,
+    "neutral_axis_foliage_hue": (-25.0, 80.0),
+    # Sky and water sector, the same rule from azure to blue. A clear sky pales toward the horizon,
+    # so its palest cells are a band's lowest-chroma set; the floor sits above a film or process cast.
+    "neutral_axis_sky_chroma": 0.06,
+    "neutral_axis_sky_hue": (-150.0, -60.0),
     # Confidence sample-size half-point: the size term is n / (n + this).
     "neutral_axis_confidence_n0": 256,
     # Mid/shadow deviation-difference dead zone (a plausible crossover passes free)

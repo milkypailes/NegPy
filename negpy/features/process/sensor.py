@@ -12,8 +12,7 @@ from numba import prange
 
 from negpy.domain.types import ImageBuffer
 from negpy.features.exposure.normalization import get_analysis_crop
-from negpy.features.process.logic import narrowband_allowed
-from negpy.features.process.models import ProcessConfig, SensorUnmix
+from negpy.features.process.models import ProcessConfig, ProcessMode, SensorUnmix
 from negpy.kernel.system.parallel import parallel_njit
 
 _EPS = 1e-4
@@ -270,7 +269,7 @@ def unmix_block_reason(process: ProcessConfig) -> str:
     Single source of truth: the sidebar greys the panel on this and names the reason, the
     pipeline skips on effective_sensor_matrix below, so the two cannot disagree.
     """
-    if not narrowband_allowed(process):
+    if process.process_mode == ProcessMode.E6:
         return "transparency"
     if not process.linear_raw:
         return "linear_raw"

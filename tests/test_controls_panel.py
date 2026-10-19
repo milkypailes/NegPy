@@ -337,7 +337,7 @@ def test_sync_modified_dots_leaves_the_scanning_setup_uncounted():
     cfg = DEFAULT_WORKSPACE_CONFIG
     panel.controller.state.config = replace(
         cfg,
-        process=replace(cfg.process, linear_raw=True, narrowband_scan=True, demosaic_preview=DemosaicMode.DHT),
+        process=replace(cfg.process, linear_raw=True, demosaic_preview=DemosaicMode.DHT),
     )
     panel.sensor_section = MagicMock()
     panel.demosaic_section = MagicMock()
@@ -359,7 +359,6 @@ def test_a_card_reset_leaves_the_scanning_setup_alone():
         process=replace(
             cfg.process,
             linear_raw=True,
-            narrowband_scan=True,
             demosaic_preview=DemosaicMode.DHT,
             hue_trim=0.3,
             highlight_reconstruction=True,
@@ -373,7 +372,6 @@ def test_a_card_reset_leaves_the_scanning_setup_alone():
 
     for process in (after_calibration, after_demosaic):
         assert process.linear_raw is True
-        assert process.narrowband_scan is True
         assert process.demosaic_preview == DemosaicMode.DHT
     assert after_calibration.hue_trim == DEFAULT_WORKSPACE_CONFIG.process.hue_trim
     assert after_demosaic.highlight_reconstruction == DEFAULT_WORKSPACE_CONFIG.process.highlight_reconstruction

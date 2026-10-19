@@ -40,6 +40,7 @@ GUIDED_KEYS = (
     "export_presets",
     "printing_notes",
     "export_sidecars",
+    "export_bake",
     "contact_sheet",
     "soft_proof",
     "metadata_presets",

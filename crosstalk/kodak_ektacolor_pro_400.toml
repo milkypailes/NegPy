@@ -2,9 +2,11 @@ name = "Kodak Ektacolor Pro 400 / Portra 400 (approx)"
 type = "specsheet-based"
 
 # 3x3 row-major density unmixing matrix (out R/G/B × in R/G/B)
-# Derived analytically from Kodak E-4050 Spectral Dye-Density Curves
+# Estimated: datasheet E-4050 plots only a midscale neutral, so its curve above D-min is fitted
+# with the Vision3 dye curves (scripts/fit_crosstalk_estimates.py), sampled at 650/550/450 nm per
+# the crosstalk-from-datasheet skill.
 matrix = [
-  [ 1.000, -0.030,  0.000],
-  [-0.129,  1.000, -0.040],
-  [-0.050, -0.158,  1.000]
+  [ 1.0000, -0.0738, -0.0004 ],
+  [-0.0894,  1.0000, -0.0709 ],
+  [-0.1174,  0.0165,  1.0000 ],
 ]

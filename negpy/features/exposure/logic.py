@@ -9,9 +9,10 @@ from negpy.features.exposure.papers import (
     PaperProfile,
     compose_density_matrices,
     effective_constants,
-    resolve_dye_matrix,
+    resolve_print_color,
     resolve_saturation_matrix,
 )
+from negpy.features.exposure.print_lut import lut_black_luminance, tetra_lookup
 from negpy.kernel.image.validation import ensure_image
 from negpy.kernel.system.parallel import parallel_njit
 
@@ -36,6 +37,14 @@ def _fast_sigmoid(x: float) -> float:
     else:
         z = np.exp(x)
         return float(z / (1.0 + z))
+
+
+@njit(inline="always")
+def _black_hold(v: float, d_max_eff: float, taper: float) -> float:
+    """Hold Black's weight on a shadow lift: 1 below `taper` under paper black, smoothstep to 0 at it.
+    Falls only where the lift is negative, so the lifted curve gets steeper and stays monotone."""
+    t = min(max((d_max_eff - v) / taper, 0.0), 1.0)
+    return t * t * (3.0 - 2.0 * t)
 
 
 @njit(inline="always")
@@ -189,7 +198,12 @@ def _apply_print_curve_kernel(
     diff_mix: float,
     diff_range: np.ndarray,
     use_diff: bool,
+    lut: np.ndarray,
+    lut_e_max: np.ndarray,
+    lut_black: float,
+    use_lut: bool,
     bpc: bool = False,
+    black_hold: float = 0.0,
 ) -> np.ndarray:
     """
     Asymmetric H&D print curve: a straight line of slope `slope` through the
@@ -218,6 +232,9 @@ def _apply_print_curve_kernel(
 
     bpc: black point compensation — paper Dmax maps to display black (ICC
     relative-colorimetric style).
+
+    lut/lut_e_max: the stock's LUT when use_lut is set; it replaces 10^-D on the density above
+    base, and BPC then maps the luminance lut_black to 0 for all channels alike.
     """
     h, w, c = img.shape
     res = np.empty_like(img)
@@ -348,6 +365,8 @@ def _apply_print_curve_kernel(
                 # weights centred in the three-quarter/quarter tones.
                 if shadow_density != 0.0 or highlight_density != 0.0:
                     w_zsh = _fast_sigmoid(zone_k * (v - zone_sh_center))
+                    if black_hold > 0.0 and shadow_density < 0.0:
+                        w_zsh = w_zsh * _black_hold(v, d_max_eff[ch], black_hold)
                     w_zhi = 1.0 - _fast_sigmoid(zone_k * (v - zone_hi_center))
                     v = v + shadow_density * w_zsh + highlight_density * w_zhi
 
@@ -379,17 +398,26 @@ def _apply_print_curve_kernel(
                 dens[1] = d_min_rgb[1] + s_mean + separation_damping_gain(sep_k3[1], sep_damping, chroma, sep_ref) * (s1 - s_mean)
                 dens[2] = d_min_rgb[2] + s_mean + separation_damping_gain(sep_k3[2], sep_damping, chroma, sep_ref) * (s2 - s_mean)
 
-            for ch in range(3):
-                transmittance = 10.0 ** (-dens[ch])
-                if bpc:
-                    transmittance = (transmittance - bpc_black[ch]) / (1.0 - bpc_black[ch])
+            if use_lut:
+                lr, lg, lb = tetra_lookup(lut, lut_e_max, dens[0] - d_min_rgb[0], dens[1] - d_min_rgb[1], dens[2] - d_min_rgb[2])
+                rgb = (lr, lg, lb)
+                for ch in range(3):
+                    transmittance = 10.0 ** (-d_min_rgb[ch]) * rgb[ch]
+                    if bpc:
+                        transmittance = (transmittance - lut_black) / (1.0 - lut_black)
+                    res[y, x, ch] = min(max(transmittance, 0.0), 1.0)
+            else:
+                for ch in range(3):
+                    transmittance = 10.0 ** (-dens[ch])
+                    if bpc:
+                        transmittance = (transmittance - bpc_black[ch]) / (1.0 - bpc_black[ch])
 
-                final_val = transmittance
-                if final_val < 0.0:
-                    final_val = 0.0
-                elif final_val > 1.0:
-                    final_val = 1.0
-                res[y, x, ch] = final_val
+                    final_val = transmittance
+                    if final_val < 0.0:
+                        final_val = 0.0
+                    elif final_val > 1.0:
+                        final_val = 1.0
+                    res[y, x, ch] = final_val
     return res
 
 
@@ -421,6 +449,7 @@ class CharacteristicCurve:
         curvature: float = 0.0,
         preflash: float = 0.0,
         grade: float = 115.0,
+        black_hold: float = 0.0,
     ):
         c = effective_constants(paper)
         ts = float(c["toe_shoulder_strength"])
@@ -438,6 +467,7 @@ class CharacteristicCurve:
         self.zone_k = float(c["zone_density_sharpness"])
         self.shadow_density = float(shadow_density)
         self.highlight_density = float(highlight_density)
+        self.black_hold = float(black_hold)
         self.shadow_grade_delta = float(shadow_grade_delta)
         self.highlight_grade_delta = float(highlight_grade_delta)
         self.d_max = float(c["d_max"])
@@ -482,6 +512,9 @@ class CharacteristicCurve:
             )
         if self.shadow_density != 0.0 or self.highlight_density != 0.0:
             w_zsh = _expit(self.zone_k * (v - self.zone_sh_center))
+            if self.black_hold > 0.0 and self.shadow_density < 0.0:
+                t = np.clip((self.d_max_eff - v) / self.black_hold, 0.0, 1.0)
+                w_zsh = w_zsh * t * t * (3.0 - 2.0 * t)
             w_zhi = 1.0 - _expit(self.zone_k * (v - self.zone_hi_center))
             v = v + self.shadow_density * w_zsh + self.highlight_density * w_zhi
         v1 = self.d_min_eff + np.logaddexp(0.0, self.a_hl * (v - self.d_min_eff)) / self.a_hl
@@ -493,6 +526,11 @@ class CharacteristicCurve:
             res = -np.log10(np.maximum(t, 1e-12))
 
         return ensure_image(res)
+
+
+def black_hold_taper(exposure: Any, paper: Optional[PaperProfile] = None) -> float:
+    """Hold Black's taper span for the kernels; 0 turns it off."""
+    return float(effective_constants(paper)["zone_black_hold_taper"]) if exposure.hold_black else 0.0
 
 
 def print_curve(
@@ -543,6 +581,7 @@ def print_curve(
         curvature=curvature,
         preflash=exposure.preflash,
         grade=exposure.grade,
+        black_hold=black_hold_taper(exposure, profile),
     )
 
 
@@ -574,19 +613,13 @@ def curve_params_from_metrics(
     d_min = profile.d_min if exposure.paper_dmin else 0.0
     anchor = metrics.get("metered_anchor") if exposure.auto_exposure else None
     bounds = metrics.get("final_bounds") or metrics.get("log_bounds")
-    strength, shadow_refs_norm, neutral_axis_norm = cast_solve_inputs(
-        bounds,
-        metrics.get("shadow_log_refs"),
-        metrics.get("neutral_axis_refs"),
-        exposure.cast_removal_strength,
-    )
+    strength, neutral_axis_norm = cast_solve_inputs(bounds, metrics.get("neutral_axis_refs"), exposure.cast_removal_strength)
     return per_channel_curve_params(
         exposure.grade,
         exposure.density,
         exposure.auto_normalize_contrast,
         strength,
         metrics.get("norm_density_range"),
-        shadow_refs_norm,
         metrics.get("textural_range"),
         d_min=d_min,
         anchor=anchor,
@@ -643,6 +676,17 @@ def per_channel_widths(
     return tw3, sw3
 
 
+_NO_LUT = np.ones((2, 2, 2, 3), dtype=np.float32)
+_NO_LUT_E_MAX = np.ones(3, dtype=np.float32)
+
+
+def black_density_rgb(d_max: float, toe: Any, toe_height: float) -> Tuple[float, float, float]:
+    """The density black point compensation maps to black, per channel; the kernel prologue and
+    exposure.wgsl compute the same: a negative toe raises the clip point."""
+    db = [d_max + t * toe_height if t < 0.0 else d_max for t in toe]
+    return (db[0], db[1], db[2])
+
+
 def paper_dmin_rgb(d_min: float, paper: Optional[PaperProfile]) -> Tuple[float, float, float]:
     """
     Per-channel paper-white floor: d_min plus the paper's base tint (a minimum
@@ -697,6 +741,7 @@ def apply_characteristic_curve(
     diffusion_plane: Optional[np.ndarray] = None,
     diffusion_rect: Optional[Tuple[float, float, float, float]] = None,
     diffusion_range: Tuple[float, float, float] = (1.0, 1.0, 1.0),
+    black_hold: float = 0.0,
 ) -> ImageBuffer:
     """Applies the asymmetric H&D print curve per channel in log-density space.
 
@@ -728,7 +773,7 @@ def apply_characteristic_curve(
     offsets = np.ascontiguousarray(np.array(cmy_offsets, dtype=np.float32))
     s_cmy = np.ascontiguousarray(np.array(shadow_cmy, dtype=np.float32))
     h_cmy = np.ascontiguousarray(np.array(highlight_cmy, dtype=np.float32))
-    dye = resolve_dye_matrix(paper)
+    dye, lut = resolve_print_color(paper)
     sat_k3 = per_channel_dye_separation(dye_separation, dye_separation_trims)
     use_sep_damping = separation_damping > 0.0 and sat_k3 != (1.0, 1.0, 1.0)
     sat = None if use_sep_damping else resolve_saturation_matrix(sat_k3)
@@ -758,19 +803,24 @@ def apply_characteristic_curve(
     toe3, sh3 = per_channel_toe_shoulder(toe, shoulder, toe_trims, shoulder_trims)
     tw3, sw3 = per_channel_widths(toe_width, shoulder_width, toe_width_trims, shoulder_width_trims)
     flash_v, flash_gamma = preflash_params(frame_grade, d_min, paper)
+    toe_k = [t * ts for t in toe3]
+    d_min_rgb = paper_dmin_rgb(d_min, paper)
+    lut_black = 0.0
+    if lut is not None and bpc:
+        lut_black = lut_black_luminance(lut, d_min_rgb, black_density_rgb(float(c["d_max"]), toe_k, float(c["toe_height"])))
     res = _apply_print_curve_kernel(
         np.ascontiguousarray(img.astype(np.float32)),
         pivots,
         slopes,
         curvs,
-        np.array([t * ts for t in toe3], dtype=np.float64),
+        np.array(toe_k, dtype=np.float64),
         np.array([s * ts for s in sh3], dtype=np.float64),
         np.array(tw3, dtype=np.float64),
         np.array(sw3, dtype=np.float64),
         offsets,
         s_cmy,
         h_cmy,
-        d_min_rgb=np.array(paper_dmin_rgb(d_min, paper), dtype=np.float64),
+        d_min_rgb=np.array(d_min_rgb, dtype=np.float64),
         d_max=float(c["d_max"]),
         a_toe_base=float(c["toe_sharpness_base"]),
         a_sh_base=float(c["shoulder_sharpness_base"]),
@@ -816,7 +866,12 @@ def apply_characteristic_curve(
         diff_mix=diffusion_mix(diffusion),
         diff_range=np.array(diffusion_range, dtype=np.float64),
         use_diff=use_diff,
+        lut=_NO_LUT if lut is None else lut.table,
+        lut_e_max=_NO_LUT_E_MAX if lut is None else lut.e_max,
+        lut_black=lut_black,
+        use_lut=lut is not None,
         bpc=bool(bpc),
+        black_hold=float(black_hold),
     )
     return ensure_image(res)
 
@@ -1198,7 +1253,7 @@ def normalize_refs(
     """
     Per-channel reference densities -> normalized [0, 1] position in the same
     floor->ceil stretch the image is normalized with. Shared by the CPU/GPU/chart
-    call sites (Cast Removal shadow refs) so they can't drift.
+    call sites (the Cast Removal neutral axis) so they can't drift.
     """
     epsilon = 1e-6
     out = []
@@ -1208,13 +1263,6 @@ def normalize_refs(
             denom = epsilon if denom >= 0 else -epsilon
         out.append((refs[ch] - floors[ch]) / denom)
     return (out[0], out[1], out[2])
-
-
-def normalized_shadow_refs(bounds: Any, refs: Optional[Tuple[float, float, float]]) -> Optional[Tuple[float, float, float]]:
-    """Shadow refs normalized against `bounds`, or None if either is missing."""
-    if bounds is None or refs is None:
-        return None
-    return normalize_refs(refs, bounds.floors, bounds.ceils)
 
 
 def normalized_neutral_axis(bounds: Any, refs: Any) -> Any:
@@ -1235,18 +1283,12 @@ def effective_cast_strength(strength: float, confidence: Optional[float]) -> flo
     return strength
 
 
-def cast_solve_inputs(
-    bounds: Any,
-    shadow_log_refs: Optional[Tuple[float, float, float]],
-    neutral_axis_refs: Any,
-    slider_strength: float,
-) -> Tuple[float, Optional[Tuple[float, float, float]], Any]:
-    """(effective strength, shadow_refs_norm, neutral_axis_norm) from raw metrics;
-    single source of truth for the CPU processor and the chart."""
-    shadow_refs_norm = normalized_shadow_refs(bounds, shadow_log_refs)
+def cast_solve_inputs(bounds: Any, neutral_axis_refs: Any, slider_strength: float) -> Tuple[float, Any]:
+    """(effective strength, neutral_axis_norm) from raw metrics; single source of truth for
+    the CPU processor and the chart."""
     neutral_axis_norm = normalized_neutral_axis(bounds, neutral_axis_refs)
     confidence = neutral_axis_refs[3] if neutral_axis_refs is not None else None
-    return effective_cast_strength(slider_strength, confidence), shadow_refs_norm, neutral_axis_norm
+    return effective_cast_strength(slider_strength, confidence), neutral_axis_norm
 
 
 def auto_base_slope(
@@ -1275,7 +1317,6 @@ def per_channel_curve_params(
     auto_normalize_contrast: bool,
     strength: float,
     lum_range: Optional[float],
-    shadow_refs_norm: Optional[Tuple[float, float, float]],
     textural_range: Optional[float],
     d_min: float = 0.0,
     anchor: Optional[float] = None,
@@ -1290,8 +1331,7 @@ def per_channel_curve_params(
 
     Cast Removal fits R/B to green's neutral axis (green is the reference; its pivot rides the
     luma anchor, so exposure is unchanged). neutral_axis_norm (midtone, shadow, highlight) ->
-    quadratic through all three; (midtone, shadow) -> line; shadow_refs_norm only -> one-point
-    shadow tie. Off / no refs (E6/B&W): one shared linear curve.
+    quadratic through all three; (midtone, shadow) -> line. Off or no axis: one shared linear curve.
     """
     c = effective_constants(paper)
     # Per-channel slope multipliers for the paper dye-layer contrast crossover. The pivot is
@@ -1360,31 +1400,7 @@ def per_channel_curve_params(
             curvs.append(curv_ch)
         return (slopes[0], slopes[1], slopes[2]), (pivots[0], pivots[1], pivots[2]), (curvs[0], curvs[1], curvs[2])
 
-    if strength > 0.0 and shadow_refs_norm is not None:
-        # Fallback one-point tie, used when there is no neutral axis: slope-tilt each channel
-        # so its shadow ref lands on green's, with the luma anchor pinning the midtone.
-        anchor_val = float(c["assumed_anchor"]) if anchor is None else float(anchor)
-        limit = float(c["cast_removal_max_offset"])
-        r_green = float(shadow_refs_norm[1])
-        numer = anchor_val - r_green
-
-        slopes = []
-        pivots = []
-        for ch in range(3):
-            # Clamp the shadow cast before solving, bounding the correction.
-            cast = min(max(strength * (r_green - float(shadow_refs_norm[ch])), -limit), limit)
-            denom = anchor_val - (r_green - cast)
-            if ch == 1 or abs(denom) < epsilon:
-                slope_ch = base_slope
-            else:
-                slope_ch = base_slope * numer / denom
-                slope_ch = min(max(slope_ch, slope_min), slope_max)
-            slope_ch = min(max(slope_ch * cg[ch], slope_min), slope_max)
-            slopes.append(slope_ch)
-            pivots.append(compute_pivot(slope_ch, density, d_min=d_min, anchor=anchor, paper=paper))
-        return (slopes[0], slopes[1], slopes[2]), (pivots[0], pivots[1], pivots[2]), (0.0, 0.0, 0.0)
-
-    # Base curve: Cast Removal off, or on with no measured refs (E6, B&W, no neutrals).
+    # Base curve: Cast Removal off, or no neutral axis (B&W, or a frame with no grays).
     s0 = min(max(base_slope * cg[0], slope_min), slope_max)
     s1 = min(max(base_slope * cg[1], slope_min), slope_max)
     s2 = min(max(base_slope * cg[2], slope_min), slope_max)

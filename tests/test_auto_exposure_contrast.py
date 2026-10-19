@@ -322,11 +322,11 @@ class TestShadowReach(unittest.TestCase):
         self.assertEqual(shadow_reach_slope(2.5, self.ANCHOR, 0.3), 2.5)
 
     def test_curve_params_apply_reach_only_with_auto_grade(self):
-        on = per_channel_curve_params(115.0, 1.0, True, 0.0, 1.2, None, 0.9, anchor=self.ANCHOR, shadow_point=0.7)
-        off = per_channel_curve_params(115.0, 1.0, False, 0.0, 1.2, None, 0.9, anchor=self.ANCHOR, shadow_point=0.7)
-        plain = per_channel_curve_params(115.0, 1.0, True, 0.0, 1.2, None, 0.9, anchor=self.ANCHOR)
+        on = per_channel_curve_params(115.0, 1.0, True, 0.0, 1.2, 0.9, anchor=self.ANCHOR, shadow_point=0.7)
+        off = per_channel_curve_params(115.0, 1.0, False, 0.0, 1.2, 0.9, anchor=self.ANCHOR, shadow_point=0.7)
+        plain = per_channel_curve_params(115.0, 1.0, True, 0.0, 1.2, 0.9, anchor=self.ANCHOR)
         self.assertGreater(on[0][1], plain[0][1])
-        self.assertEqual(off[0][1], per_channel_curve_params(115.0, 1.0, False, 0.0, 1.2, None, 0.9, anchor=self.ANCHOR)[0][1])
+        self.assertEqual(off[0][1], per_channel_curve_params(115.0, 1.0, False, 0.0, 1.2, 0.9, anchor=self.ANCHOR)[0][1])
 
 
 class TestMeasureShadowPoint(unittest.TestCase):

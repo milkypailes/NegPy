@@ -168,6 +168,12 @@ class GeometryConfig:
             object.__setattr__(self, "autocrop_ratio", AspectRatio.FREE)
 
 
+def crops_frame(geometry: GeometryConfig) -> bool:
+    """Whether the frame has a crop ROI (GeometryProcessor's branches): a rect, Crop by Default's
+    void-free rect, or a Crop Offset margin."""
+    return bool(geometry.crop_rect) or (geometry.crop_to_valid and not geometry.crop_from_auto) or geometry.autocrop_offset > 0
+
+
 def holds_own_skew(geometry: GeometryConfig) -> bool:
     """The frame already has its own Fine Rotation, Tilt or Swing, set by hand, by the Auto
     Skew button or by an earlier squaring: Auto Crop's squaring leaves it as it is."""

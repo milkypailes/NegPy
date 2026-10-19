@@ -281,15 +281,14 @@ def wb_bake_block_reason(rgbscan: Optional[RgbScanConfig], process: Optional[Pro
     illuminant. A narrowband capture (Trichrome's three isolated exposures, or a Single-Shot
     Narrowband profile) has no such scene: the gains are an artifact of whatever preset was
     dialed on the camera, not a correction the light or the film calls for. Channel separation
-    for these captures comes from the RGBScan/sensor-unmix profile instead.
+    for these captures comes from the triplet or the sensor unmix instead.
 
-    Single-Shot Narrowband is flagged by either of two independent sticky settings: the
-    Narrowband toggle (the bundled RGBScan input profile) or a calibrated sensor matrix
-    (Single-Shot Narrowband Calibration) — a rig can have one set without the other.
+    Single-Shot Narrowband is flagged by a calibrated sensor matrix (Single-Shot Narrowband
+    Calibration).
     """
     if rgbscan is not None and is_rgb_triplet(rgbscan):
         return "trichrome"
-    if process is not None and (process.narrowband_scan or process.sensor_matrix is not None):
+    if process is not None and process.sensor_matrix is not None:
         return "narrowband"
     return ""
 

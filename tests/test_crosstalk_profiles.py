@@ -1,5 +1,6 @@
 import os
 
+import numpy as np
 import pytest
 
 from negpy.features.process.models import ProcessMode
@@ -252,3 +253,17 @@ def test_saving_again_keeps_the_profile_in_its_own_file(tmp_path, monkeypatch):
 
     assert len(list(tmp_path.glob("*.toml"))) == 1
     assert CrosstalkProfiles.scan_user()["Portra-400"][0] == 9.0
+
+
+def test_bundled_gallery_parses_with_small_cross_terms():
+    # The loader drops a malformed profile silently, and a cross term past 0.2 is a misread curve
+    # or a transposed matrix (the crosstalk-from-datasheet skill's bound).
+    gallery = os.path.join(os.path.dirname(__file__), "..", "crosstalk")
+    files = sorted(f for f in os.listdir(gallery) if f.endswith(".toml"))
+    assert files
+    for f in files:
+        parsed = CrosstalkProfiles._parse_file(os.path.join(gallery, f))
+        assert parsed, f
+        m = np.reshape(parsed[1], (3, 3))
+        m = m / np.diag(m)[:, None]
+        assert np.abs(m[~np.eye(3, dtype=bool)]).max() < 0.2, f

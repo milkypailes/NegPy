@@ -545,6 +545,12 @@ class TestRemapWorkspaceConfig:
         assert ex_size == 12.0
         assert updated.process.analysis_rect is None
 
+    def test_a_moved_split_clears_the_meter_rect(self):
+        config = WorkspaceConfig()
+        config = replace(config, process=replace(config.process, meter_rect=(0.1, 0.1, 0.9, 0.9), meter_key="k|0.75"))
+        updated = remap_workspace_config(config, 1, HalfGeometry(split_x=0.5), HalfGeometry(split_x=0.6))
+        assert (updated.process.meter_rect, updated.process.meter_key) == (None, "")
+
     def test_remaps_dust_spots_and_scratch_lines(self):
         old, new = HalfGeometry(split_x=0.5), HalfGeometry(split_x=0.6)
         config = WorkspaceConfig(retouch=RetouchConfig(manual_dust_spots=[(0.3, 0.3, 6)], scratch_lines=[(0.1, 0.1, 0.2, 0.2, 2.0)]))

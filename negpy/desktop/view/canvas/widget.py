@@ -1,13 +1,15 @@
+from negpy.kernel.system.i18n import tr
 from typing import TYPE_CHECKING, Any, Optional, Tuple
 import math
 import sys
 import numpy as np
 from PyQt6.QtWidgets import QStackedLayout, QMenu, QWidget, QPinchGesture, QGestureEvent
-from PyQt6.QtGui import QCursor, QMouseEvent, QNativeGestureEvent, QPainter, QColor, QWheelEvent
-from PyQt6.QtCore import QEvent, pyqtSignal, Qt, QPointF
+from PyQt6.QtGui import QCursor, QImage, QMouseEvent, QNativeGestureEvent, QPainter, QColor, QWheelEvent
+from PyQt6.QtCore import QEvent, QRectF, pyqtSignal, Qt, QPointF
 from negpy.desktop.session import ToolMode, AppState
 from negpy.desktop.view.canvas.gpu_widget import GPUCanvasWidget
 from negpy.desktop.view.canvas.hud import CanvasHud
+from negpy.desktop.view.canvas.navigator import CanvasNavigator, visible_part
 from negpy.desktop.view.canvas.overlay import CanvasOverlay
 from negpy.desktop.view.widgets.granular_settings_dialog import open_paste_dialog, open_sync_bounds_dialog
 from negpy.infrastructure.gpu.device import GPUDevice
@@ -27,6 +29,8 @@ logger = get_logger(__name__)
 # Inset for the floating bottom toolbar, so the pill is not flush against the canvas edge
 # or clipped by it on tight laptop layouts.
 _TOOLBAR_INSET = THEME.space_xl
+# Clear space kept around the frame at fit.
+FIT_MARGIN = THEME.space_xl
 
 
 def clamp_canvas_zoom_level(zoom: float) -> float:
@@ -53,6 +57,7 @@ _TOOL_CURSORS: dict[ToolMode, Qt.CursorShape] = {
     ToolMode.LOCAL_OVAL: Qt.CursorShape.CrossCursor,
     ToolMode.LOCAL_GRADIENT: Qt.CursorShape.CrossCursor,
     ToolMode.ANALYSIS_DRAW: Qt.CursorShape.CrossCursor,
+    ToolMode.FILM_BASE: Qt.CursorShape.CrossCursor,
     ToolMode.STRAIGHTEN: Qt.CursorShape.CrossCursor,
     ToolMode.KEYSTONE_LINES: Qt.CursorShape.CrossCursor,
     ToolMode.ZONE_PLACE: Qt.CursorShape.CrossCursor,
@@ -134,6 +139,7 @@ class ImageCanvas(QWidget):
     straighten_completed = pyqtSignal(float)
     keystone_line_marked = pyqtSignal(str, float, float, float, float)
     test_strip_picked = pyqtSignal(int, int)
+    paper_strip_kept = pyqtSignal()
     zone_pin_moved = pyqtSignal(int, float, float, bool)
     zone_placement_confirmed = pyqtSignal()
     local_mask_selected = pyqtSignal(int)
@@ -169,6 +175,7 @@ class ImageCanvas(QWidget):
 
         # Acceleration layer
         self.gpu_widget = GPUCanvasWidget(self)
+        self.gpu_widget.fit_margin = FIT_MARGIN
         gpu = GPUDevice.get()
         if gpu.is_available:
             try:
@@ -180,6 +187,7 @@ class ImageCanvas(QWidget):
 
         # UI Overlay layer
         self.overlay = CanvasOverlay(state, self)
+        self.overlay.fit_margin = FIT_MARGIN
         self.root_layout.addWidget(self.overlay)
 
         self.overlay.clicked.connect(self.clicked.emit)
@@ -201,13 +209,17 @@ class ImageCanvas(QWidget):
         self.overlay.straighten_completed.connect(self.straighten_completed.emit)
         self.overlay.keystone_line_marked.connect(self.keystone_line_marked.emit)
         self.overlay.test_strip_picked.connect(self.test_strip_picked.emit)
+        self.overlay.paper_strip_kept.connect(self.paper_strip_kept.emit)
         self.overlay.zone_pin_moved.connect(self.zone_pin_moved.emit)
         self.overlay.zone_placement_confirmed.connect(self.zone_placement_confirmed.emit)
         self.overlay.local_mask_selected.connect(self.local_mask_selected.emit)
         self.overlay.local_mask_edited.connect(self.local_mask_edited.emit)
         self.overlay.local_vertex_deleted.connect(self.local_vertex_deleted.emit)
+        self.overlay.zoom_toggle_requested.connect(self.toggle_zoom_at)
 
         self.hud = CanvasHud(self)
+        self.navigator = CanvasNavigator(self)
+        self.navigator.center_requested.connect(self.center_on)
         self._floating_toolbar: Optional[QWidget] = None
 
         self.grabGesture(Qt.GestureType.PinchGesture)
@@ -225,6 +237,7 @@ class ImageCanvas(QWidget):
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         self._layout_floating_widgets()
+        self._sync_navigator()
         # The fit scale moves with the viewport, so the true-zoom % readout must refresh.
         self.zoom_changed.emit(self.zoom_level)
 
@@ -235,6 +248,9 @@ class ImageCanvas(QWidget):
     def _layout_floating_widgets(self) -> None:
         self.hud.setGeometry(self.rect())
         tb = self._floating_toolbar
+        nav = self.navigator.sizeHint()
+        nav_bottom = self.height() - (self._toolbar_reserved_height() if tb is not None else 0) - _TOOLBAR_INSET
+        self.navigator.setGeometry(self.width() - nav.width() - _TOOLBAR_INSET, nav_bottom - nav.height(), nav.width(), nav.height())
         if tb is not None:
             if hasattr(tb, "set_available_width"):
                 tb.set_available_width(self.width())
@@ -250,6 +266,7 @@ class ImageCanvas(QWidget):
 
     def _raise_floating_widgets(self) -> None:
         self.hud.raise_()
+        self.navigator.raise_()
         if self._floating_toolbar is not None:
             self._floating_toolbar.raise_()
 
@@ -307,7 +324,8 @@ class ImageCanvas(QWidget):
         vh = max(1.0, self.height() * dpr)
         if not self.state.immersive_canvas:
             vh = max(1.0, vh - self._toolbar_reserved_height() * dpr)
-        return min(vw / max(1, img_w), vh / max(1, img_h))
+        margin = 2.0 * FIT_MARGIN * dpr
+        return min(max(1.0, vw - margin) / max(1, img_w), max(1.0, vh - margin) / max(1, img_h))
 
     def _source_scale(self) -> float:
         """Rendered-buffer pixels per source pixel. Below 1 when the frame rendered
@@ -330,25 +348,92 @@ class ImageCanvas(QWidget):
         where a settled frame carries every scan pixel and only a transient proxy does not."""
         if self.state.hq_preview or self._source_scale() >= 1.0:
             return ""
-        return "preview res · HQ off" if self.current_zoom_percent() >= 100 else ""
+        return tr("preview res · HQ off") if self.current_zoom_percent() >= 100 else ""
 
     def fit_to_window(self) -> None:
         """Fit the image to the viewport (zoom_level 1.0 is the shader's fit); reset pan."""
         self.set_zoom(1.0)
 
-    def zoom_to_percent(self, percent: float) -> None:
-        """Set the true pixel zoom to ``percent`` (100 = 1 source pixel : 1 device pixel)."""
+    def _zoom_level_for_percent(self, percent: float) -> Optional[float]:
         fs = self._fit_scale()
         if not fs:
-            self.set_zoom(1.0)
-            return
-        zmin = APP_CONFIG.canvas_zoom_min
+            return None
         # Allow above the normal wheel max, so a true 100% stays reachable for images much larger
         # than the viewport, where 1 / fit_scale exceeds canvas_zoom_max.
-        self.zoom_level = max(zmin, (percent / 100.0) / (fs * self._source_scale()))
+        return max(APP_CONFIG.canvas_zoom_min, (percent / 100.0) / (fs * self._source_scale()))
+
+    def zoom_to_percent(self, percent: float) -> None:
+        """Set the true pixel zoom to ``percent`` (100 = 1 source pixel : 1 device pixel)."""
+        zoom = self._zoom_level_for_percent(percent)
+        if zoom is None:
+            self.set_zoom(1.0)
+            return
+        self.zoom_level = zoom
         if self.zoom_level <= 1.0:
             self.pan_offset = QPointF(0, 0)
         self._sync_transform()
+
+    def toggle_zoom_at(self, anchor: QPointF) -> None:
+        """Double-click: back to fit, or from fit to 100% with the clicked spot kept under the cursor."""
+        if abs(self.zoom_level - 1.0) > 1e-3:
+            self.fit_to_window()
+            return
+        zoom = self._zoom_level_for_percent(100.0)
+        if zoom is not None:
+            self._commit_anchored_zoom(zoom, anchor)
+
+    def center_on(self, nx: float, ny: float) -> None:
+        """Pan so the buffer point (nx, ny) sits at the center of the unobstructed view."""
+        view = self.overlay._view_rect
+        if view.isEmpty():
+            return
+        reserve = self._toolbar_reserved_height() if not self.state.immersive_canvas else 0
+        cx, cy = self.width() / 2.0, (self.height() - reserve) / 2.0
+        self.pan_by_viewport_delta(cx - (view.x() + nx * view.width()), cy - (view.y() + ny * view.height()))
+
+    def _navigator_image(self) -> Optional[QImage]:
+        """The displayed frame on the CPU path; else the frame's film-strip thumbnail, cut out of
+        its square padding. A GPU frame has no host copy, and an HQ readback costs far more than
+        the map is worth."""
+        if self.overlay._qimage is not None:
+            return self.overlay._qimage
+        st = self.state
+        if not 0 <= st.selected_file_idx < len(st.uploaded_files):
+            return None
+        from negpy.services.assets.thumbnails import asset_thumbnail_key
+
+        icon = st.thumbnails.get(asset_thumbnail_key(st.uploaded_files[st.selected_file_idx]))
+        dims = self.display_size()
+        if icon is None or not dims:
+            return None
+        side = APP_CONFIG.thumbnail_size
+        thumb = icon.pixmap(side, side).toImage()
+        side = thumb.width()
+        aspect = dims[0] / max(1, dims[1])
+        w, h = (side, round(side / aspect)) if aspect >= 1.0 else (round(side * aspect), side)
+        return thumb.copy((side - w) // 2, (side - h) // 2, max(1, w), max(1, h))
+
+    def _sync_navigator(self) -> None:
+        """Shown while part of the frame is off screen, in a view whose geometry the map shares."""
+        view = self.overlay._view_rect
+        dims = self.display_size()
+        visible = visible_part(view, QRectF(self.rect()))
+        shown = (
+            dims is not None
+            and not visible.isEmpty()
+            and (visible.width() < 0.995 or visible.height() < 0.995)
+            and not self.state.test_strip
+            and not self.state.canvas_value("crop_preview_full")
+        )
+        if not shown:
+            self.navigator.hide()
+            return
+        assert dims is not None
+        self.navigator.set_view(self._navigator_image(), dims[0] / max(1, dims[1]), visible)
+        if self.navigator.isHidden():
+            self._layout_floating_widgets()
+            self.navigator.show()
+            self.navigator.wake()
 
     def zoom_to_original(self) -> None:
         """Zoom to one source pixel per device pixel (100%). Below HQ the preview is
@@ -382,6 +467,7 @@ class ImageCanvas(QWidget):
         self._last_buffer = None
         self.gpu_widget.clear()
         self.overlay.update_buffer(None, "sRGB", None)
+        self.navigator.hide()
 
     def release_gpu_texture(self) -> None:
         """Drop the displayed texture before the engine frees its pool.
@@ -661,6 +747,7 @@ class ImageCanvas(QWidget):
         self.gpu_widget.set_transform(self.zoom_level, self.pan_offset.x(), self.pan_offset.y())
         self.overlay.fit_height_reserve = reserve
         self.overlay.set_transform(self.zoom_level, self.pan_offset.x(), self.pan_offset.y())
+        self._sync_navigator()
         self.zoom_changed.emit(self.zoom_level)
         self.update()
 
@@ -709,6 +796,7 @@ class ImageCanvas(QWidget):
             self.overlay.show()
             self.overlay.raise_()
         self._raise_floating_widgets()
+        self._sync_navigator()
         # The image resolution can change between renders, for example on toggling HQ, which
         # shifts the fit scale. Refresh the true-zoom readout for the new buffer.
         self.zoom_changed.emit(self.zoom_level)
@@ -743,33 +831,33 @@ class ImageCanvas(QWidget):
             return
 
         menu = QMenu(self)
-        act_wb = menu.addAction(label_with_shortcut("Pick WB", "pick_wb"))
+        act_wb = menu.addAction(label_with_shortcut(tr("Pick WB"), "pick_wb"))
         act_wb.triggered.connect(lambda: self._controller.set_active_tool(ToolMode.WB_PICK))  # type: ignore[union-attr]
-        act_dust = menu.addAction(label_with_shortcut("Pick Dust", "pick_dust"))
+        act_dust = menu.addAction(label_with_shortcut(tr("Pick Dust"), "pick_dust"))
         act_dust.triggered.connect(lambda: self._controller.set_active_tool(ToolMode.DUST_PICK))  # type: ignore[union-attr]
         self._add_exclude_action(menu, pos)
         menu.addSeparator()
-        act_copy = menu.addAction(label_with_shortcut("Copy Settings", "copy"))
+        act_copy = menu.addAction(label_with_shortcut(tr("Copy Settings"), "copy"))
         act_copy.triggered.connect(self._controller.session.copy_settings)  # type: ignore[union-attr]
-        act_copy_bounds = menu.addAction(label_with_shortcut("Copy Settings + Bounds", "copy_with_bounds"))
+        act_copy_bounds = menu.addAction(label_with_shortcut(tr("Copy Settings + Bounds"), "copy_with_bounds"))
         act_copy_bounds.triggered.connect(self._controller.session.copy_settings_with_bounds)  # type: ignore[union-attr]
-        act_paste = menu.addAction(label_with_shortcut("Paste Settings", "paste"))
+        act_paste = menu.addAction(label_with_shortcut(tr("Paste Settings"), "paste"))
         act_paste.triggered.connect(lambda: open_paste_dialog(self, self._controller))  # type: ignore[arg-type]
         act_paste.setEnabled(self.state.clipboard is not None)
-        act_sync_bounds = menu.addAction(label_with_shortcut("Sync Bounds…", "sync_bounds"))
+        act_sync_bounds = menu.addAction(label_with_shortcut(tr("Sync Bounds…"), "sync_bounds"))
         act_sync_bounds.triggered.connect(lambda: open_sync_bounds_dialog(self, self._controller.session))  # type: ignore[union-attr]
         menu.addSeparator()
         self._add_reset_actions(menu)
         menu.addSeparator()
-        act_reset = menu.addAction("Reset View")
+        act_reset = menu.addAction(tr("Reset View"))
         act_reset.triggered.connect(self.fit_to_window)
-        act_sticky_zoom = menu.addAction("Sticky Zoom")
+        act_sticky_zoom = menu.addAction(tr("Sticky Zoom"))
         act_sticky_zoom.setCheckable(True)
         act_sticky_zoom.setChecked(self.state.sticky_zoom)
         act_sticky_zoom.toggled.connect(self._controller.session.set_sticky_zoom)  # type: ignore[union-attr]
         menu.addSeparator()
         self._add_merge_to_tiff_action(menu)
-        act_unload = menu.addAction("Unload…")
+        act_unload = menu.addAction(tr("Unload…"))
         act_unload.triggered.connect(self._unload_current_file)
         menu.exec(global_pos)
 
@@ -785,8 +873,8 @@ class ImageCanvas(QWidget):
         """The Film Strip's frame resets, for the frame on the canvas."""
         controller = self._controller
         assert controller is not None
-        menu.addAction("Reset Settings").triggered.connect(controller.session.reset_settings)
-        act_roll = menu.addAction(label_with_shortcut("Reset to Roll Settings", "reset_to_roll"))
+        menu.addAction(tr("Reset Settings")).triggered.connect(controller.session.reset_settings)
+        act_roll = menu.addAction(label_with_shortcut(tr("Reset to Roll Settings"), "reset_to_roll"))
         act_roll.triggered.connect(controller.revert_frame_to_roll)
         act_roll.setEnabled(controller.can_revert_frame_to_roll())
         menu.addAction(label_with_shortcut(SIDECAR_LABEL, "load_sidecar")).triggered.connect(
@@ -801,7 +889,7 @@ class ImageCanvas(QWidget):
         coords = self.overlay.image_coords_at(pos)
         if coords is None:
             return
-        act = menu.addAction("Exclude from Optical Removal")
+        act = menu.addAction(tr("Exclude from Optical Removal"))
         act.triggered.connect(lambda _=False, c=coords: self._controller.handle_dust_exclusion_painted([c]))  # type: ignore[union-attr]
 
     def _unload_current_file(self) -> None:
@@ -818,18 +906,18 @@ class ImageCanvas(QWidget):
         assert controller is not None
         count = len(self.state.config.retouch.clone_strokes)
         menu = QMenu(self)
-        act_source = menu.addAction("Pick New Source")
+        act_source = menu.addAction(tr("Pick New Source"))
         act_source.triggered.connect(lambda: controller.arm_clone_source(True))
         menu.addSeparator()
         hit = self.overlay.heal_hit_test(pos)
         if hit is not None and hit[0] == "clone":
-            act_delete = menu.addAction("Delete This Clone")
+            act_delete = menu.addAction(tr("Delete This Clone"))
             act_delete.triggered.connect(lambda _=False, i=hit[1]: controller.delete_clone(i))
             menu.addSeparator()
-        act_undo = menu.addAction(label_with_shortcut("Undo Last Clone", "undo"))
+        act_undo = menu.addAction(label_with_shortcut(tr("Undo Last Clone"), "undo"))
         act_undo.triggered.connect(controller.undo_last_clone)
         act_undo.setEnabled(count > 0)
-        act_clear = menu.addAction("Clear All Clones…")
+        act_clear = menu.addAction(tr("Clear All Clones…"))
         act_clear.triggered.connect(controller.clear_clones)
         act_clear.setEnabled(count > 0)
         menu.exec(global_pos)
@@ -844,10 +932,10 @@ class ImageCanvas(QWidget):
         menu = QMenu(self)
 
         if self.state.active_tool == ToolMode.SCRATCH_PICK:
-            act_confirm = menu.addAction("Confirm Scratch  Enter")
+            act_confirm = menu.addAction(tr("Confirm Scratch  Enter"))
             act_confirm.triggered.connect(self.overlay.confirm_scratch)
             act_confirm.setEnabled(self.overlay.has_scratch_points())
-            act_point = menu.addAction("Undo Last Point  Backspace")
+            act_point = menu.addAction(tr("Undo Last Point  Backspace"))
             act_point.triggered.connect(self.overlay.undo_last_scratch_point)
             act_point.setEnabled(self.overlay.has_scratch_points())
             menu.addSeparator()
@@ -855,17 +943,17 @@ class ImageCanvas(QWidget):
         hit = self.overlay.heal_hit_test(pos)
         if hit is not None:
             kind, index = hit
-            act_delete = menu.addAction("Delete This Clone" if kind == "clone" else "Delete This Heal")
+            act_delete = menu.addAction(tr("Delete This Clone") if kind == "clone" else tr("Delete This Heal"))
             act_delete.triggered.connect(
                 lambda _=False, k=kind, i=index: controller.delete_clone(i) if k == "clone" else controller.delete_heal(k, i)
             )
             menu.addSeparator()
 
         self._add_exclude_action(menu, pos)
-        act_undo = menu.addAction(label_with_shortcut("Undo Last Heal", "undo"))
+        act_undo = menu.addAction(label_with_shortcut(tr("Undo Last Heal"), "undo"))
         act_undo.triggered.connect(controller.undo_last_retouch)
         act_undo.setEnabled(num_heals > 0)
-        act_clear = menu.addAction("Clear All Heals…")
+        act_clear = menu.addAction(tr("Clear All Heals…"))
         act_clear.triggered.connect(controller.clear_retouch)
         act_clear.setEnabled(num_heals > 0)
         menu.exec(global_pos)

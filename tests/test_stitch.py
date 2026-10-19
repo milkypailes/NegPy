@@ -184,6 +184,17 @@ def test_gain_compensation_removes_cast():
     assert rms < 0.02
 
 
+def test_gain_compensation_is_exact_on_a_full_res_overlap():
+    """An export-sized overlap must get the same per-channel gain as a preview-sized one."""
+    n = 2048
+    ref = np.empty((n, n, 3), np.float32)
+    ref[...] = (0.45, 0.1, 0.1)
+    mov = ref * np.float32(1.4)
+    mask = np.ones((n, n), bool)
+    stitch_logic.gain_compensate(ref, mask, mov, mask)
+    np.testing.assert_allclose(mov[0, 0], ref[0, 0], rtol=1e-5)
+
+
 def test_ir_blended_only_when_all_present():
     _, part0, part1, t = _parts()
     cfg = _registered_config(part0, part1)

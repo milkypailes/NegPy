@@ -204,15 +204,11 @@ class TestProfileDetection:
         icc = _build_matrix_trc_icc(_SRGB_R, _SRGB_G, _SRGB_B, add_a2b0=True)
         assert not is_matrix_trc_profile(icc)
 
-    def test_real_bundled_profiles(self):
+    def test_real_lut_profile(self):
         import os
 
-        icc_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "icc")
-        rgbscan = os.path.join(icc_dir, "RGBScan.icc")
-        if os.path.exists(rgbscan):
-            with open(rgbscan, "rb") as f:
-                data = f.read()
-            assert not is_matrix_trc_profile(data), "RGBScan.icc is LUT-based, must not be detected as matrix/TRC"
+        with open(os.path.join(os.path.dirname(__file__), "fixtures", "RGBScan.icc"), "rb") as f:
+            assert not is_matrix_trc_profile(f.read()), "a LUT-based profile must not be detected as matrix/TRC"
 
     def test_gray_profile_not_detected_as_matrix(self):
         """A GRAY-space profile (class=mntr, space=GRAY: desc/cprt/wtpt/kTRC/bkpt, no
@@ -424,48 +420,16 @@ class TestRealBundledProfiles:
         assert bypassed
         np.testing.assert_allclose(out, img, atol=5e-4)
 
-    def test_rgbscan_not_bypassable(self):
-        """RGBScan.icc (spac/Lab PCS, A2B0-only) is the shipped Narrowband Scan default.
-        It must never take the matrix-only shortcut — its A2B0 curves are authored
-        against the full-CMS decode and must keep running through it unchanged."""
+    def test_a_lut_profile_is_not_bypassable(self):
+        """A LUT input profile (here spac/Lab PCS, A2B0-only) must never take the matrix-only
+        shortcut: its A2B0 curves are authored against the full-CMS decode."""
+        import os
+
         from negpy.services.rendering.image_processor import ImageProcessor
 
-        path = self._icc_path("RGBScan.icc")
+        path = os.path.join(os.path.dirname(__file__), "fixtures", "RGBScan.icc")
         assert not is_matrix_trc_profile(open(path, "rb").read())
         img = np.random.RandomState(4).rand(16, 16, 3).astype(np.float32)
         out, bypassed = ImageProcessor._try_matrix_bypass(img, path)
         assert not bypassed
         np.testing.assert_array_equal(out, img)
-
-    def test_boundary_encoding_contract(self):
-        """The buffer arriving at the boundary is pure-power ~2.2 encoded (working_oetf's
-        563/256, not exactly 2.2, but within a fraction of an LSB). RGBScan.icc's CLUT
-        input domain is sRGB piecewise. The A2B0 input curve is the transcode between the
-        two — decode pure-power, re-encode sRGB — which is what this pins, so a change to
-        the finish-step OETF fails this loudly instead of silently breaking the shipped
-        narrowband-scan default."""
-        import struct
-
-        from negpy.kernel.image.logic import working_oetf_decode
-
-        path = self._icc_path("RGBScan.icc")
-        data = open(path, "rb").read()
-        tag_count = struct.unpack_from(">I", data, 128)[0]
-        tags = {}
-        for i in range(tag_count):
-            base = 132 + i * 12
-            sig = data[base : base + 4]
-            off, sz = struct.unpack_from(">II", data, base + 4)
-            tags[sig] = (off, sz)
-        off, _ = tags[b"A2B0"]
-        assert data[off : off + 4] == b"mft2"
-        n_in_entries = struct.unpack_from(">H", data, off + 48)[0]
-        r_curve = np.array(struct.unpack_from(f">{n_in_entries}H", data, off + 52), dtype=np.float64) / 65535.0
-
-        x = np.linspace(0.0, 1.0, n_in_entries)
-        linear = working_oetf_decode(x.astype(np.float32)).astype(np.float64)
-        srgb_encoded = np.where(linear <= 0.0031308, linear * 12.92, 1.055 * linear ** (1 / 2.4) - 0.055)
-
-        # The profile's curve was built against a plain gamma=2.2 assumption, not the
-        # pipeline's exact 563/256 (2.19921875) — a known, tiny, sub-8-bit-LSB gap.
-        assert np.max(np.abs(r_curve - srgb_encoded)) < 2e-4
