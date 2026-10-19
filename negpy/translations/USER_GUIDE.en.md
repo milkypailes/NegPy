@@ -382,7 +382,7 @@ Rows that measure the scan, not your edit; hover for details.
 **Crop:**
 
 *   **Auto** (magic wand on the CROP header): the Crop card's Auto Crop ([§10.5](#105-crop)), for this frame.
-*   **Ratio**: the roll's crop ratio, the same field as on the Crop card. **1:1.4142** is the ISO A paper shape (A4, A6).
+*   **Ratio**: the roll's crop ratio, the same field as on the Crop card. **1:1.4142** is the ISO A paper shape (A4, A6). **Custom…** opens a dialog that takes any width:height, for example **16:11**.
 *   **Crop** tool: draw a crop rectangle; with **Ratio** at **Free**, an edge midpoint resizes one axis. A manual crop turns **Auto Crop** off for this frame. **Reset** clears the crop and turns auto-crop off.
 *   **Guide**: *Thirds*, *Phi Grid*, *Diagonals*, *Golden Triangles*, *Golden Spiral*, *Armature*, *Diagonal Method*, *Grid* or *Off*. The redo button rotates the guide.
 
@@ -808,7 +808,7 @@ How this frame is measured into a positive's tonal bounds.
 
 The roll-wide crop shape, and what the frame detector looks for. Each frame's rectangle is its own, drawn or found in **Geometry** ([§4.1](#41-geometry-crop-and-straighten)).
 
-*   **Ratio** (default `Free`): `Free`, `1:1`, `3:2`, `4:3`, `5:4`, `6:7`, `7:5`, `65:24`, `16:9`, `16:10`, `11:8.5`, each auto-oriented. On `Free` auto-crop uses the detected format; a ratio forces every frame to it.
+*   **Ratio** (default `Free`): `Free`, `1:1`, `3:2`, `4:3`, `5:4`, `6:7`, `7:5`, `65:24`, `16:9`, `16:10`, `8.5:11`, each auto-oriented; **Custom…** takes any width:height, for example `16:11`. On `Free` auto-crop uses the detected format; a ratio forces every frame to it.
 *   **Detect**: snaps the ratio to the closest standard.
 
 **Auto Crop**:

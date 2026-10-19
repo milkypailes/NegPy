@@ -1,11 +1,11 @@
-from negpy.desktop.view.styles.templates import add_choice_items, select_choice
 from negpy.kernel.system.i18n import tr
-from PyQt6.QtWidgets import QHBoxLayout, QLabel
+from PyQt6.QtWidgets import QDialog, QHBoxLayout, QLabel
 
 from negpy.desktop.view.sidebar.base import BaseSidebar
 from negpy.desktop.view.styles.templates import ICON_BUTTON_WIDTH, field_label, header_row, section_subheader, wrap_tooltip
+from negpy.desktop.view.widgets.crop_ratio_dialog import CropRatioDialog
+from negpy.desktop.view.widgets.crop_ratio_picker import CUSTOM_RATIO_ACTION, fill_crop_ratio_combo, sync_crop_ratio_combo
 from negpy.desktop.view.widgets.step_combo import StepCombo
-from negpy.domain.models import CROP_RATIO_CHOICES, canonical_crop_ratio
 from negpy.desktop.view.widgets.sliders import CompactSlider, SliderGroup
 from negpy.features.geometry.models import AutocropMode
 
@@ -29,9 +29,8 @@ class AutocropSidebar(BaseSidebar):
         self.ratio_combo = StepCombo()
         # One entry per shape (see CROP_RATIO_CHOICES). The crop tool auto-orients to match the
         # current drag, so a separate portrait entry for every ratio would duplicate the same
-        # shape twice.
-        add_choice_items(self.ratio_combo, [r.value for r in CROP_RATIO_CHOICES])
-        select_choice(self.ratio_combo, canonical_crop_ratio(conf.autocrop_ratio))
+        # shape twice. Custom… is the exception: it takes any width:height and shows its own item.
+        fill_crop_ratio_combo(self.ratio_combo, conf.autocrop_ratio)
         self.ratio_combo.setPlaceholderText(tr("Select Ratio…"))
         self.ratio_combo.setToolTip(wrap_tooltip(tr("Aspect ratio the auto crop and the crop tool snap to")))
         ratio_row.addWidget(self.ratio_combo, 1)
@@ -103,7 +102,7 @@ class AutocropSidebar(BaseSidebar):
         self.layout.addWidget(SliderGroup(self.offset_slider, self.rebate_trim_slider))
 
     def _connect_signals(self) -> None:
-        self.ratio_combo.currentIndexChanged.connect(lambda _: self.controller.set_crop_ratio(self.ratio_combo.currentData()))
+        self.ratio_combo.currentIndexChanged.connect(self._on_ratio_selected)
         self.detect_ratio_btn.clicked.connect(self.controller.detect_aspect_ratio)
         self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
         self.auto_frame_btn.toggled.connect(self._on_auto_frame_toggled)
@@ -120,6 +119,28 @@ class AutocropSidebar(BaseSidebar):
         self.rebate_trim_slider.valueCommitted.connect(
             lambda v: self.controller.set_roll_default("autocrop", autocrop_rebate_trim=v / 100.0)
         )
+
+    def _on_ratio_selected(self, _index: int) -> None:
+        value = self.ratio_combo.currentData()
+        if value == CUSTOM_RATIO_ACTION:
+            self._prompt_custom_ratio()
+        else:
+            self.controller.set_crop_ratio(value)
+
+    def _prompt_custom_ratio(self) -> None:
+        conf = self.state.config.geometry
+        dialog = CropRatioDialog(str(conf.autocrop_ratio), parent=self, repo=self.controller.session.repo)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.controller.set_crop_ratio(dialog.ratio())
+        # Cancel restores the stored ratio; accept shows the ratio as its own list item.
+        self._sync_ratio_combo()
+
+    def _sync_ratio_combo(self) -> None:
+        self.block_signals(True)
+        try:
+            sync_crop_ratio_combo(self.ratio_combo, self.state.config.geometry.autocrop_ratio)
+        finally:
+            self.block_signals(False)
 
     def _on_auto_frame_toggled(self, checked: bool) -> None:
         if checked:
@@ -146,7 +167,7 @@ class AutocropSidebar(BaseSidebar):
         conf = self.state.config.geometry
         self.block_signals(True)
         try:
-            select_choice(self.ratio_combo, canonical_crop_ratio(conf.autocrop_ratio))
+            sync_crop_ratio_combo(self.ratio_combo, conf.autocrop_ratio)
             self._select_mode(conf.autocrop_mode)
             self.offset_slider.setValue(float(conf.autocrop_offset))
             self.rebate_trim_slider.setValue(conf.autocrop_rebate_trim * 100.0)

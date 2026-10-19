@@ -1,3 +1,4 @@
+import re
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import TYPE_CHECKING, Optional, Tuple
@@ -85,6 +86,26 @@ def canonical_crop_ratio(ratio: str) -> str:
     return _PORTRAIT_TO_CANONICAL_CROP_RATIO.get(ratio, ratio)
 
 
+_CUSTOM_RATIO_RE = re.compile(r"\s*(\d+(?:\.\d+)?)\s*:\s*(\d+(?:\.\d+)?)\s*")
+
+
+def _ratio_number(value: float) -> str:
+    return str(int(value)) if value.is_integer() else f"{value:g}"
+
+
+def parse_custom_crop_ratio(text: str) -> Optional[str]:
+    """A user-typed ``width:height`` as its normalized form, or None when it is not two
+    positive numbers. Normalizing strips whitespace, leading zeros and a trailing ``.0``,
+    so the picker shows one form for one shape."""
+    match = _CUSTOM_RATIO_RE.fullmatch(text)
+    if match is None:
+        return None
+    w, h = (float(part) for part in match.groups())
+    if w <= 0.0 or h <= 0.0:
+        return None
+    return f"{_ratio_number(w)}:{_ratio_number(h)}"
+
+
 # Candidates for "Detect closest aspect ratio" (geometry.logic._closest_standard_ratio):
 # real film/scan formats only, both orientations. Keep output-only sizes (7:5, 16:9,
 # 16:10, 8.5:11) out: they sit too close to 3:2 and 5:4 in log-ratio space, so contour
@@ -130,7 +151,9 @@ class GeometryConfig:
     # Free, not 3:2: autocrop reads the film format off the detected frame, so the
     # default fits 6x6, 645 and 6x7 as well as 35mm. A fixed 3:2 center-cropped every
     # other format down to a third of the picture. An explicit ratio still overrides.
-    autocrop_ratio: AspectRatio = AspectRatio.FREE
+    # A str, not an AspectRatio: the picker's Custom entry stores any valid width:height
+    # (parse_custom_crop_ratio), which the enum does not name.
+    autocrop_ratio: str = AspectRatio.FREE
     autocrop_mode: AutocropMode = AutocropMode.IMAGE
     # Fraction of the detected rebate to cut: 0.0 = film edge, 1.0 = image edge, above
     # 1.0 bites into the picture. Image mode only.
@@ -165,7 +188,8 @@ class GeometryConfig:
         try:
             object.__setattr__(self, "autocrop_ratio", AspectRatio(self.autocrop_ratio))
         except ValueError:
-            object.__setattr__(self, "autocrop_ratio", AspectRatio.FREE)
+            custom = parse_custom_crop_ratio(str(self.autocrop_ratio))
+            object.__setattr__(self, "autocrop_ratio", custom if custom is not None else AspectRatio.FREE)
 
 
 def crops_frame(geometry: GeometryConfig) -> bool:

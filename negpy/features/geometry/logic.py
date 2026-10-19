@@ -2697,6 +2697,15 @@ def rotation_drag_angle(
     return float(np.clip(new_angle, -limit, limit))
 
 
+def _standard_fallback_ratio(fallback: str) -> AspectRatio:
+    """The fallback as an AspectRatio. A stored Custom ratio is not one, and detection
+    returning a standard member is the point of the caller, so it degrades to 3:2."""
+    try:
+        return AspectRatio(fallback)
+    except ValueError:
+        return AspectRatio.R_3_2
+
+
 def _closest_standard_ratio(roi: ROI, img_shape: Tuple[int, int], fallback: str = "3:2") -> AspectRatio:
     """
     Returns the standard AspectRatio closest to the ROI's aspect (log-space distance),
@@ -2707,7 +2716,7 @@ def _closest_standard_ratio(roi: ROI, img_shape: Tuple[int, int], fallback: str 
     y1, y2, x1, x2 = roi
     cw, ch = x2 - x1, y2 - y1
     if cw <= 0 or ch <= 0:
-        return AspectRatio(fallback)
+        return _standard_fallback_ratio(fallback)
 
     detected = cw / ch
     is_landscape = cw >= ch
@@ -2728,7 +2737,7 @@ def _closest_standard_ratio(roi: ROI, img_shape: Tuple[int, int], fallback: str 
         candidates.append((ratio, target))
 
     if not candidates:
-        return AspectRatio(fallback)
+        return _standard_fallback_ratio(fallback)
 
     best = min(candidates, key=lambda c: abs(math.log(max(detected, 1e-6)) - math.log(max(c[1], 1e-6))))
 
