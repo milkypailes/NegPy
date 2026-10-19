@@ -379,7 +379,7 @@ class TestConfigDeserialization(unittest.TestCase):
         self.assertEqual(WorkspaceConfig.from_flat_dict({"process_mode": "Kodachrome"}).process.process_mode, ProcessMode.C41)
 
     def test_retired_enum_values_fall_back_to_their_default(self):
-        config = WorkspaceConfig.from_flat_dict({"export_fmt": "PSD", "export_resolution_mode": "contact_sheet", "autocrop_ratio": "13:17"})
+        config = WorkspaceConfig.from_flat_dict({"export_fmt": "PSD", "export_resolution_mode": "contact_sheet", "autocrop_ratio": "13x17"})
         self.assertEqual(config.export.export_fmt, ExportFormat.JPEG)
         self.assertEqual(config.export.export_resolution_mode, ExportResolutionMode.ORIGINAL)
         self.assertEqual(config.geometry.autocrop_ratio, AspectRatio.FREE)
