@@ -4,6 +4,7 @@ import tempfile
 from typing import List, Optional
 
 from negpy.domain.models import WorkspaceConfig
+from negpy.features.exposure.normalization import BOUNDS_VERSION
 from negpy.kernel.system.logging import get_logger
 
 logger = get_logger(__name__)
@@ -22,7 +23,7 @@ def write_sidecar(source_path: str, config: WorkspaceConfig, half: int = 0) -> s
     """Write the full edit (``config.to_dict()``) as JSON next to the source. Returns the path written."""
     path = sidecar_path_for(source_path, half)
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    payload = json.dumps(config.to_dict(), default=str, indent=2)
+    payload = json.dumps({**config.to_dict(), "bounds_version": BOUNDS_VERSION}, default=str, indent=2)
     tmp_path = None
     try:
         with tempfile.NamedTemporaryFile("w", dir=os.path.dirname(path), delete=False, suffix=".part", encoding="utf-8") as tmp:
@@ -45,12 +46,16 @@ def load_sidecar(source_path: str, half: int = 0) -> Optional[WorkspaceConfig]:
 
 
 def read_sidecar(path: str) -> Optional[WorkspaceConfig]:
-    """Load edits from the sidecar at *path*. None if unreadable or malformed."""
+    """Load edits from the sidecar at *path*. None if unreadable or malformed. Frame bounds saved
+    under an older BOUNDS_VERSION are dropped, except under Lock Bounds, so the frame meters again."""
     try:
         with open(path, "r", encoding="utf-8") as f_in:
             data = json.load(f_in)
         if not isinstance(data, dict):
             return None
+        if int(data.pop("bounds_version", 0) or 0) < BOUNDS_VERSION and not data.get("lock_bounds"):
+            data.pop("local_floors", None)
+            data.pop("local_ceils", None)
         return WorkspaceConfig.from_flat_dict(data)
     except Exception as exc:
         logger.warning("Failed to load sidecar %s: %s", path, exc)

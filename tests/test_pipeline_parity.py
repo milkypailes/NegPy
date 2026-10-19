@@ -4,10 +4,10 @@ CPU ↔ GPU pipeline parity tests.
 Validates that every WGSL shader and its corresponding CPU logic.py produce
 outputs within tolerance across representative configs.
 
-NOTE: Current tolerances are generous (atol=1.5e-1) because several operations
-(lab chroma-denoise, glow/halation) use fundamentally different implementations
-between CPU (OpenCV) and GPU (custom WGSL filters). Sharpen has converged
-(shared kernel taps) and is held to 5e-2. Tighten the rest as they converge.
+NOTE: Current tolerances are generous (atol=1.5e-1) because glow/halation use
+fundamentally different implementations between CPU (OpenCV) and GPU (custom
+WGSL filters). Sharpen and Chroma Denoise have converged (shared kernel taps)
+and are held to 5e-2 and 2e-3. Tighten the rest as they converge.
 
 These tests require a GPU adapter; they are skipped in CI environments
 where no GPU is available. For consistent parity validation, run these
@@ -18,7 +18,10 @@ import numpy as np
 from dataclasses import replace
 
 from negpy.domain.models import WorkspaceConfig
+from negpy.features.exposure import print_lut
 from negpy.features.exposure.models import ExposureConfig
+from negpy.features.exposure.papers import PAPER_PROFILES, PaperProfile
+from negpy.features.exposure.print_lut import DyeLut, load_print_lut, save_print_lut
 from negpy.features.lab.models import LabConfig
 from negpy.features.local.models import LocalAdjustmentsConfig, LocalMask
 from negpy.features.retouch.models import RetouchConfig
@@ -171,6 +174,57 @@ class TestExposureParity:
 
     def test_default_config(self):
         self._run_and_compare(_make_base_settings())
+
+    def _lut_stock(self, tmp_path, monkeypatch, key, tilt):
+        g = np.linspace(0.0, 3.0, 17)
+        c, m, y = np.meshgrid(g, g, g, indexing="ij")
+        d = np.stack([c + tilt * m, m + 0.10 * y + 0.05 * c, y + 0.08 * m], -1)
+        save_print_lut(tmp_path / f"{key}.npz", (10.0**-d).astype(np.float32), np.full(3, 3.0, np.float32), key)
+        monkeypatch.setattr(print_lut, "LUT_DIR", tmp_path)
+        load_print_lut.cache_clear()
+        monkeypatch.setitem(PAPER_PROFILES, key, PaperProfile(label=key, print_color=DyeLut(key)))
+        return replace(_make_base_settings(), exposure=replace(ExposureConfig(), paper_profile=key))
+
+    def _render_both(self, settings, img=None):
+        img = self.img if img is None else img
+        scale = max(img.shape[:2]) / 1024.0
+        cpu = self.cpu.process(img, settings, f"parity_lut_{settings.exposure.paper_profile}")
+        tex, _ = self.gpu.process_to_texture(img, settings, scale_factor=scale, apply_layout=False, readback_metrics=False)
+        return cpu, self.gpu._readback_downsampled(tex)
+
+    def test_lut_stock_parity(self, tmp_path, monkeypatch):
+        s = self._lut_stock(tmp_path, monkeypatch, "lut_a", 0.10)
+        cpu, gpu = self._render_both(s)
+        _assert_mostly_close(cpu, gpu, atol=1e-2, rtol=0.0, max_violation_frac=0.01)
+        digital = self.cpu.process(self.img, _make_base_settings(), "parity_lut_digital")
+        assert np.mean(np.abs(cpu - digital).max(axis=-1) > 0.01) > 0.01
+
+    def test_lut_stock_parity_paper_black(self, tmp_path, monkeypatch):
+        s = self._lut_stock(tmp_path, monkeypatch, "lut_a", 0.10)
+        s = replace(s, exposure=replace(s.exposure, paper_black=True))
+        _assert_mostly_close(*self._render_both(s), atol=1e-2, rtol=0.0, max_violation_frac=0.01)
+
+    def test_lut_stock_parity_deep_toe(self, tmp_path, monkeypatch):
+        s = self._lut_stock(tmp_path, monkeypatch, "lut_a", 0.10)
+        s = replace(s, exposure=replace(s.exposure, toe=-1.0, shadow_density=0.5))
+        _assert_mostly_close(*self._render_both(s), atol=1e-2, rtol=0.0, max_violation_frac=0.01)
+
+    def test_lut_texture_replacement_drops_bind_groups(self, tmp_path, monkeypatch):
+        # Bind groups are keyed by id() of the view: a destroyed LUT's id can come back on a new view.
+        self._render_both(self._lut_stock(tmp_path, monkeypatch, "lut_r", 0.10))
+        assert self.gpu._bind_group_cache
+        load_print_lut.cache_clear()
+        self.gpu._lut_texture(load_print_lut("lut_r"))
+        assert not self.gpu._bind_group_cache
+
+    def test_lut_stock_switch(self, tmp_path, monkeypatch):
+        a = self._lut_stock(tmp_path, monkeypatch, "lut_a", 0.10)
+        b = self._lut_stock(tmp_path, monkeypatch, "lut_b", 0.40)
+        first = self._render_both(a)[1]
+        other = self._render_both(b)[1]
+        again = self._render_both(a)[1]
+        np.testing.assert_allclose(again, first, atol=1e-6)
+        assert np.abs(other - first).max() > 0.01
 
     def test_cast_removal_quadratic(self):
         # Curved neutral axis -> 3-point Cast Removal emits a quadratic core; CPU and GPU
@@ -446,14 +500,26 @@ class TestLabParity:
         assert cpu_result.shape == gpu_result.shape
         assert np.allclose(cpu_result, gpu_result, atol=0.5, rtol=0.2), f"Max diff: {np.max(np.abs(cpu_result - gpu_result)):.6f}"
 
+    def _chroma_denoise_renders(self, chroma_denoise: float, scale: float) -> tuple:
+        from negpy.domain.interfaces import PipelineContext
+
+        rng = np.random.default_rng(11)
+        img = np.ascontiguousarray(np.clip(self.img + rng.normal(0, 0.03, self.img.shape).astype(np.float32), 1e-4, 1.0))
+        s = replace(_make_base_settings(), lab=LabConfig(chroma_denoise=chroma_denoise, sharpen=0.0))
+        h, w = img.shape[:2]
+        ctx = PipelineContext(original_size=(h, w), scale_factor=scale, process_mode=s.process.process_mode)
+        cpu = np.asarray(self.cpu.process(img, s, f"parity_cdn_{chroma_denoise}_{scale}", context=ctx))[..., :3]
+        gpu_tex, _ = self.gpu.process_to_texture(img, s, scale_factor=scale, apply_layout=False, readback_metrics=False)
+        return cpu.astype(np.float64), np.asarray(self.gpu._readback_downsampled(gpu_tex))[..., :3].astype(np.float64)
+
     def test_chroma_denoise(self):
-        # Isolate chroma denoise from the sharpen default. The GPU scales its a*/b* blur radius by
-        # chroma_denoise * scale_factor to follow the CPU bilateralFilter sigmaSpace.
-        s = replace(
-            _make_base_settings(),
-            lab=LabConfig(chroma_denoise=3.0, sharpen=0.0),
-        )
-        self._run_and_compare(s)
+        """Both engines low-pass a*/b* with the same gaussian_kernel_1d taps and apply the same edge test."""
+        for scale in (1.0, 2.5):
+            cpu, gpu = self._chroma_denoise_renders(2.0, scale)
+            cpu_off, _ = self._chroma_denoise_renders(0.0, scale)
+            moved = float(np.mean(np.abs(cpu - cpu_off) > 2e-3))
+            assert moved > 0.02, f"denoise moves only {moved:.1%} of values past the tolerance -- a dead mirror would pass"
+            _assert_mostly_close(cpu, gpu, atol=2e-3, rtol=2e-3, max_violation_frac=0.001)
 
     def _run_and_compare_sharpen(self, settings: WorkspaceConfig, scale: float) -> None:
         """Sharpen-specific harness: both engines get the SAME explicit scale

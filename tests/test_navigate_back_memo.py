@@ -40,6 +40,7 @@ def _stub(memo, **overrides):
         _spared_texture=None,
         _gpu_fallback_notified=True,
         _freeze_resolved_auto_crop=MagicMock(),
+        _freeze_resolved_meter=MagicMock(),
         state=SimpleNamespace(
             config=object(),
             metrics_lock=MagicMock(__enter__=lambda s: None, __exit__=lambda s, *a: None),

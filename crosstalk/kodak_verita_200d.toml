@@ -1,0 +1,12 @@
+name = "Kodak VERITA 200D 5206/7206 (approx)"
+type = "specsheet-based"
+
+# 3x3 row-major density unmixing matrix (out R/G/B × in R/G/B)
+# Estimated: the 5206/7206 brochure plots only a midscale neutral, so its curve above D-min is
+# fitted with the Vision3 dye curves (scripts/fit_crosstalk_estimates.py), sampled at 650/550/450
+# nm per the crosstalk-from-datasheet skill.
+matrix = [
+  [ 1.0000, -0.0738, -0.0007 ],
+  [-0.1551,  1.0000, -0.0622 ],
+  [-0.0482,  0.0007,  1.0000 ],
+]

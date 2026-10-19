@@ -18,7 +18,7 @@ from negpy.desktop.controller import AppController
 from negpy.desktop.session import DesktopSessionManager, AppState, ToolMode
 from negpy.desktop.settings_catalog import rows_for_fields
 from negpy.desktop.workers.export import ExportTask, resolve_export_target_path
-from negpy.services.rendering.image_processor import ArmedCrop
+from negpy.services.rendering.image_processor import ArmedCrop, MeterBox
 from negpy.features.geometry.logic import autocrop_detection_key
 from negpy.domain.models import (
     ColorSpace,
@@ -98,6 +98,133 @@ class TestAppController(unittest.TestCase):
         args, _ = self.controller.session.repo.save_global_setting.call_args
         self.assertEqual(args[0], "half_frame_profile")
         self.assertEqual(args[1], {"crop_rect": [0.0, 0.0, 1.0, 1.0], "split_x": 0.6, "gutter_thickness": 0.02, "split_axis": "x"})
+
+    def _bake_meters(self):
+        from negpy.features.exposure.normalization import LogNegativeBounds
+
+        return {
+            "metered_anchor": 0.55,
+            "textural_range": 1.1,
+            "norm_density_range": 1.4,
+            "shadow_point": 0.9,
+            "highlight_point": 0.03,
+            "final_bounds": LogNegativeBounds((0.2, 0.5, 0.8), (1.6, 1.9, 2.1)),
+        }
+
+    def test_baked_exposure_config_freezes_autos_to_shown_values(self):
+        from negpy.desktop.auto_sliders import shown_values
+
+        meters = self._bake_meters()
+        cfg = self.controller.state.config
+        baked = self.controller._baked_exposure_config(cfg, meters)
+        self.assertIsNotNone(baked)
+        self.assertFalse(baked.exposure.auto_exposure)
+        self.assertFalse(baked.exposure.auto_normalize_contrast)
+        shown = shown_values(cfg, meters)
+        self.assertEqual(baked.exposure.density, shown["density"])
+        self.assertEqual(baked.exposure.grade, shown["grade"])
+        self.assertEqual(baked.exposure.highlight_density, shown["highlight_density"])
+        self.assertEqual(baked.exposure.shadow_density, shown["shadow_density"])
+
+    def test_baked_exposure_config_none_when_both_autos_off(self):
+        cfg = replace(
+            self.controller.state.config,
+            exposure=replace(self.controller.state.config.exposure, auto_exposure=False, auto_normalize_contrast=False),
+        )
+        self.assertIsNone(self.controller._baked_exposure_config(cfg, self._bake_meters()))
+
+    def test_baked_exposure_config_none_when_no_meters(self):
+        self.assertIsNone(self.controller._baked_exposure_config(self.controller.state.config, {}))
+
+    def test_baked_config_for_file_none_for_composites_and_forks(self):
+        self.assertIsNone(self.controller._baked_config_for_file({"hash": "hdr1", "path": "/tmp/a.jpg", "hdr_paths": ["/tmp/b.jpg"]}))
+        self.assertIsNone(self.controller._baked_config_for_file({"hash": "st1", "path": "/tmp/a.jpg", "stitch_paths": ["/tmp/b.jpg"]}))
+        self.assertIsNone(self.controller._baked_config_for_file({"hash": "abc#roll:r1", "path": "/tmp/a.jpg"}))
+
+    def test_bake_to_roll_bakes_active_frame_and_others(self):
+        meters = self._bake_meters()
+        self.controller.state.uploaded_files = [
+            {"hash": "a", "path": "/tmp/a.jpg"},
+            {"hash": "b", "path": "/tmp/b.jpg"},
+        ]
+        self.controller.state.current_file_hash = "a"
+        self.controller.state.auto_meters = {"a": meters, "b": meters}
+        self.controller.session.asset_model = MagicMock()
+        self.controller.session.asset_model.visible_actual_indices_ordered.return_value = [0, 1]
+        self.controller.apply_config = MagicMock()
+        with patch("negpy.desktop.controller.load_or_promote", return_value=self.controller.state.config):
+            self.controller.bake_auto_density_grade_to_roll()
+        # active frame frozen into the live config via apply_config
+        self.controller.apply_config.assert_called_once()
+        active_baked = self.controller.apply_config.call_args.args[0]
+        self.assertFalse(active_baked.exposure.auto_exposure)
+        self.assertFalse(active_baked.exposure.auto_normalize_contrast)
+        # the other frame frozen into the DB via save_file_settings
+        self.controller.session.repo.save_file_settings.assert_called_once()
+        save_args = self.controller.session.repo.save_file_settings.call_args
+        self.assertEqual(save_args.args[0], "b")
+        self.assertFalse(save_args.args[1].exposure.auto_exposure)
+        self.assertFalse(save_args.args[1].exposure.auto_normalize_contrast)
+
+    def test_bake_to_roll_meters_and_bakes_unviewed_frame(self):
+        """A visible frame with no meters yet is metered on demand, then frozen, not skipped."""
+        meters = self._bake_meters()
+        self.controller.state.uploaded_files = [
+            {"hash": "a", "path": "/tmp/a.jpg"},
+            {"hash": "b", "path": "/tmp/b.jpg"},
+        ]
+        self.controller.state.current_file_hash = "a"
+        self.controller.state.auto_meters = {"a": meters}
+        self.controller.session.asset_model = MagicMock()
+        self.controller.session.asset_model.visible_actual_indices_ordered.return_value = [0, 1]
+        self.controller.apply_config = MagicMock()
+        with (
+            patch("negpy.desktop.controller.load_or_promote", return_value=self.controller.state.config),
+            patch.object(self.controller, "_meter_file", return_value=meters) as meter_mock,
+        ):
+            self.controller.bake_auto_density_grade_to_roll()
+        # the unviewed frame "b" was metered first, then frozen into the DB
+        meter_mock.assert_called_once()
+        self.assertEqual(meter_mock.call_args.args[0]["hash"], "b")
+        self.controller.session.repo.save_file_settings.assert_called_once()
+        save_args = self.controller.session.repo.save_file_settings.call_args
+        self.assertEqual(save_args.args[0], "b")
+        self.assertFalse(save_args.args[1].exposure.auto_exposure)
+        self.assertFalse(save_args.args[1].exposure.auto_normalize_contrast)
+
+    def test_bake_for_export_persists_without_touching_live_config(self):
+        meters = self._bake_meters()
+        files = [
+            {"hash": "a", "path": "/tmp/a.jpg"},
+            {"hash": "b", "path": "/tmp/b.jpg"},
+        ]
+        self.controller.state.current_file_hash = "a"
+        self.controller.state.auto_meters = {"a": meters, "b": meters}
+        live = self.controller.state.config
+        with patch("negpy.desktop.controller.load_or_promote", return_value=self.controller.state.config):
+            self.controller._bake_auto_density_grade_for_export(files)
+        # both frames persisted, both frozen
+        self.assertEqual(self.controller.session.repo.save_file_settings.call_count, 2)
+        for call in self.controller.session.repo.save_file_settings.call_args_list:
+            self.assertFalse(call.args[1].exposure.auto_exposure)
+            self.assertFalse(call.args[1].exposure.auto_normalize_contrast)
+        # the live config the export renders with is untouched
+        self.assertIs(self.controller.state.config, live)
+
+    def test_set_bake_on_export_persists_and_emits(self):
+        self.controller.state.bake_on_export = False
+        mock_slot = MagicMock()
+        self.controller.bake_on_export_changed.connect(mock_slot)
+        self.controller.set_bake_on_export(True)
+        self.assertTrue(self.controller.state.bake_on_export)
+        self.controller.session.repo.save_global_setting.assert_called_once_with("bake_on_export", True)
+        mock_slot.assert_called_once_with(True)
+        # a repeat with the same value is a no-op
+        self.controller.session.repo.save_global_setting.reset_mock()
+        mock_slot.reset_mock()
+        self.controller.set_bake_on_export(True)
+        self.controller.session.repo.save_global_setting.assert_not_called()
+        mock_slot.assert_not_called()
 
     def test_keystone_solve_clears_lines_after_config_update(self):
         self.controller.state.active_tool = ToolMode.KEYSTONE_LINES
@@ -2209,42 +2336,9 @@ class TestAppController(unittest.TestCase):
         self.assertTrue(self.controller.proof_active())
 
     def test_effective_input_icc(self):
-        """Explicit Input ICC wins; Narrowband Scan supplies the bundled RGBScan
-        profile when none is set; None when both are off."""
-        state = self.controller.state
+        """The explicit Input ICC, else None."""
         self.assertIsNone(self.controller.effective_input_icc())
-
-        state.config = replace(state.config, process=replace(state.config.process, narrowband_scan=True))
-        path = self.controller.effective_input_icc()
-        assert path is not None
-        self.assertTrue(path.endswith(os.path.join("icc", "RGBScan.icc")))
-        self.assertTrue(os.path.exists(path))
-
-        state.icc_input_path = "/custom.icc"
-        self.assertEqual(self.controller.effective_input_icc(), "/custom.icc")
-
-    def test_narrowband_profile_suppressed_by_any_transparency(self):
-        """The bundled profile describes narrowband capture of *negative* dyes, so it is
-        refused for a slide whatever Positive says. Narrowband is a sticky setting, so
-        this must hold without the user touching it."""
-        from negpy.features.process.models import ProcessMode
-
-        state = self.controller.state
-        state.config = replace(state.config, process=replace(state.config.process, narrowband_scan=True))
-        self.assertIsNotNone(self.controller.effective_input_icc())
-
-        for positive in (True, False):
-            state.config = replace(
-                state.config,
-                process=replace(state.config.process, process_mode=ProcessMode.E6, positive_source=positive),
-            )
-            self.assertIsNone(self.controller.effective_input_icc(), f"positive_source={positive}")
-            # ...and the preview must not claim a proof it no longer applies.
-            state.soft_proof_enabled = False
-            self.assertFalse(self.controller.proof_active(), f"positive_source={positive}")
-
-        # An explicit Input ICC is a deliberate choice about the source and still wins.
-        state.icc_input_path = "/custom.icc"
+        self.controller.state.icc_input_path = "/custom.icc"
         self.assertEqual(self.controller.effective_input_icc(), "/custom.icc")
 
     def test_effective_cam_xyz_stands_in_for_an_active_input_icc(self):
@@ -2271,14 +2365,13 @@ class TestAppController(unittest.TestCase):
         self.assertEqual(camera_wb, wb)
         np.testing.assert_allclose(camera_to_working_matrix(cam_xyz, wb), np.diag(np.array(wb) / wb[1]), atol=1e-5)
 
-    def _export_icc_input(self, **process):
+    def _export_icc_input(self):
         state = self.controller.state
         state.current_file_path = "/tmp/shot.dng"
         state.current_file_hash = "h1"
         state.flat_output = True
         state.config = replace(
             state.config,
-            process=replace(state.config.process, **process),
             export=replace(state.config.export, output_mode=ExportPresetOutputMode.SAME_AS_SOURCE, export_path="/tmp"),
         )
         self.controller._run_export_tasks = MagicMock()
@@ -2287,36 +2380,10 @@ class TestAppController(unittest.TestCase):
         (tasks,), _ = self.controller._run_export_tasks.call_args
         return tasks[0].export_settings.icc_input_path
 
-    def test_export_resolves_the_narrowband_profile_from_the_frames_own_process(self):
-        """Regression: request_export resolved the implicit ICC from the pre-flatten view
-        rather than the frame's settings, and silently dropped it from flat masters. The
-        answer must not depend on which view asked."""
-        path = self._export_icc_input(narrowband_scan=True)
-        self.assertTrue(
-            path is not None and path.endswith(os.path.join("icc", "RGBScan.icc")),
-            "flat export dropped the implicit Narrowband profile",
-        )
-
-    def test_a_flat_export_of_a_slide_still_refuses_the_narrowband_profile(self):
-        """The profile is refused for the dye set, not for the render, so flattening must not
-        smuggle it back in."""
-        from negpy.features.process.models import ProcessMode
-
-        self.assertIsNone(self._export_icc_input(narrowband_scan=True, process_mode=ProcessMode.E6))
-
-    def test_proof_active_with_narrowband_scan(self):
-        """Narrowband Scan forces proofing on even with the soft-proof toggle off."""
-        state = self.controller.state
-        state.soft_proof_enabled = False
-        self.assertFalse(self.controller.proof_active())
-        state.config = replace(state.config, process=replace(state.config.process, narrowband_scan=True))
-        self.assertTrue(self.controller.proof_active())
-
-    def test_narrowband_profile_hidden_from_dropdown(self):
-        from negpy.infrastructure.display.color_mgmt import ColorService
-
-        profiles = ColorService.get_available_profiles()
-        self.assertFalse(any(p.endswith("RGBScan.icc") for p in profiles))
+    def test_a_flat_export_carries_the_explicit_input_icc(self):
+        self.assertIsNone(self._export_icc_input())
+        self.controller.state.icc_input_path = "/custom.icc"
+        self.assertEqual(self._export_icc_input(), "/custom.icc")
 
     def test_load_file_preserve_zoom(self):
         """Test that load_file with preserve_zoom=True skips resetting zoom."""
@@ -2690,6 +2757,46 @@ class TestAppController(unittest.TestCase):
         metrics = {"autocrop_resolved": ArmedCrop((0.05, 0.04, 0.99, 0.98), "stale-key", None, False)}
 
         self.controller._freeze_resolved_auto_crop(metrics)
+
+        self.mock_session_manager.update_config.assert_not_called()
+
+    def _meter_box(self, rect=(0.2, 0.17, 0.8, 0.83), geometry_key=None):
+        geometry_key = geometry_key or autocrop_detection_key(self.controller.state.config.geometry)
+        return MeterBox(rect, geometry_key + "|1.50", geometry_key)
+
+    def test_meter_freeze_stores_the_rect_the_render_resolved(self):
+        box = self._meter_box()
+        self.controller._freeze_resolved_meter({"meter_resolved": box})
+
+        call = self.mock_session_manager.update_config.call_args
+        self.assertEqual((call.args[0].process.meter_rect, call.args[0].process.meter_key), (box.rect, box.key))
+        self.assertFalse(call.kwargs["render"])
+        self.assertFalse(call.kwargs["record_history"])
+
+    def test_meter_freeze_drops_bounds_measured_without_the_box(self):
+        """The render already metered inside the box; the stored bounds still hold the holder."""
+        proc = replace(self.controller.state.config.process, local_floors=(-2.0, -2.1, -2.2), local_ceils=(-0.5, -0.6, -0.7))
+        self.controller.state.config = replace(self.controller.state.config, process=proc)
+
+        self.controller._freeze_resolved_meter({"meter_resolved": self._meter_box()})
+
+        self.assertFalse(self.mock_session_manager.update_config.call_args.args[0].process.is_local_initialized)
+
+    def test_meter_freeze_ignores_a_proxy_or_one_diptych_half(self):
+        for flag in ("interactive", "ephemeral", "diptych"):
+            self.controller._freeze_resolved_meter({"meter_resolved": self._meter_box(), flag: True})
+        self.mock_session_manager.update_config.assert_not_called()
+
+    def test_meter_freeze_drops_a_result_the_user_has_moved_past(self):
+        self.controller._freeze_resolved_meter({"meter_resolved": self._meter_box(geometry_key="stale")})
+        self.mock_session_manager.update_config.assert_not_called()
+
+    def test_meter_freeze_skips_a_frame_cropped_since(self):
+        box = self._meter_box()
+        geometry = replace(self.controller.state.config.geometry, crop_rect=(0.1, 0.1, 0.9, 0.9))
+        self.controller.state.config = replace(self.controller.state.config, geometry=geometry)
+
+        self.controller._freeze_resolved_meter({"meter_resolved": box})
 
         self.mock_session_manager.update_config.assert_not_called()
 
@@ -4250,26 +4357,6 @@ class TestRgbScanModeReload(unittest.TestCase):
         self.mock_session_manager.repo.save_global_setting.assert_any_call("rgbscan_mode", True)
         self.controller.request_asset_discovery.assert_not_called()
 
-    def test_enabling_sets_sticky_narrowband_default(self):
-        self.controller.set_rgb_scan_mode(True)
-        self.mock_session_manager.repo.save_global_setting.assert_any_call("last_narrowband_scan", True)
-
-    def test_disabling_does_not_touch_narrowband(self):
-        self.controller.set_rgb_scan_mode(False)
-        calls = [c.args for c in self.mock_session_manager.repo.save_global_setting.call_args_list]
-        self.assertNotIn(("last_narrowband_scan", True), calls)
-
-    def test_enabling_forces_narrowband_on_active_config(self):
-        state = self.mock_session_manager.state
-        state.uploaded_files = [{"name": "a", "path": "/a.dng", "hash": "h1"}]
-        state.current_file_path = "/a.dng"
-        self.assertFalse(state.config.process.narrowband_scan)
-
-        self.controller.set_rgb_scan_mode(True)
-
-        updated_config = self.mock_session_manager.update_config.call_args.args[0]
-        self.assertTrue(updated_config.process.narrowband_scan)
-
     def test_toggle_with_loaded_files_rediscovers_all_exposures(self):
         state = self.mock_session_manager.state
         state.uploaded_files = [
@@ -5044,26 +5131,14 @@ class TestDisplayTransformParams(unittest.TestCase):
         self.assertIsNone(proof)
 
     def test_proof_profiles_follows_the_soft_proof_toggle(self):
+        """The Input ICC proofs only with the toggle on, like the output profile."""
         self.controller.state.soft_proof_enabled = False
-        self.controller.state.config = replace(
-            self.controller.state.config,
-            process=replace(self.controller.state.config.process, narrowband_scan=False),
-        )
+        self.controller.state.icc_input_path = "/custom.icc"
         self.assertIsNone(self.controller.proof_profiles())
         self.controller.state.soft_proof_enabled = True
-        self.assertIsNotNone(self.controller.proof_profiles())
-
-    def test_narrowband_supplies_an_input_profile_with_the_toggle_off(self):
-        """Narrowband Scan proofs through its own input profile regardless."""
-        self.controller.state.soft_proof_enabled = False
-        self.controller.state.config = replace(
-            self.controller.state.config,
-            process=replace(self.controller.state.config.process, narrowband_scan=True),
-        )
         proof = self.controller.proof_profiles()
         self.assertIsNotNone(proof)
-        self.assertTrue(proof[0], "narrowband must supply the input profile")
-        self.assertIsNone(proof[1], "the output profile stays gated on the toggle")
+        self.assertEqual(proof[0], "/custom.icc")
 
     def test_thumbnail_task_carries_the_same_params_as_the_canvas(self):
         """The actual regression: the thumbnail used to hardcode the working space."""
@@ -5225,24 +5300,6 @@ class TestNegativePeekColor(unittest.TestCase):
         without_wb = np.array(state.peek_frame["base_positive"])
 
         np.testing.assert_allclose(with_wb, without_wb, atol=1e-5)
-
-    def test_a_narrowband_capture_folds_the_multipliers_the_render_path_refuses(self):
-        """should_fold_camera_wb refuses them on narrowband, where no scene white balance
-        exists to reconstruct. The peek folds them anyway: it only has to show the film the
-        way every raw viewer does, and unbalanced sensor RGB renders an orange mask green."""
-        import numpy as np
-
-        from negpy.features.process.capture_color import apply_camera_matrix, camera_to_working_matrix, lightbox_level
-        from negpy.kernel.image.logic import working_oetf_encode
-
-        state = self.controller.state
-        state.config = replace(state.config, process=replace(state.config.process, linear_raw=True, narrowband_scan=True))
-        painted = self._paint(self.D3300, camera_wb=[1.891, 1.0, 1.578])["base_positive"]
-
-        source = state.preview_raw
-        matrix = camera_to_working_matrix(self.D3300, [1.891, 1.0, 1.578])
-        expected = working_oetf_encode(apply_camera_matrix(source, matrix) * lightbox_level(source, matrix))
-        np.testing.assert_allclose(painted, expected, atol=1e-5)
 
     def test_the_peek_clears_a_stale_interactive_flag(self):
         """Flat Peek renders with readback_metrics=False, which tags its metrics
@@ -5744,6 +5801,26 @@ class TestCompareFlatPeekInteraction(unittest.TestCase):
         # Working space, so the display conversion runs; the proof does not.
         self.assertFalse(metrics["splash"])
         self.assertFalse(metrics["proof"])
+
+    def test_negative_peek_crops_like_the_render(self):
+        """The crop margin scales with the buffer the render crops, not the full-res file."""
+        import numpy as np
+
+        from negpy.features.geometry.logic import get_manual_rect_coords
+        from negpy.kernel.system.config import APP_CONFIG
+
+        source = np.full((400, 600, 3), 0.5, dtype=np.float32)
+        state = self.controller.state
+        state.preview_raw = source
+        state.original_res = (4000, 6000)
+        rect = (0.1, 0.1, 0.9, 0.9)
+        state.config = replace(state.config, geometry=replace(state.config.geometry, crop_rect=rect, autocrop_offset=10))
+
+        self.controller.toggle_negative_peek(force=True)
+
+        scale = max(source.shape[:2]) / float(APP_CONFIG.preview_render_size)
+        y1, y2, x1, x2 = get_manual_rect_coords(source, rect, offset_px=10, scale_factor=scale)
+        self.assertEqual(state.peek_frame["base_positive"].shape[:2], (y2 - y1, x2 - x1))
 
     def test_leaving_the_negative_peek_re_renders_the_edit(self):
         self.controller.state.negative_peek = True

@@ -1,13 +1,36 @@
+from negpy.kernel.system.i18n import tr
 from dataclasses import replace
 
 import numpy as np
 from PyQt6.QtCore import Qt
-from PyQt6.QtWidgets import QAbstractSpinBox, QComboBox, QDialog, QDoubleSpinBox, QGridLayout, QHBoxLayout, QLabel, QSpinBox, QStyle, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import (
+    QAbstractSpinBox,
+    QComboBox,
+    QDialog,
+    QDoubleSpinBox,
+    QGridLayout,
+    QHBoxLayout,
+    QLabel,
+    QSpinBox,
+    QStyle,
+    QVBoxLayout,
+    QWidget,
+)
 
 from negpy.desktop.auto_sliders import shown_values, stored_value
+from negpy.desktop.view.confirm import warn_targets_affect_unbaked
 from negpy.desktop.view.shortcut_registry import tooltip_with_shortcut
 from negpy.desktop.view.sidebar.base import BaseSidebar
-from negpy.desktop.view.styles.templates import ICON_BUTTON_WIDTH, field_label_qss, header_row, hint_label, section_subheader, wrap_tooltip
+from negpy.desktop.view.styles.templates import (
+    ICON_BUTTON_WIDTH,
+    TEST_STRIP_SWEEP,
+    field_label_qss,
+    gradient_icon,
+    header_row,
+    hint_label,
+    section_subheader,
+    wrap_tooltip,
+)
 from negpy.desktop.view.styles.theme import THEME
 from negpy.desktop.view.widgets.charts import LevelsHistogramWidget, CurvesWidget
 from negpy.desktop.view.widgets.choice_button import SegmentedChoice, ToggleMenuButton
@@ -38,6 +61,7 @@ def _levels_pair(label: str, spin: QWidget) -> QWidget:
     row.addWidget(spin)
     return box
 
+
 _ISO_R_MIN = float(EXPOSURE_CONSTANTS["iso_r_min"])
 _ISO_R_MAX = float(EXPOSURE_CONSTANTS["iso_r_max"])
 
@@ -49,7 +73,7 @@ _CH_COLORS = (THEME.channel_red_text, THEME.channel_green_text, THEME.channel_bl
 def channel_selector(tooltip: str) -> SegmentedChoice:
     """[Global/R/G/B]: Global edits the shared curve, a channel its per-layer trims."""
     return SegmentedChoice(
-        (("fa5s.globe", "Global"), *(("fa5s.circle", n, c) for n, c in zip(("Red", "Green", "Blue"), _CH_COLORS))),
+        (("fa5s.globe", tr("Global")), *(("fa5s.circle", n, c) for n, c in zip(("Red", "Green", "Blue"), _CH_COLORS))),
         tooltip,
         icon_only=(1, 2, 3),
     )
@@ -63,21 +87,25 @@ class ToneSidebar(BaseSidebar):
     def _init_ui(self) -> None:
         conf = self.state.config.exposure
 
-        self.density_slider = CompactSlider("Print Density", 0.0, 2.0, conf.density)
+        self.density_slider = CompactSlider(tr("Print Density"), 0.0, 2.0, conf.density)
         # Travel matches the kernel's grade clamp, so the slider never offers a grade it would clip.
-        self.grade_slider = CompactSlider("ISO-R Grade", _ISO_R_MIN, _ISO_R_MAX, conf.grade, step=1.0, inverted=True, unit=" R")
-        self.grade_trim_slider = CompactSlider("Grade", -30.0, 30.0, 0.0, step=1.0, inverted=True, unit=" R")
+        self.grade_slider = CompactSlider(tr("ISO-R Grade"), _ISO_R_MIN, _ISO_R_MAX, conf.grade, step=1.0, inverted=True, unit=" R")
+        self.grade_trim_slider = CompactSlider(tr("Grade"), -30.0, 30.0, 0.0, step=1.0, inverted=True, unit=" R")
         self.grade_trim_slider.setToolTip(
-            "Crossover correction — this layer's contrast trim in ISO-R points on top of the Grade: "
-            "filtration can only shift a dye layer's curve, this rotates its slope, fixing casts that "
-            "differ between shadows and highlights. Midtone neutrality is preserved."
+            tr(
+                "Crossover correction — this layer's contrast trim in ISO-R points on top of the Grade: "
+                "filtration can only shift a dye layer's curve, this rotates its slope, fixing casts that "
+                "differ between shadows and highlights. Midtone neutrality is preserved."
+            )
         )
         self.grade_trim_slider.setVisible(False)
 
         # Channel selector: Global = the shared curve; R/G/B = per-layer trims.
         self.ch_btn = channel_selector(
-            "Global edits the shared grade (all layers). Red, Green and Blue edit per-layer "
-            "Grade and split Grade trims for the cyan-, magenta- and yellow-dye emulsions"
+            tr(
+                "Global edits the shared grade (all layers). Red, Green and Blue edit per-layer "
+                "Grade and split Grade trims for the cyan-, magenta- and yellow-dye emulsions"
+            )
         )
         # Each channel's trim fields, for the edited dot.
         self._channel_fields = tuple(
@@ -88,32 +116,57 @@ class ToneSidebar(BaseSidebar):
             )
             for ch in _CH_SUFFIX
         )
-        self.auto_btn = ToggleMenuButton("fa5s.magic", "", "Auto: automatic print density and grade, and the targets they aim for")
+        self.auto_btn = ToggleMenuButton(
+            "fa5s.magic", "", tr("Auto: automatic print density and grade, the targets they aim for, and Hold Black")
+        )
         self.auto_btn.setFixedWidth(ICON_BUTTON_WIDTH)
         self.auto_density_action = self.auto_btn.add_toggle(
-            "Auto Density",
-            "Meter each frame's midtone and anchor the print exposure there, so dense and flat "
-            "negatives land at a consistent brightness instead of needing per-frame trimming",
+            tr("Auto Density"),
+            tr(
+                "Meter each frame's midtone and anchor the print exposure there, so dense and flat "
+                "negatives land at a consistent brightness instead of needing per-frame trimming"
+            ),
         )
         self.auto_grade_action = self.auto_btn.add_toggle(
-            "Auto Grade",
-            "Aim each frame at a contrast target instead of printing the negative's own density "
-            "range, so dense negatives stop printing over-contrasty and flat ones stop printing muddy",
+            tr("Auto Grade"),
+            tr(
+                "Aim each frame at a contrast target instead of printing the negative's own density "
+                "range, so dense negatives stop printing over-contrasty and flat ones stop printing muddy"
+            ),
         )
         # Not an add_toggle option: the button's checked look follows the two real ones.
-        self.auto_both_action = self.auto_btn.choice_menu.addAction("Auto Density and Grade")
+        self.auto_both_action = self.auto_btn.choice_menu.addAction(tr("Auto Density and Grade"))
         self.auto_both_action.setCheckable(True)
-        self.auto_both_action.plain_tooltip = "Turn Auto Density and Auto Grade on or off together"
+        self.auto_both_action.plain_tooltip = tr("Turn Auto Density and Auto Grade on or off together")
         self.auto_btn.choice_menu.addSeparator()
-        targets_action = self.auto_btn.choice_menu.addAction("Set Targets…")
+        # Not an add_toggle option either: it meters nothing, so the button's look ignores it.
+        self.hold_black_action = self.auto_btn.choice_menu.addAction(tr("Hold Black"))
+        self.hold_black_action.setCheckable(True)
+        self.hold_black_action.setChecked(conf.hold_black)
+        self.hold_black_action.plain_tooltip = tr(
+            "Hold Black: a negative Shadows Density fades out toward paper black, so the shadows open and the black point barely moves."
+        )
+        self.auto_btn.choice_menu.addSeparator()
+        targets_action = self.auto_btn.choice_menu.addAction(tr("Set Targets…"))
         targets_action.setToolTip(
-            "Tune the brightness and contrast Auto Density and Auto Grade aim for. "
-            "Applies to every frame and is remembered between sessions."
+            tr(
+                "Tune the brightness and contrast Auto Density and Auto Grade aim for. "
+                "Applies to every frame and is remembered between sessions."
+            )
         )
         targets_action.triggered.connect(self._open_targets_dialog)
+        self.auto_bake_action = self.auto_btn.choice_menu.addAction(tr("Bake Auto Density/Grade"))
+        self.auto_bake_action.setToolTip(
+            tr(
+                "Write this frame's metered Auto Density and Auto Grade into its settings and turn both "
+                "off, so it keeps the look the autos chose without them and is not shifted by a later target change."
+            )
+        )
+        self.auto_bake_action.triggered.connect(self._bake_auto_density_grade)
         self.auto_density_action.setChecked(conf.auto_exposure)
         self.auto_grade_action.setChecked(conf.auto_normalize_contrast)
         self.test_strip_btn = self._tool_toggle("mdi.view-grid-outline", "", self._test_strip_tooltip())
+        self.test_strip_btn.setIcon(gradient_icon("mdi.view-grid-outline", TEST_STRIP_SWEEP))
         self.test_strip_btn.setFixedWidth(ICON_BUTTON_WIDTH)
         self.test_strip_btn.clicked.connect(lambda checked: self.controller.toggle_test_strip(force=checked))
 
@@ -125,20 +178,22 @@ class ToneSidebar(BaseSidebar):
         ch_row.addWidget(self.test_strip_btn)
         self.layout.addLayout(ch_row)
         # Disabled widgets get no hover, so the reason hangs off the hint under them.
-        self.auto_merged_hint = hint_label("Not applied to a merged bracket.")
+        self.auto_merged_hint = hint_label(tr("Not applied to a merged bracket."))
         self.auto_merged_hint.setToolTip(
             wrap_tooltip(
-                "A merge already places the tones: Render exposure picks which exposure it prints "
-                "at, and metering the merged frame would divide that choice straight back out. "
-                "Unmerge the frame to meter it."
+                tr(
+                    "A merge already places the tones: Render exposure picks which exposure it prints "
+                    "at, and metering the merged frame would divide that choice straight back out. "
+                    "Unmerge the frame to meter it."
+                )
             )
         )
         self.auto_merged_hint.setVisible(False)
         self.layout.addWidget(self.auto_merged_hint)
         self.layout.addWidget(self.density_slider)
 
-        self.shadow_density_slider = CompactSlider("Shadows Density", -1.0, 1.0, conf.shadow_density)
-        self.highlight_density_slider = CompactSlider("Highlights Density", -1.0, 1.0, conf.highlight_density)
+        self.shadow_density_slider = CompactSlider(tr("Shadows Density"), -1.0, 1.0, conf.shadow_density)
+        self.highlight_density_slider = CompactSlider(tr("Highlights Density"), -1.0, 1.0, conf.highlight_density)
         self.layout.addWidget(SliderGroup(self.shadow_density_slider, self.highlight_density_slider))
 
         grade_row = QVBoxLayout()
@@ -146,39 +201,45 @@ class ToneSidebar(BaseSidebar):
         grade_row.addWidget(self.grade_trim_slider)
         self.layout.addLayout(grade_row)
 
-        self.shadow_grade_slider = CompactSlider("Shadows Grade", -50.0, 50.0, conf.shadow_grade, step=1.0, inverted=True, unit=" R")
+        self.shadow_grade_slider = CompactSlider(tr("Shadows Grade"), -50.0, 50.0, conf.shadow_grade, step=1.0, inverted=True, unit=" R")
         self.highlight_grade_slider = CompactSlider(
-            "Highlights Grade", -50.0, 50.0, conf.highlight_grade, step=1.0, inverted=True, unit=" R"
+            tr("Highlights Grade"), -50.0, 50.0, conf.highlight_grade, step=1.0, inverted=True, unit=" R"
         )
         self.split_grade_rail = SliderGroup(self.shadow_grade_slider, self.highlight_grade_slider)
         self.layout.addWidget(self.split_grade_rail)
 
         # Inverted like ISO-R Grade, so dragging right hardens on both controls.
-        self.contrast_mask_slider = CompactSlider("Contrast Mask", -0.5, 0.5, conf.contrast_mask, has_neutral=True, inverted=True)
+        self.contrast_mask_slider = CompactSlider(tr("Contrast Mask"), -0.5, 0.5, conf.contrast_mask, has_neutral=True, inverted=True)
         self.contrast_mask_slider.setToolTip(
-            "Contrast Mask: sandwich the negative with a blurred, low-contrast film mask, as in "
-            "the darkroom. Densities add, so the mask's polarity sets the direction and its gamma "
-            "sets the amount. Positive is a blurred positive and squeezes the negative's range, so "
-            "a harder grade then fits the paper. Negative matches the negative's own polarity and "
-            "stretches the range instead, adding snap to the broad tones while grain and texture "
-            "stay put. It still works on a flat negative where Grade has run out."
+            tr(
+                "Contrast Mask: sandwich the negative with a blurred, low-contrast film mask, as in "
+                "the darkroom. Densities add, so the mask's polarity sets the direction and its gamma "
+                "sets the amount. Positive is a blurred positive and squeezes the negative's range, so "
+                "a harder grade then fits the paper. Negative matches the negative's own polarity and "
+                "stretches the range instead, adding snap to the broad tones while grain and texture "
+                "stay put. It still works on a flat negative where Grade has run out."
+            )
         )
-        self.mask_spacer_slider = CompactSlider("Mask Spacer", 2.0, 6.0, conf.mask_spacer, unit="%")
+        self.mask_spacer_slider = CompactSlider(tr("Mask Spacer"), 2.0, 6.0, conf.mask_spacer, unit="%")
         self.mask_spacer_slider.setToolTip(
-            "Mask Spacer: what holds the mask off the negative, as a per-cent of the frame. It "
-            "sets the scale above which tones are masked, so it reads backwards from a blur "
-            "radius: a thick spacer works on the broad masses only and leaves detail alone, a "
-            "thin one reaches down into the detail and so bites harder. Thin also lifts shadows "
-            "that sit next to something bright, which is the mask line on the sheet. "
-            "Inert with no mask."
+            tr(
+                "Mask Spacer: what holds the mask off the negative, as a per-cent of the frame. It "
+                "sets the scale above which tones are masked, so it reads backwards from a blur "
+                "radius: a thick spacer works on the broad masses only and leaves detail alone, a "
+                "thin one reaches down into the detail and so bites harder. Thin also lifts shadows "
+                "that sit next to something bright, which is the mask line on the sheet. "
+                "Inert with no mask."
+            )
         )
         # Light given to the paper, not the shape of its curve, so it sits with the exposure controls.
-        self.preflash_slider = CompactSlider("Preflash", 0.0, 1.0, conf.preflash)
-        self.diffusion_slider = CompactSlider("Diffusion", 0.0, 1.0, conf.diffusion)
+        self.preflash_slider = CompactSlider(tr("Preflash"), 0.0, 1.0, conf.preflash)
+        self.diffusion_slider = CompactSlider(tr("Diffusion"), 0.0, 1.0, conf.diffusion)
         self.diffusion_slider.setToolTip(
-            "Diffusion: a diffuser under the enlarger lens, a Softar or a stocking. The value is how much "
-            "light it scatters. Shadows bleed into highlights and edges soften; flat areas print as before. "
-            "0 is off."
+            tr(
+                "Diffusion: a diffuser under the enlarger lens, a Softar or a stocking. The value is how much "
+                "light it scatters. Shadows bleed into highlights and edges soften; flat areas print as before. "
+                "0 is off."
+            )
         )
         self.layout.addWidget(self.preflash_slider)
         self.layout.addWidget(self.diffusion_slider)
@@ -186,22 +247,26 @@ class ToneSidebar(BaseSidebar):
         self.mask_spacer_rail = SliderGroup(self.mask_spacer_slider)
         self.layout.addWidget(self.mask_spacer_rail)
 
-        levels_header = section_subheader("LEVELS")
+        levels_header = section_subheader(tr("LEVELS"))
         levels_header.setToolTip(
             wrap_tooltip(
-                "Display-referred levels, GIMP-style, applied last after everything else for "
-                "fine-tuning the output. Each channel maps its input range onto the output "
-                "range through a gamma; higher gamma holds more high-level intensities."
+                tr(
+                    "Display-referred levels, GIMP-style, applied last after everything else for "
+                    "fine-tuning the output. Each channel maps its input range onto the output "
+                    "range through a gamma; higher gamma holds more high-level intensities."
+                )
             )
         )
         self.levels_auto_btn = self._icon_action(
             "fa5s.magic",
-            "Auto Levels: stretch this channel's input range onto the output range at the 0.6% clip points, "
-            "like GIMP's Auto Input Levels. With Global selected the stretch reads luminance, so hues don't move",
+            tr(
+                "Auto Levels: stretch this channel's input range onto the output range at the 0.6% clip points, "
+                "like GIMP's Auto Input Levels. With Global selected the stretch reads luminance, so hues don't move"
+            ),
         )
         self.levels_reset_btn = self._icon_action(
             "fa5s.undo",
-            "Reset Levels: every channel back to identity",
+            tr("Reset Levels: every channel back to identity"),
         )
         self.layout.addLayout(header_row(levels_header, self.levels_auto_btn, self.levels_reset_btn))
         self.levels_combo = QComboBox()
@@ -209,17 +274,18 @@ class ToneSidebar(BaseSidebar):
             self.levels_combo.addItem(label)
         self.levels_combo.setToolTip(
             wrap_tooltip(
-                "Levels channel: Global edits the master curve on all channels, Red, Green "
-                "and Blue trim one channel on top of it"
+                tr("Levels channel: Global edits the master curve on all channels, Red, Green and Blue trim one channel on top of it")
             )
         )
         self.layout.addWidget(self.levels_combo)
         self.levels_hist = LevelsHistogramWidget()
         self.levels_hist.setToolTip(
             wrap_tooltip(
-                "The channel's input histogram. Drag the black, gray and white markers for "
-                "input low, mid and high; drag the output bar's markers for output low and "
-                "high. Double-click resets the channel."
+                tr(
+                    "The channel's input histogram. Drag the black, gray and white markers for "
+                    "input low, mid and high; drag the output bar's markers for output low and "
+                    "high. Double-click resets the channel."
+                )
             )
         )
         self.layout.addWidget(self.levels_hist)
@@ -278,7 +344,12 @@ class ToneSidebar(BaseSidebar):
         levels_out_grid.setVerticalSpacing(0)
         for col, (label, spin, tip, align) in enumerate(
             (
-                ("Out low", self.levels_out_low_spin, "Lowest output level (0-255): lifts blacks above this, this channel", Qt.AlignmentFlag.AlignLeft),
+                (
+                    "Out low",
+                    self.levels_out_low_spin,
+                    "Lowest output level (0-255): lifts blacks above this, this channel",
+                    Qt.AlignmentFlag.AlignLeft,
+                ),
                 (
                     "Out high",
                     self.levels_out_high_spin,
@@ -292,17 +363,19 @@ class ToneSidebar(BaseSidebar):
             levels_out_grid.addWidget(_levels_pair(label, spin), 0, col, align)
         self.layout.addLayout(levels_out_grid)
 
-        curves_header = section_subheader("CURVES")
+        curves_header = section_subheader(tr("CURVES"))
         curves_header.setToolTip(
             wrap_tooltip(
-                "Display-referred curves, GIMP-style, applied after Levels as the last step. "
-                "Each channel holds eight nodes; drag one to reshape the tone map. "
-                "Nodes clamp against their neighbours, so the curve can never fold."
+                tr(
+                    "Display-referred curves, GIMP-style, applied after Levels as the last step. "
+                    "Each channel holds eight nodes; drag one to reshape the tone map. "
+                    "Nodes clamp against their neighbours, so the curve can never fold."
+                )
             )
         )
         self.curves_reset_btn = self._icon_action(
             "fa5s.undo",
-            "Reset Curves: every channel back to the identity line",
+            tr("Reset Curves: every channel back to the identity line"),
         )
         self.layout.addLayout(header_row(curves_header, self.curves_reset_btn))
         self.curves_combo = QComboBox()
@@ -310,17 +383,13 @@ class ToneSidebar(BaseSidebar):
             self.curves_combo.addItem(label)
         self.curves_combo.setToolTip(
             wrap_tooltip(
-                "Curves channel: Global edits the master curve on all channels, Red, Green "
-                "and Blue trim one channel on top of it"
+                tr("Curves channel: Global edits the master curve on all channels, Red, Green and Blue trim one channel on top of it")
             )
         )
         self.layout.addWidget(self.curves_combo)
         self.curves_widget = CurvesWidget()
         self.curves_widget.setToolTip(
-            wrap_tooltip(
-                "The channel's input histogram with its tone curve. Drag a node; "
-                "double-click resets the channel."
-            )
+            wrap_tooltip(tr("The channel's input histogram with its tone curve. Drag a node; double-click resets the channel."))
         )
         self.layout.addWidget(self.curves_widget)
 
@@ -359,9 +428,20 @@ class ToneSidebar(BaseSidebar):
             values = dlg.values()
             apply_targets(values)
             self.controller.session.repo.save_global_setting("exposure_targets", values)
+            if any(abs(values[k] - self._targets_snapshot[k]) > 1e-6 for k in values):
+                warn_targets_affect_unbaked(self, self.controller.session.repo)
         else:
             apply_targets(self._targets_snapshot)
         self.controller.request_render(readback_metrics=True)
+
+    def _bake_auto_density_grade(self) -> None:
+        """Freeze this frame's metered Auto Density and Auto Grade into its settings, then turn both off.
+        The baked values are the sliders' shown values, so the print does not move."""
+        shown = shown_values(self.state.config, self._meters())
+        changes: dict = dict(shown)
+        changes["auto_exposure"] = False
+        changes["auto_normalize_contrast"] = False
+        self.update_config_section("exposure", render=True, persist=True, readback_metrics=True, **changes)
 
     def _channel_index(self) -> int:
         return self.ch_btn.currentIndex()
@@ -488,11 +568,13 @@ class ToneSidebar(BaseSidebar):
     @staticmethod
     def _test_strip_tooltip(printing: bool = False) -> str:
         if printing:
-            return "Printing the test strip…"
+            return tr("Printing the test strip…")
         return tooltip_with_shortcut(
-            "Test Strip: print the frame as a 5×5 grid — Print Density increasing left to right, "
-            "ISO-R Grade softening top to bottom. Click the patch you like to keep its settings. "
-            "The 90° rotate controls turn the ladder while it is up.",
+            tr(
+                "Test Strip: print the frame as a 5×5 grid — Print Density increasing left to right, "
+                "ISO-R Grade softening top to bottom. Click the patch you like to keep its settings. "
+                "The 90° rotate controls turn the ladder while it is up."
+            ),
             "toggle_test_strip",
         )
 
@@ -546,6 +628,9 @@ class ToneSidebar(BaseSidebar):
         self.controller.image_updated.connect(self._sync_driven)
         self.controller.image_updated.connect(self._sync_levels_histogram)
         self.controller.image_updated.connect(self._sync_curves_histogram)
+        self.hold_black_action.toggled.connect(
+            lambda checked: self.update_config_section("exposure", render=True, persist=True, readback_metrics=True, hold_black=checked)
+        )
 
         for slider, field in (
             (self.contrast_mask_slider, "contrast_mask"),
@@ -666,6 +751,8 @@ class ToneSidebar(BaseSidebar):
                 self.mask_spacer_rail,
                 self.diffusion_slider,
                 self.preflash_slider,
+                # The transfer curve always fades a lift at the bottom of its window.
+                self.hold_black_action,
             ):
                 w.setVisible(not transfer)
             # Per-layer trims are meaningless on a single-emulsion B&W paper.
@@ -692,14 +779,14 @@ class ToneSidebar(BaseSidebar):
             suffix = _CH_LABEL[idx]
             self.grade_slider.setVisible(global_mode)
             self.grade_trim_slider.setVisible(not global_mode)
-            self.shadow_grade_slider.label.setText("Shadows Grade" + suffix)
-            self.highlight_grade_slider.label.setText("Highlights Grade" + suffix)
+            self.shadow_grade_slider.label.setText(tr("Shadows Grade") + suffix)
+            self.highlight_grade_slider.label.setText(tr("Highlights Grade") + suffix)
             if global_mode:
                 self.shadow_grade_slider.setValue(conf.shadow_grade)
                 self.highlight_grade_slider.setValue(conf.highlight_grade)
             else:
                 ch = _CH_SUFFIX[idx - 1]
-                self.grade_trim_slider.label.setText("Grade" + suffix)
+                self.grade_trim_slider.label.setText(tr("Grade") + suffix)
                 self.grade_trim_slider.setValue(getattr(conf, f"grade_trim_{ch}"))
                 self.shadow_grade_slider.setValue(getattr(conf, f"shadow_grade_trim_{ch}"))
                 self.highlight_grade_slider.setValue(getattr(conf, f"highlight_grade_trim_{ch}"))
@@ -709,6 +796,8 @@ class ToneSidebar(BaseSidebar):
             merged = hdr_active(self.state.config.hdr)
             for action in (self.auto_density_action, self.auto_grade_action, self.auto_both_action):
                 action.setEnabled(not merged)
+            # Bake is a no-op when both autos are already off, and is unreachable on a merge (the auto button is off).
+            self.auto_bake_action.setEnabled(not merged and (conf.auto_exposure or conf.auto_normalize_contrast))
             self.auto_merged_hint.setVisible(merged)
 
             for i, fields in enumerate(self._channel_fields, start=1):
@@ -718,6 +807,7 @@ class ToneSidebar(BaseSidebar):
             self.mask_spacer_slider.setValue(conf.mask_spacer)
             self.diffusion_slider.setValue(conf.diffusion)
             self.preflash_slider.setValue(conf.preflash)
+            self.hold_black_action.setChecked(conf.hold_black)
             # Out of _global_only: that tuple means enabled exactly when global.
             self.mask_spacer_slider.setEnabled(global_mode and conf.contrast_mask != 0.0)
             self.auto_density_action.setChecked(conf.auto_exposure)
@@ -753,6 +843,7 @@ class ToneSidebar(BaseSidebar):
             self.mask_spacer_slider,
             self.diffusion_slider,
             self.preflash_slider,
+            self.hold_black_action,
             self.auto_density_action,
             self.auto_grade_action,
             self.auto_both_action,

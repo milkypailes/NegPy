@@ -105,6 +105,30 @@ def test_auto_density_grade_stay_on_a_raw_slide_and_a_positive(qapp):
     assert not sidebar.auto_btn.isHidden()
 
 
+def test_hold_black_rides_the_auto_menu_without_lighting_it(qapp):
+    controller = MagicMock()
+    controller.state = AppState()
+    cfg = controller.state.config
+    controller.state.config = replace(
+        cfg, exposure=replace(cfg.exposure, auto_exposure=False, auto_normalize_contrast=False, hold_black=True)
+    )
+    sidebar = ToneSidebar(controller)
+    sidebar.sync_ui()
+    assert sidebar.hold_black_action in sidebar.auto_btn.choice_menu.actions()
+    assert sidebar.hold_black_action.isChecked()
+    assert not sidebar.auto_btn.isChecked()
+
+    sidebar.update_config_section = MagicMock()
+    sidebar.hold_black_action.trigger()
+    assert sidebar.update_config_section.call_args.kwargs["hold_black"] is False
+
+    controller.state.config = replace(
+        controller.state.config, process=replace(controller.state.config.process, process_mode=ProcessMode.E6)
+    )
+    sidebar.sync_ui()
+    assert not sidebar.hold_black_action.isVisible()
+
+
 def _metered_sidebar():
     from negpy.features.exposure.normalization import LogNegativeBounds
 
@@ -195,3 +219,69 @@ def test_both_autos_toggle_together(qapp):
     sidebar.auto_both_action.trigger()
     off = controller.apply_config.call_args.args[0].exposure
     assert not off.auto_exposure and not off.auto_normalize_contrast
+
+
+def test_bake_writes_shown_values_and_turns_both_autos_off(qapp):
+    from negpy.desktop.auto_sliders import shown_values
+
+    controller, sidebar = _metered_sidebar()
+    sidebar.sync_ui()
+    shown = shown_values(controller.state.config, controller.state.auto_meters["frame"])
+
+    sidebar.auto_bake_action.trigger()
+
+    baked = controller.apply_config.call_args.args[0].exposure
+    assert not baked.auto_exposure
+    assert not baked.auto_normalize_contrast
+    for field in ("density", "grade", "shadow_density", "highlight_density"):
+        if field in shown:
+            assert getattr(baked, field) == pytest.approx(shown[field], abs=0.005)
+
+
+def test_bake_item_enabled_when_an_auto_is_on(qapp):
+    controller, sidebar = _metered_sidebar()
+    sidebar.sync_ui()
+    assert sidebar.auto_bake_action.isEnabled()
+
+
+def test_bake_item_disabled_when_both_autos_off(qapp):
+    controller = MagicMock()
+    controller.state = AppState()
+    controller.state.config = replace(
+        controller.state.config,
+        exposure=replace(controller.state.config.exposure, auto_exposure=False, auto_normalize_contrast=False),
+    )
+    sidebar = ToneSidebar(controller)
+    sidebar.sync_ui()
+    assert not sidebar.auto_bake_action.isEnabled()
+
+
+def test_confirmed_target_change_warns_but_no_change_does_not(qapp, monkeypatch):
+    from PyQt6.QtWidgets import QDialog
+
+    from negpy.desktop.view.sidebar import tone as tone_mod
+    from negpy.features.exposure.models import TUNABLE_TARGETS
+
+    controller, sidebar = _metered_sidebar()
+    sidebar.sync_ui()
+    sidebar._targets_snapshot = {k: 1.0 for k in TUNABLE_TARGETS}
+
+    warned = []
+    monkeypatch.setattr(tone_mod, "warn_targets_affect_unbaked", lambda parent, repo: warned.append(parent))
+    monkeypatch.setattr(tone_mod, "apply_targets", lambda values: None)
+
+    class _Changed:
+        def values(self):
+            return dict(sidebar._targets_snapshot, anchor_target_density=2.0)
+
+    sidebar._on_targets_finished(_Changed(), int(QDialog.DialogCode.Accepted))
+    assert len(warned) == 1
+
+    warned.clear()
+
+    class _Same:
+        def values(self):
+            return dict(sidebar._targets_snapshot)
+
+    sidebar._on_targets_finished(_Same(), int(QDialog.DialogCode.Accepted))
+    assert len(warned) == 0

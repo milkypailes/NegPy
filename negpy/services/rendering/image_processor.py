@@ -12,7 +12,7 @@ from functools import lru_cache
 from PIL import Image, ImageCms
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple
 from negpy.kernel.system.logging import get_logger
-from negpy.kernel.system.config import APP_CONFIG
+from negpy.kernel.system.config import APP_CONFIG, render_scale_factor
 from negpy.domain.types import ImageBuffer
 from negpy.domain.models import (
     WorkspaceConfig,
@@ -24,7 +24,7 @@ from negpy.domain.models import (
 )
 from negpy.features.altprocess.models import AltProcess
 from negpy.features.process.capture_color import wb_only_cam_xyz
-from negpy.features.process.models import DemosaicMode, ProcessMode
+from negpy.features.process.models import DemosaicMode, ProcessMode, invalidate_local_bounds
 from negpy.features.process.logic import (
     demosaic_token,
     effective_highlight_reconstruction,
@@ -41,8 +41,8 @@ from negpy.features.exposure.models import RenderIntent
 from negpy.features.flatfield.logic import apply_flatfield, flatfield_token
 from negpy.features.lab.logic import apply_resize_sharpening
 from negpy.services.rendering.lens import flatfield_source, lens_decode_token, metadata_lens_corrections, prepare_lens_source
-from negpy.features.geometry.logic import autocrop_detection_key, resolve_autocrop_rect
-from negpy.features.geometry.models import squares_on_arm
+from negpy.features.geometry.logic import autocrop_detection_key, meter_detection_key, resolve_autocrop_rect, resolve_meter_rect
+from negpy.features.geometry.models import crops_frame, squares_on_arm
 from negpy.features.geometry.skew import squared_geometry
 from negpy.features.retouch.logic import (
     apply_hair_inpaint,
@@ -218,6 +218,43 @@ def _resolve_armed_autocrop(img: np.ndarray, settings: WorkspaceConfig) -> Tuple
     return dc_replace(settings, geometry=geom), ArmedCrop(rect, key, skew, tried)
 
 
+_METER_MEMO_SIZE = 64
+
+
+class MeterBox(NamedTuple):
+    """The meter rect a render resolved, for the controller to freeze."""
+
+    rect: Optional[Tuple[float, float, float, float]]  # None when the film fills the frame
+    key: str  # meter_detection_key it was found under
+    geometry_key: str  # autocrop_detection_key of that geometry, which the controller can check
+
+
+def _resolve_meter_rect(
+    img: np.ndarray, settings: WorkspaceConfig, memo: Optional[Dict[Tuple[str, str], Any]] = None, source_key: str = ""
+) -> Tuple[WorkspaceConfig, Optional[MeterBox]]:
+    """Find the picture box once on a frame with no crop, so its meters skip a holder or bare light. Bounds
+    measured without the new box are dropped, so this render meters again. Returns this render's settings and
+    what to freeze, or None. `memo` holds detections by (source_key, key) for renders that arrive before
+    the freeze, which would otherwise each detect again."""
+    geom, proc = settings.geometry, settings.process
+    if crops_frame(geom) or geom.crop_from_auto or proc.analysis_rect is not None:
+        return settings, None
+    key = meter_detection_key(geom, img.shape)
+    if proc.meter_key == key:
+        return settings, None
+    if memo is not None and (source_key, key) in memo:
+        rect = memo[(source_key, key)]
+    else:
+        rect = resolve_meter_rect(img, geom, APP_CONFIG.preview_render_size)
+        if memo is not None:
+            if len(memo) >= _METER_MEMO_SIZE:
+                memo.pop(next(iter(memo)))
+            memo[(source_key, key)] = rect
+    stale = invalidate_local_bounds(proc) if rect != proc.meter_rect else {}
+    resolved = dc_replace(proc, meter_rect=rect, meter_key=key, **stale)
+    return dc_replace(settings, process=resolved), MeterBox(rect, key, autocrop_detection_key(geom))
+
+
 def _camera_token(cam_xyz: Optional[list], camera_wb: Optional[list]) -> str:
     """The camera matrix and as-shot WB a slide's transfer reads; an Input ICC swaps them."""
     if cam_xyz is None and camera_wb is None:
@@ -337,6 +374,7 @@ class ImageProcessor:
         # creative slider moves.
         self._precorrect_key: Optional[tuple] = None
         self._precorrect_value: Optional[np.ndarray] = None
+        self._meter_memo: Dict[Tuple[str, str], Any] = {}
 
         # Source-space dust detection cache. Geometry is out of the key because strokes are
         # source-normalized, and resolution is out so an export reuses the preview regions.
@@ -714,6 +752,7 @@ class ImageProcessor:
         cache_stages: bool = True,
         gain_slices: tuple = (),
         source_orientation: int = 1,
+        film_base: Optional[tuple] = None,
     ) -> Tuple[Any, Dict[str, Any]]:
         """Executes rendering pipeline. Returns result (ndarray/GPUTexture) and metrics. ``skip_flatfield``: the export CPU
         fallbacks pass an already flat-fielded buffer. ``gain_slices``: the ``slice_half`` cuts that took *img* out of the
@@ -803,9 +842,10 @@ class ImageProcessor:
 
         source_hash = base_hash + hair_token + f"|res{w_cols}x{h_orig}" + _camera_token(cam_xyz, camera_wb)
 
-        scale_factor = max(h_orig, w_cols) / float(APP_CONFIG.preview_render_size)
+        scale_factor = render_scale_factor(img.shape)
 
         settings, resolved_crop = _resolve_armed_autocrop(img, settings)
+        settings, resolved_meter = _resolve_meter_rect(img, settings, self._meter_memo, source_hash)
 
         context = PipelineContext(
             scale_factor=scale_factor,
@@ -816,13 +856,18 @@ class ImageProcessor:
             cam_xyz=cam_xyz,
             camera_wb=camera_wb,
             cache_stages=cache_stages,
+            readback_metrics=readback_metrics,
         )
         if metrics:
             context.metrics.update(metrics)
+        if film_base is not None:
+            context.metrics["film_base"] = tuple(film_base)
         # The crop this render detected, for the controller to freeze into the edit. The key
         # rides along so a freeze that lands after the user moved on is discarded.
         if resolved_crop is not None:
             context.metrics["autocrop_resolved"] = resolved_crop
+        if resolved_meter is not None:
+            context.metrics["meter_resolved"] = resolved_meter
         # Overlay data, written even when empty: the controller merges metrics into the last
         # frame's, so an absent key keeps the previous frame's marks.
         dust_mask = detected_dust < 1.0 if detected_dust is not None else None
@@ -843,7 +888,7 @@ class ImageProcessor:
         if self._is_flat(settings):
             prefer_gpu = False
 
-        needs_tiling = bool(prefer_gpu and self.engine_gpu and self.engine_gpu.requires_tiling(img, settings))
+        needs_tiling = bool(prefer_gpu and self.engine_gpu and self.engine_gpu.requires_tiling(img, settings, render_size_ref))
         if needs_tiling and crop_preview_full:
             prefer_gpu = False
 
@@ -859,6 +904,7 @@ class ImageProcessor:
                         analysis_source_hash=source_hash,
                         cam_xyz=cam_xyz,
                         camera_wb=camera_wb,
+                        film_base=film_base,
                         memory_bounded=True,
                         render_size_ref=render_size_ref,
                     )
@@ -874,6 +920,7 @@ class ImageProcessor:
                         analysis_source_hash=source_hash,
                         cam_xyz=cam_xyz,
                         camera_wb=camera_wb,
+                        film_base=film_base,
                         full_frame=crop_preview_full,
                     )
                 context.metrics.update(gpu_metrics)
@@ -1404,11 +1451,12 @@ class ImageProcessor:
         color_space = str(target_cs)
 
         h_raw, w_raw = f32_buffer.shape[:2]
-        export_scale = max(h_raw, w_raw) / float(APP_CONFIG.preview_render_size)
+        export_scale = render_scale_factor(f32_buffer.shape)
 
         # Only hits detection for an edit never previewed (armed by copy-settings or an old
         # sidecar); a previewed edit arrives with its rect frozen, so the export matches it.
         params, _ = _resolve_armed_autocrop(f32_buffer, params)
+        params, _ = _resolve_meter_rect(f32_buffer, params)
 
         if self._is_flat(params):
             prefer_gpu = False
@@ -1836,6 +1884,7 @@ class ImageProcessor:
             f32_buffer = self._clone_bake(f32_buffer, params)
 
             params, _ = _resolve_armed_autocrop(f32_buffer, params)
+            params, _ = _resolve_meter_rect(f32_buffer, params)
 
             if self._is_flat(params):
                 prefer_gpu = False
@@ -1857,6 +1906,7 @@ class ImageProcessor:
                     render_size_ref=float(target_long_px),
                     prefer_gpu=False,
                     wants_uv_grid=False,
+                    readback_metrics=False,
                     skip_flatfield=True,  # f32_buffer already flat-fielded by _load_source_f32
                     cam_xyz=self._cam_xyz_by_path.get(file_path, (None, None))[0],
                     camera_wb=self._cam_xyz_by_path.get(file_path, (None, None))[1],

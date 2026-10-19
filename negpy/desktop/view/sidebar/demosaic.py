@@ -1,7 +1,9 @@
-from PyQt6.QtWidgets import QComboBox, QHBoxLayout
+from negpy.kernel.system.i18n import tr
+from PyQt6.QtWidgets import QHBoxLayout
 
 from negpy.desktop.view.sidebar.base import BaseSidebar
 from negpy.desktop.view.styles.templates import FIELD_LABEL_WIDTH, field_label, hint_label, section_subheader, wrap_tooltip
+from negpy.desktop.view.widgets.step_combo import StepCombo
 from negpy.features.hdr.models import hdr_active
 from negpy.features.process.logic import VALID_HIGHLIGHT_LEVELS
 from negpy.features.process.models import DemosaicMode, ProcessMode
@@ -28,12 +30,12 @@ _TIP = (
 # worth choosing between (see effective_highlight_reconstruction) — Reconstruct pinned to
 # libraw's own default level rather than exposing all seven numbered levels.
 _HIGHLIGHT_LEVELS = (
-    (0, "Off"),
-    (2, "Blend"),
-    (5, "Reconstruct"),
+    (0, tr("Off")),
+    (2, tr("Blend")),
+    (5, tr("Reconstruct")),
 )
 
-_HIGHLIGHT_TIP = (
+_HIGHLIGHT_TIP = tr(
     "Camera RAW only, and only useful when a highlight actually clipped.<br><br>"
     "<b>Off</b> (default) — a blown highlight stays flat white, or magenta if one channel "
     "clipped first.<br><br>"
@@ -68,14 +70,14 @@ class DemosaicSidebar(BaseSidebar):
         conf = self.state.config.process
         modes = [str(m) for m in supported_demosaic_modes()]
 
-        self.preview_combo = QComboBox()
+        self.preview_combo = StepCombo()
         self.preview_combo.addItems(modes)
         self.preview_combo.setToolTip(_TIP)
-        self.export_combo = QComboBox()
+        self.export_combo = StepCombo()
         self.export_combo.addItems(modes)
         self.export_combo.setToolTip(_TIP)
 
-        self.layout.addWidget(section_subheader("DEMOSAIC"))
+        self.layout.addWidget(section_subheader(tr("DEMOSAIC")))
         for label, combo in (("Preview", self.preview_combo), ("Export", self.export_combo)):
             row = QHBoxLayout()
             lbl = field_label(label, FIELD_LABEL_WIDTH)
@@ -84,33 +86,35 @@ class DemosaicSidebar(BaseSidebar):
             self.layout.addLayout(row)
 
         # Shown only on a frame these do not reach; the general note lives in the tooltip.
-        self.hint = hint_label("This frame is not a Bayer or X-Trans RAW, so it arrives already de-mosaiced.")
+        self.hint = hint_label(tr("This frame is not a Bayer or X-Trans RAW, so it arrives already de-mosaiced."))
         self.hint.setVisible(False)
         self.layout.addWidget(self.hint)
 
         self.preview_combo.setCurrentText(str(DemosaicMode(conf.demosaic_preview)))
         self.export_combo.setCurrentText(str(DemosaicMode(conf.demosaic_export)))
 
-        self.highlight_header = section_subheader("HIGHLIGHTS")
+        self.highlight_header = section_subheader(tr("HIGHLIGHTS"))
         self.layout.addWidget(self.highlight_header)
         highlight_row = QHBoxLayout()
-        self.highlight_label = field_label("Recovery", FIELD_LABEL_WIDTH)
+        self.highlight_label = field_label(tr("Recovery"), FIELD_LABEL_WIDTH)
         highlight_row.addWidget(self.highlight_label)
-        self.highlight_combo = QComboBox()
+        self.highlight_combo = StepCombo()
         self.highlight_combo.addItems([label for _level, label in _HIGHLIGHT_LEVELS])
         self.highlight_combo.setToolTip(wrap_tooltip(_HIGHLIGHT_TIP))
         self.highlight_combo.setCurrentIndex(_highlight_bucket(conf.highlight_reconstruction))
         highlight_row.addWidget(self.highlight_combo, 1)
         self.layout.addLayout(highlight_row)
 
-        self.highlight_merged_hint = hint_label("Not applied to a merged bracket.")
+        self.highlight_merged_hint = hint_label(tr("Not applied to a merged bracket."))
         self.highlight_merged_hint.setToolTip(
             wrap_tooltip(
-                "A reconstructed pixel no longer reads near the sensor ceiling, so the merge's "
-                "own highlight recovery would trust a per-frame guess as real signal and blend "
-                "inconsistent guesses across frames. A bracket already recovers a genuine "
-                "highlight from a shorter, unclipped exposure, which reconstruction's guess "
-                "cannot improve on. Unmerge the frame if you need it."
+                tr(
+                    "A reconstructed pixel no longer reads near the sensor ceiling, so the merge's "
+                    "own highlight recovery would trust a per-frame guess as real signal and blend "
+                    "inconsistent guesses across frames. A bracket already recovers a genuine "
+                    "highlight from a shorter, unclipped exposure, which reconstruction's guess "
+                    "cannot improve on. Unmerge the frame if you need it."
+                )
             )
         )
         self.highlight_merged_hint.setVisible(False)

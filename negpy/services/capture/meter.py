@@ -14,9 +14,9 @@ import numpy as np
 from negpy.features.geometry.logic import (
     AUTOCROP_DETECT_RES,
     _normalize_detection_input,
-    _refine_roi_to_image,
     _scale_roi,
-    detect_film_bounds_with_confidence,
+    film_and_picture,
+    rebate_mask,
 )
 from negpy.features.process.logic import detect_process_mode
 from negpy.features.process.models import ProcessMode
@@ -122,12 +122,7 @@ def meter_frame(img: np.ndarray, shutter: str, candidates: tuple[str, ...] = (),
         medium = "positive" if detect_process_mode(linear) == ProcessMode.E6 else "negative"
     det, scale = _normalize_detection_input(linear, AUTOCROP_DETECT_RES)
     det = np.ascontiguousarray(det, dtype=np.float32)
-    h, w = det.shape[:2]
-    film = detect_film_bounds_with_confidence(det)
-    film_roi = film.roi if film.roi is not None else (0, h, 0, w)
-    gate, _, _ = _refine_roi_to_image(det, film_roi)
-    if gate[1] <= gate[0] or gate[3] <= gate[2]:  # a degenerate picture box on a blank or dark probe
-        gate = (0, h, 0, w)
+    film_roi, gate = film_and_picture(det)
     gy1, gy2, gx1, gx2 = gate
     picture_det = det[gy1:gy2, gx1:gx2].reshape(-1, 3)
     # The picture at the probe's own resolution: a highlight narrower than a detection pixel
@@ -138,13 +133,7 @@ def meter_frame(img: np.ndarray, shutter: str, candidates: tuple[str, ...] = (),
     brightest = frame_brightest[ly1:ly2, lx1:lx2]
     clipped_fraction = float(np.mean(brightest >= _SATURATION))
 
-    # No film box, no rebate: the ring would be whatever surrounds the picture, bare light included.
-    rebate = np.zeros((h, w), bool)
-    if film.roi is not None:
-        fy1, fy2, fx1, fx2 = film_roi
-        rebate[fy1:fy2, fx1:fx2] = True
-        rebate[gy1:gy2, gx1:gx2] = False
-    ring = det[rebate]
+    ring = det[rebate_mask(det.shape[:2], film_roi, gate)]
     # A negative's base is its thinnest film, so a ring darker than the picture is picture.
     if medium == "negative" and ring.size and np.median(ring.mean(axis=1)) > np.median(picture_det.mean(axis=1)):
         region = "base"

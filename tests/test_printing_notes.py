@@ -43,7 +43,7 @@ def test_the_recipe_keeps_quiet_about_defaults() -> None:
     lines = recipe_lines(ExposureConfig(), LocalAdjustmentsConfig(), FinishConfig(), frame="roll1_04.tif")
 
     assert lines[0] == "roll1_04.tif"
-    assert any("Neutral" in line for line in lines)
+    assert any("Digital (Adobe RGB)" in line for line in lines)
     assert any(line.startswith("Print Density 1.00") for line in lines)
     assert any(line.startswith("Grade ISO-R 115") for line in lines)
     assert not [line for line in lines if line.startswith(("Filtration", "Toe", "Snap", "Edge burn", "Dodge & burn", "Zone density"))]

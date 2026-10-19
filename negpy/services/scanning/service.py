@@ -62,13 +62,18 @@ class ScannerService:
         """
         return self._get_backend().eject(device_id)
 
-    def detect_frames(self, device_id: str, *, film_format: str | None = None) -> int:
+    def media_loaded(self, device_id: str) -> bool | None:
+        """Whether film is loaded. None where the transport cannot tell."""
+        loaded = getattr(self._get_backend(), "media_loaded", None)
+        return None if loaded is None else bool(loaded(device_id))
+
+    def detect_frames(self, device_id: str, *, film_format: str | None = None, film_type: str = "negative") -> int:
         """How many frames the loaded film carries, 0 where the transport cannot measure it.
 
         A feeder counts slots instead, and the caller has that from the device capabilities.
         """
         detect = getattr(self._get_backend(), "detect_frames", None)
-        return 0 if detect is None else int(detect(device_id, film_format=film_format))
+        return 0 if detect is None else int(detect(device_id, film_format=film_format, film_type=film_type))
 
     def open_roll(
         self,

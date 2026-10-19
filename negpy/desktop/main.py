@@ -1,3 +1,4 @@
+from negpy.kernel.system.i18n import configure, install_qt_translations, tr
 import html
 import os
 import re
@@ -8,12 +9,9 @@ from PyQt6.QtCore import QEvent, QObject, Qt, qInstallMessageHandler
 from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import QAbstractButton, QAbstractSpinBox, QApplication, QComboBox, QProxyStyle, QStyle, QWidget
 
-from negpy.desktop.controller import AppController
-from negpy.desktop.session import DesktopSessionManager
-from negpy.desktop.view.main_window import MainWindow
-from negpy.desktop.view.styles.templates import wrap_tooltip
 from negpy.features.flatfield.logic import set_gain_provider
 from negpy.infrastructure.storage.repository import StorageRepository
+from negpy.services.assets.migrations.bounds import migrate_stale_frame_bounds
 from negpy.services.assets.migrations.cast_removal import migrate_legacy_slide_cast_removal
 from negpy.services.assets.crosstalk import CrosstalkProfiles
 from negpy.services.assets.flatfield import FlatFieldProfiles
@@ -75,6 +73,8 @@ class AppEventFilter(QObject):
             event.ignore()
             return True
         if kind == QEvent.Type.ToolTipChange and isinstance(obj, QWidget):
+            from negpy.desktop.view.styles.templates import wrap_tooltip
+
             tip = obj.toolTip()
             if tip and not tip.startswith("<qt>"):
                 obj.setToolTip(wrap_tooltip(tip))
@@ -153,10 +153,12 @@ def _show_error_notice(error: str) -> None:
 
     QMessageBox.critical(
         None,
-        "NegPy Hit an Error",
-        f"Something went wrong and was logged:\n\n{error}\n\n"
-        f"The app kept running. If it keeps happening, please attach the log file "
-        f"({os.path.join(BASE_USER_DIR, 'negpy.log')}) to a bug report on GitHub.",
+        tr("NegPy Hit an Error"),
+        tr(
+            "Something went wrong and was logged:\n\n{error}\n\nThe app kept running. If it keeps happening, please attach the log file ({value}) to a bug report on GitHub.",
+            error=error,
+            value=os.path.join(BASE_USER_DIR, "negpy.log"),
+        ),
     )
 
 
@@ -225,11 +227,13 @@ def _offer_to_disable_cpu_parallel(repo, parent) -> None:
 
     box = QMessageBox(parent)
     box.setIcon(QMessageBox.Icon.Warning)
-    box.setWindowTitle("NegPy Closed Unexpectedly")
-    box.setText("The last session ended unexpectedly with multi-core CPU rendering turned on.")
+    box.setWindowTitle(tr("NegPy Closed Unexpectedly"))
+    box.setText(tr("The last session ended unexpectedly with multi-core CPU rendering turned on."))
     box.setInformativeText(
-        "That setting is the most likely cause. Turning it off costs some speed on merges "
-        "and exports, and is the safe setting.\n\nTurn multi-core CPU rendering off?"
+        tr(
+            "That setting is the most likely cause. Turning it off costs some speed on merges "
+            "and exports, and is the safe setting.\n\nTurn multi-core CPU rendering off?"
+        )
     )
     box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
     box.setDefaultButton(QMessageBox.StandardButton.Yes)
@@ -267,6 +271,12 @@ def main() -> None:
         # can be applied through QT_SCALE_FACTOR, which Qt reads only at startup.
         repo = StorageRepository(APP_CONFIG.edits_db_path, APP_CONFIG.settings_db_path)
         repo.initialize()
+        configure(str(repo.get_global_setting("ui_language", "system") or "system"))
+
+        # Load the catalog before UI modules construct their static labels.
+        from negpy.desktop.controller import AppController
+        from negpy.desktop.session import DesktopSessionManager
+        from negpy.desktop.view.main_window import MainWindow
 
         # Preferences fills in the performance numbers override.toml left alone. After the
         # file's own apply() above, and still before QApplication reads any of them.
@@ -305,6 +315,7 @@ def main() -> None:
         migrate_new_roll_field_locks(repo)
         migrate_cast_removal_roll_locks(repo)
         migrate_auto_crop_roll_locks(repo)
+        migrate_stale_frame_bounds(repo)
 
         scale = float(repo.get_global_setting("ui_scale", 1.0) or 1.0)
         scale = max(0.8, min(1.2, scale))
@@ -318,6 +329,7 @@ def main() -> None:
 
         qInstallMessageHandler(_filter_qt_messages)
         app = QApplication(sys.argv)
+        install_qt_translations(app)
         app.setApplicationName("NegPy")
         app.setStyle(_AppStyle("Fusion"))
         app.installEventFilter(AppEventFilter(app))

@@ -14,9 +14,13 @@
 
 NegPy turns scans of film negatives and slides into finished pictures. I wrote it because I wanted a tool made for film scans that does more than invert them. It models film and photographic paper, and adds the conveniences of a lab scanner. It is written in Python and runs on Linux, macOS and Windows.
 
-![NegPy main window](docs/media/0640.png)
+![NegPy main window](docs/media/0650.webp)
 
 The [User Guide](docs/USER_GUIDE.md) covers every panel and control (the ⓘ on each panel opens it in the app). [PIPELINE.md](docs/PIPELINE.md) explains the math.
+
+## Languages
+
+The desktop interface and panel guides support English, Simplified Chinese (简体中文), Japanese (日本語) and Korean (한국어). Choose a language in **Preferences → Interface → Language**, then restart NegPy. **System Default** follows your system language and uses English for unsupported languages. Missing panel translations fall back to English. See [CONTRIBUTING.md](CONTRIBUTING.md#translations) to update or add a translation.
 
 ## Features
 
@@ -37,7 +41,7 @@ The [User Guide](docs/USER_GUIDE.md) covers every panel and control (the ⓘ on 
 
 ### Capture
 
-* Film scanners: Plustek OpticFilm 8200i SE and 8100 V2 over USB, Nikon Coolscan, Reflecta, Pacific Image, and anything SANE supports.
+* Film scanners: Plustek OpticFilm 8200i SE, 8100 V2, 8300i SE and 7600i v1 over USB, Nikon Coolscan, Reflecta, Pacific Image, and anything SANE supports.
 * Tethered camera scanning (macOS and Linux), including narrowband RGB captures with a [Scanlight](https://github.com/jackw01/scanlight) and a sub-pixel Trichrome merge ([guide](docs/CAMERA_SCANNING.md)).
 * Flat-field correction, sensor calibration for narrowband light, and lens correction read from the file.
 * Camera RAWs, TIFF, DNG, JPEG XL and scanner formats such as Pakon, Coolscan NEF, Flextight FFF and Noritsu.

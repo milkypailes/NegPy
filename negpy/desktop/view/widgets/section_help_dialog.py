@@ -1,9 +1,10 @@
 """Panel guides: the ⓘ in a section header opens that panel's slice of the user guide.
 
-docs/USER_GUIDE.md is the single source — it ships in the frozen build (build.py) and the
-slices are anchored on `<!-- panel:<key> -->` markers keyed by the section's persistence key,
-so renumbering or retitling a heading can't orphan a guide.
+docs/USER_GUIDE.md provides the English guides; localized guides use the same panel markers.
+Both ship in the frozen build. Stable panel keys select each slice independently of its title.
 """
+
+from negpy.kernel.system.i18n import language, tr
 
 import re
 from functools import lru_cache
@@ -18,7 +19,8 @@ from negpy.desktop.view.styles.theme import THEME
 from negpy.desktop.view.widgets.dialog_geometry import remember_dialog_geometry
 from negpy.kernel.system.paths import get_resource_path
 
-_MARKER = re.compile(r"^<!--\s*panel:([a-z_]+)\s*-->\s*$")
+# A localized guide's marker also records its English source (src:<hash>), checked by tests/test_i18n.py.
+_MARKER = re.compile(r"^<!--\s*panel:([a-z_]+)(?:\s+src:[0-9a-f]+)?\s*-->\s*$")
 _HEADING = re.compile(r"^(#{1,6})\s")
 # Cross-doc links ([CROSSTALK.md](CROSSTALK.md)) have nowhere to go from a modal, and Qt's
 # markdown importer paints anchors in the app palette's accent red, unreadable at body
@@ -26,12 +28,24 @@ _HEADING = re.compile(r"^(#{1,6})\s")
 _LINK = re.compile(r"\[([^\]]+)\]\([^)]+\)")
 
 
-@lru_cache(maxsize=1)
 def _guides() -> dict[str, str]:
+    return _localized_guides(language())
+
+
+@lru_cache(maxsize=4)
+def _localized_guides(locale: str) -> dict[str, str]:
     """Section key → the markdown under its heading. Empty when the doc is unreadable,
     which just means no section offers a guide."""
+    guides = _read_guides("docs/USER_GUIDE.md") or _read_guides("negpy/translations/USER_GUIDE.en.md")
+    if locale != "en":
+        # Fall back per panel so missing translations keep the help button available.
+        guides.update(_read_guides(f"negpy/translations/USER_GUIDE.{locale}.md"))
+    return guides
+
+
+def _read_guides(relative_path: str) -> dict[str, str]:
     try:
-        lines = Path(get_resource_path("docs/USER_GUIDE.md")).read_text(encoding="utf-8").splitlines()
+        lines = Path(get_resource_path(relative_path)).read_text(encoding="utf-8").splitlines()
     except OSError:
         return {}
 
@@ -68,7 +82,7 @@ class SectionHelpDialog(QDialog):
 
     def __init__(self, key: str, title: str, parent: Optional[QWidget] = None, *, repo=None):
         super().__init__(parent)
-        heading = f"Reading the {title} panel"
+        heading = tr("Reading the {title} panel", title=title)
         self.setWindowTitle(heading)
         self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.WindowCloseButtonHint)
         self.setModal(True)
@@ -102,7 +116,7 @@ class SectionHelpDialog(QDialog):
 
         actions = QHBoxLayout()
         actions.addStretch()
-        close_btn = QPushButton("Close")
+        close_btn = QPushButton(tr("Close"))
         close_btn.clicked.connect(self.accept)
         pin_dialog_default(close_btn)
         actions.addWidget(close_btn)

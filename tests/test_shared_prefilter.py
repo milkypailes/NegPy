@@ -9,8 +9,6 @@ from negpy.features.exposure.normalization import (
     measure_anchor_from_log,
     measure_neutral_axis,
     measure_neutral_axis_from_log,
-    measure_shadow_log_refs,
-    measure_shadow_refs_from_log,
     measure_textural_range,
     measure_textural_range_from_log,
     prefilter_log_grid,
@@ -45,11 +43,6 @@ class TestSharedPrefilter(unittest.TestCase):
         got = analyze_log_exposure_bounds_from_log(self.prefiltered, None, 0.0)
         np.testing.assert_allclose(ref.floors, got.floors, rtol=0, atol=1e-6)
         np.testing.assert_allclose(ref.ceils, got.ceils, rtol=0, atol=1e-6)
-
-    def test_shadow_refs_match(self):
-        ref = measure_shadow_log_refs(self.img)
-        got = measure_shadow_refs_from_log(self.prefiltered, None, 0.0)
-        np.testing.assert_allclose(ref, got, rtol=0, atol=1e-6)
 
     def test_anchor_and_textural_match(self):
         bounds = analyze_log_exposure_bounds(self.img)

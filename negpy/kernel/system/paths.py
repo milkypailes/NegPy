@@ -17,7 +17,7 @@ def get_resource_path(relative_path: str) -> str:
         # this file is at src/kernel/system/paths.py, so the root is 3 levels up
         base_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 
-    # Callers pass forward-slash relatives ("icc/RGBScan.icc"), and normpath keeps the result
+    # Callers pass forward-slash relatives ("icc/sRGB-v4.icc"), and normpath keeps the result
     # in the platform's own separators instead of a mixed form.
     return os.path.normpath(os.path.join(base_path, relative_path))
 

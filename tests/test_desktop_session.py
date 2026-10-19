@@ -132,7 +132,7 @@ class TestDesktopSessionSync(unittest.TestCase):
                 "autocrop_offset": 7,
                 "auto_exposure": True,
             },
-            "last_narrowband_scan": True,
+            "last_linear_raw": True,
         }
         self.mock_repo.get_global_setting.side_effect = lambda key, default=None: sticky.get(key, default)
         asset = {"name": "fresh.dng", "path": "/roll/fresh.dng", "hash": "fresh-hash"}
@@ -143,7 +143,7 @@ class TestDesktopSessionSync(unittest.TestCase):
         self.assertEqual(config.exposure.density, defaults.exposure.density)
         self.assertEqual(config.lab.saturation, defaults.lab.saturation)
         self.assertTrue(config.exposure.auto_exposure)
-        self.assertTrue(config.process.narrowband_scan)
+        self.assertTrue(config.process.linear_raw)
         self.assertEqual(config.process.process_mode, ProcessMode.E6)
         self.assertEqual(config.geometry.autocrop_ratio, "1:1")
         self.assertEqual(config.geometry.autocrop_offset, 7)
@@ -369,7 +369,7 @@ class TestDesktopSessionSync(unittest.TestCase):
             self.assertIn(field, snapshot)
         # Carried on their own keys: no catalog row reaches them.
         self.assertIn("last_export_config", saved)
-        self.assertIn("last_narrowband_scan", saved)
+        self.assertIn("last_linear_raw", saved)
 
     def _with_global(self, **values):
         base = self.mock_repo.get_global_setting.side_effect
@@ -910,7 +910,7 @@ class TestDesktopSessionSync(unittest.TestCase):
         doesn't silently reset its scan/process-mode to dataclass defaults."""
         sticky = {
             "sticky_config": {"process_mode": ProcessMode.E6},
-            "last_narrowband_scan": True,
+            "last_linear_raw": True,
         }
         self.mock_repo.get_global_setting.side_effect = lambda key, default=None: sticky.get(key, default)
         self.mock_repo.load_file_settings.return_value = None  # fresh target, no DB row
@@ -927,7 +927,7 @@ class TestDesktopSessionSync(unittest.TestCase):
         saved = args[1]
         self.assertEqual(saved.exposure.density, 1.5)  # the one synced field
         # Sticky workflow settings survive because the base was config_for_asset, not defaults.
-        self.assertTrue(saved.process.narrowband_scan)
+        self.assertTrue(saved.process.linear_raw)
         self.assertEqual(saved.process.process_mode, ProcessMode.E6)
 
     def test_sync_selected_settings_empty_is_noop(self):
@@ -2249,8 +2249,8 @@ class TestSearchFacts(unittest.TestCase):
 
 
 class ResetKeepsScanSetup(unittest.TestCase):
-    """A reset clears the look but keeps the rig: Linear RAW and Narrowband come back as
-    the scan setup gives them to a fresh file, on every reset path."""
+    """A reset clears the look but keeps the rig: Linear RAW comes back as the scan setup
+    gives it to a fresh file, on every reset path."""
 
     def setUp(self):
         import tempfile
@@ -2259,7 +2259,7 @@ class ResetKeepsScanSetup(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.repo = StorageRepository(f"{self.tmp.name}/edits.db", f"{self.tmp.name}/settings.db")
         self.repo.initialize()
-        self.repo.save_global_settings({"last_linear_raw": True, "last_narrowband_scan": True})
+        self.repo.save_global_settings({"last_linear_raw": True})
         self.session = DesktopSessionManager(self.repo)
         self.session.state.uploaded_files = [
             {"name": "a.raw", "path": f"{self.tmp.name}/a.raw", "hash": "hash1"},
@@ -2267,7 +2267,7 @@ class ResetKeepsScanSetup(unittest.TestCase):
         ]
         edited = replace(
             DEFAULT_WORKSPACE_CONFIG,
-            process=replace(DEFAULT_WORKSPACE_CONFIG.process, linear_raw=True, narrowband_scan=True),
+            process=replace(DEFAULT_WORKSPACE_CONFIG.process, linear_raw=True),
             exposure=replace(DEFAULT_WORKSPACE_CONFIG.exposure, density=1.8),
         )
         for f in self.session.state.uploaded_files:
@@ -2276,7 +2276,6 @@ class ResetKeepsScanSetup(unittest.TestCase):
         self.session.select_file(0)
 
     def _assert_reset_keeping_rig(self, config: WorkspaceConfig) -> None:
-        self.assertTrue(config.process.narrowband_scan)
         self.assertTrue(config.process.linear_raw)
         self.assertEqual(config.exposure.density, DEFAULT_WORKSPACE_CONFIG.exposure.density)
 
@@ -2305,14 +2304,14 @@ class ResetKeepsScanSetup(unittest.TestCase):
         self.assertEqual(self.repo.load_file_settings("hash2"), via_settings)
 
     def _locked_roll(self) -> str:
-        """The reported roll: Narrowband on for the roll, a frame locked to its own off."""
+        """The reported roll: Linear RAW on for the roll, a frame locked to its own off."""
         from negpy.services.assets import rolls
 
         roll_id = rolls.create_virtual_roll(self.repo, "Pakon", [f["path"] for f in self.session.state.uploaded_files])
-        rolls.set_roll_defaults(self.repo, roll_id, narrowband_scan=True)
+        rolls.set_roll_defaults(self.repo, roll_id, linear_raw=True)
         for h in ("hash1", "hash2"):
             rolls.set_frame_override(self.repo, roll_id, h, "sensor", locked=True)
-        self.repo.save_global_settings({"last_narrowband_scan": False})
+        self.repo.save_global_settings({"last_linear_raw": False})
         self.session.state.active_roll_id = roll_id
         return roll_id
 
@@ -2326,30 +2325,30 @@ class ResetKeepsScanSetup(unittest.TestCase):
         for h in ("hash1", "hash2"):
             self.assertEqual(rolls.frame_override_cards(self.repo, roll_id, h), set())
         asset = self.session.state.uploaded_files[1]
-        self.assertTrue(self.session.config_for_asset(asset).process.narrowband_scan)
+        self.assertTrue(self.session.config_for_asset(asset).process.linear_raw)
 
     def test_a_reset_in_a_roll_shows_the_roll_values_at_once(self):
         self._locked_roll()
 
         self.session.reset_settings()
 
-        self.assertTrue(self.session.state.config.process.narrowband_scan)
+        self.assertTrue(self.session.state.config.process.linear_raw)
 
     def test_undoing_a_reset_in_a_roll_keeps_the_frames_own_values(self):
         from negpy.services.assets import rolls
 
         roll_id = self._locked_roll()
         own = self.session.state.config
-        own = replace(own, process=replace(own.process, narrowband_scan=False))
+        own = replace(own, process=replace(own.process, linear_raw=False))
         self.session.update_config(own, persist=True)
 
         self.session.reset_settings()
         self.session.undo()
 
-        self.assertFalse(self.session.state.config.process.narrowband_scan)
+        self.assertFalse(self.session.state.config.process.linear_raw)
         self.assertIn("sensor", rolls.frame_override_cards(self.repo, roll_id, "hash1"))
         self.session.repo.save_file_settings("hash1", self.session.state.config, file_path=self.session.state.uploaded_files[0]["path"])
-        self.assertFalse(self.session.config_for_asset(self.session.state.uploaded_files[0]).process.narrowband_scan)
+        self.assertFalse(self.session.config_for_asset(self.session.state.uploaded_files[0]).process.linear_raw)
 
     def test_undo_leaves_a_card_pinned_at_the_rolls_value_pinned(self):
         from negpy.services.assets import rolls
@@ -2363,12 +2362,12 @@ class ResetKeepsScanSetup(unittest.TestCase):
 
         self.assertIn("film", rolls.frame_override_cards(self.repo, roll_id, "hash1"))
 
-    def _own_narrowband_then_reset(self) -> str:
-        """The frame's own Narrowband off as a history step, then a reset that hands the
-        frame back to the roll: Narrowband on, the Calibration card unlocked."""
+    def _own_linear_raw_then_reset(self) -> str:
+        """The frame's own Linear RAW off as a history step, then a reset that hands the
+        frame back to the roll: Linear RAW on, the Calibration card unlocked."""
         roll_id = self._locked_roll()
         own = self.session.state.config
-        self.session.update_config(replace(own, process=replace(own.process, narrowband_scan=False)), persist=True)
+        self.session.update_config(replace(own, process=replace(own.process, linear_raw=False)), persist=True)
         self.session.save_work_print("own")
         self.session.reset_settings()
         return roll_id
@@ -2376,21 +2375,21 @@ class ResetKeepsScanSetup(unittest.TestCase):
     def test_a_history_jump_locks_a_card_that_differs_from_the_roll(self):
         from negpy.services.assets import rolls
 
-        roll_id = self._own_narrowband_then_reset()
+        roll_id = self._own_linear_raw_then_reset()
 
         self.session.jump_to_step(self.session.state.undo_index - 1)
 
-        self.assertFalse(self.session.state.config.process.narrowband_scan)
+        self.assertFalse(self.session.state.config.process.linear_raw)
         self.assertIn("sensor", rolls.frame_override_cards(self.repo, roll_id, "hash1"))
 
     def test_loading_a_work_print_locks_a_card_that_differs_from_the_roll(self):
         from negpy.services.assets import rolls
 
-        roll_id = self._own_narrowband_then_reset()
+        roll_id = self._own_linear_raw_then_reset()
 
         self.session.load_work_print("own")
 
-        self.assertFalse(self.session.state.config.process.narrowband_scan)
+        self.assertFalse(self.session.state.config.process.linear_raw)
         self.assertIn("sensor", rolls.frame_override_cards(self.repo, roll_id, "hash1"))
 
     def test_loading_a_sidecar_replaces_the_edit_as_one_undo_step(self):
@@ -2399,13 +2398,13 @@ class ResetKeepsScanSetup(unittest.TestCase):
         from negpy.services.assets import rolls
         from negpy.services.assets.sidecar import write_sidecar
 
-        roll_id = self._own_narrowband_then_reset()
+        roll_id = self._own_linear_raw_then_reset()
         own = self.session.state.config
         before = self.session.state.undo_index
         with tempfile.TemporaryDirectory() as d:
             path = write_sidecar(
                 f"{d}/frame.tif",
-                replace(own, process=replace(own.process, narrowband_scan=False), exposure=replace(own.exposure, density=0.77)),
+                replace(own, process=replace(own.process, linear_raw=False), exposure=replace(own.exposure, density=0.77)),
             )
             self.assertTrue(self.session.load_edit_from_sidecar(path))
             self.assertFalse(self.session.load_edit_from_sidecar(f"{d}/missing.negpy"))
@@ -2438,11 +2437,10 @@ class ResetKeepsScanSetup(unittest.TestCase):
         self.session.reset_settings()
 
     def test_a_white_light_scan_setup_resets_to_off(self):
-        self.repo.save_global_settings({"last_linear_raw": False, "last_narrowband_scan": False})
+        self.repo.save_global_settings({"last_linear_raw": False})
 
         self.session.reset_settings()
 
-        self.assertFalse(self.session.state.config.process.narrowband_scan)
         self.assertFalse(self.session.state.config.process.linear_raw)
 
 

@@ -35,8 +35,12 @@ def _curve(
     highlight_density=0.0,
     shadow_grade=0.0,
     highlight_grade=0.0,
+    black_hold=0.0,
+    n=257,
+    x_max=1.0,
 ):
-    x, ramp = _ramp()
+    x = np.linspace(0.0, x_max, n).astype(np.float32)
+    ramp = np.stack([x, x, x], axis=-1)[None, :, :]
     d_min = EXPOSURE_CONSTANTS["d_min"]
     slope = grade_to_slope(grade, lum_range)
     pivot = compute_pivot(slope, density=density, d_min=d_min)
@@ -53,6 +57,7 @@ def _curve(
         shadow_grade_deltas=sg3,
         highlight_grade_deltas=hg3,
         d_min=d_min,
+        black_hold=black_hold,
     )
     # Stage outputs linear; compare in the displayed space where goldens are calibrated.
     return x, np.asarray(working_oetf_encode(np.asarray(out)))[0, :, 0].astype(np.float64)
@@ -297,6 +302,46 @@ class TestSplitGrade(unittest.TestCase):
             d = cc(x.astype(np.float32))
             enc = np.asarray(working_oetf_encode(np.power(10.0, -np.asarray(d)).astype(np.float32))).reshape(-1)
             np.testing.assert_allclose(enc, kernel, atol=1e-4, err_msg=f"sg={sg} hg={hg}")
+
+
+class TestHoldBlack(unittest.TestCase):
+    TAPER = EXPOSURE_CONSTANTS["zone_black_hold_taper"]
+
+    def _density(self, **kw):
+        x, out = _curve(x_max=1.2, **kw)
+        return x, _output_to_density(out)
+
+    def test_a_held_lift_keeps_the_black_point(self):
+        _, base = self._density()
+        _, lift = self._density(shadow_density=-0.6)
+        _, held = self._density(shadow_density=-0.6, black_hold=self.TAPER)
+        self.assertLess(float(lift.max()), float(base.max()) - 0.02, "the unheld lift moves the black point")
+        self.assertAlmostEqual(float(held.max()), float(base.max()), delta=1e-3)
+        zone_ii = int(np.argmin(np.abs(base - 1.6)))
+        self.assertLess(held[zone_ii], base[zone_ii] - 0.2, "the held lift still opens zone II")
+
+    def test_a_burn_ignores_the_hold(self):
+        _, burn = self._density(shadow_density=0.6)
+        _, held = self._density(shadow_density=0.6, black_hold=self.TAPER)
+        np.testing.assert_array_equal(burn, held)
+
+    def test_a_held_lift_stays_monotone(self):
+        for grade in (50.0, 115.0, 180.0):
+            for sd in (-1.0, -0.5):
+                _, out = _curve(grade=grade, shadow_density=sd, black_hold=self.TAPER, x_max=1.2)
+                self.assertTrue(np.all(np.diff(out) <= 1e-6), f"non-monotone at grade={grade} sd={sd}")
+
+    def test_chart_mirror_parity(self):
+        from negpy.features.exposure.logic import CharacteristicCurve
+
+        d_min = EXPOSURE_CONSTANTS["d_min"]
+        slope = grade_to_slope(115.0, 1.3)
+        pivot = compute_pivot(slope, density=1.0, d_min=d_min)
+        x, kernel = _curve(shadow_density=-0.7, black_hold=self.TAPER, x_max=1.2)
+        cc = CharacteristicCurve(contrast=slope, pivot=pivot, d_min=d_min, shadow_density=-0.7, black_hold=self.TAPER)
+        d = cc(x.astype(np.float32))
+        enc = np.asarray(working_oetf_encode(np.power(10.0, -np.asarray(d)).astype(np.float32))).reshape(-1)
+        np.testing.assert_allclose(enc, kernel, atol=1e-4)
 
 
 class TestPivotAndGrade(unittest.TestCase):

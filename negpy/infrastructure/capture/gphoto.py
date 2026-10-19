@@ -463,10 +463,8 @@ class GphotoCamera:
         accepts = match or (lambda got: got == value)
 
         try:
-            current = _safe_value(self._gp, camera.get_single_config(name))
-            if current is not None and accepts(current) and match is None:
-                return True  # already there — skip the round trip (a scan re-sends the shutter)
-
+            # Written every time: the driver's cached read-back does not follow the dial, so a
+            # value that reads as set may not be what the body exposes at.
             widget = camera.get_single_config(name)
             offered = _choices(self._gp, widget)
             if offered and value not in offered:
@@ -754,8 +752,8 @@ class GphotoCamera:
         The suffix comes from the camera — a Canon writes `.CR3`, a Nikon `.NEF` — so the
         returned path may differ from the one asked for. Callers must use the return value.
         Blocks the preview meanwhile. `iso`/`aperture` lock the body to the preset's exposure
-        (a scan re-asserts them so a drifted setting can't falsify it); `_set_verified` skips the
-        write when the body is already there, so it costs a read unless something actually moved.
+        (a scan re-asserts them so a drifted setting can't falsify it); `_set_verified` writes every
+        time, because the driver's cached read-back does not follow the dial.
         """
         prev = self._post_shot
         if prev is not None and prev.is_alive():

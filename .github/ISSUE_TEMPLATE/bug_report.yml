@@ -77,7 +77,7 @@ body:
     attributes:
       label: Input ICC profile (if any)
       description: Which profile was selected under Input ICC, if you set one explicitly
-      placeholder: "e.g. RGBScan.icc, none/default"
+      placeholder: "e.g. my-scanner.icc, none/default"
 
   - type: textarea
     id: settings

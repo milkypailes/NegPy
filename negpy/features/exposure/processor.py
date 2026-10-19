@@ -4,8 +4,9 @@ import numpy as np
 
 from negpy.domain.interfaces import PipelineContext
 from negpy.domain.types import ImageBuffer
-from negpy.features.exposure.analysis import density_histogram
+from negpy.features.exposure.analysis import density_histogram, density_parade, scan_full_scale_columns
 from negpy.features.exposure.logic import (
+    black_hold_taper,
     apply_characteristic_curve,
     apply_flat_curve,
     cast_solve_inputs,
@@ -29,13 +30,13 @@ from negpy.features.exposure.normalization import (
     LogNegativeBounds,
     analyze_log_exposure_bounds_from_log,
     blend_neutral_axis,
+    density_above_base,
     luma_source_bounds,
     luminance_density_range,
     measure_anchor_from_log,
     measure_highlight_point_from_log,
     measure_clip_fractions,
     measure_neutral_axis_from_log,
-    measure_shadow_refs_from_log,
     measure_shadow_point_from_log,
     measure_textural_range_from_log,
     normalize_log_image,
@@ -53,7 +54,8 @@ from negpy.kernel.image.logic import get_luminance
 
 class NormalizationProcessor:
     """
-    Converts linear RAW to normalized log-density.
+    Converts linear RAW to normalized log-density. `context.metrics["base_log"]`, the clear
+    base the engine reads once per source, feeds `density_above_base`; absent, that metric is None.
     """
 
     def __init__(self, config: ProcessConfig):
@@ -66,7 +68,10 @@ class NormalizationProcessor:
         img_log = np.log10(np.clip(np.nan_to_num(image, nan=epsilon, posinf=1.0, neginf=epsilon), epsilon, None))
         # Shared prefilter, once for all five meters, with the ROI and buffer applied here. A
         # freehand analysis_rect overrides the crop ROI and centered buffer for the metered region.
-        an_roi, an_buffer = resolve_analysis_region(image.shape, context.active_roi, self.config.analysis_buffer, self.config.analysis_rect)
+        an_roi, an_buffer = resolve_analysis_region(
+            image.shape, context.active_roi, self.config.analysis_buffer, self.config.analysis_rect, self.config.meter_rect
+        )
+        region = (self.config.analysis_rect, self.config.meter_rect)
         prefiltered = prefilter_log_grid(image, an_roi, an_buffer)
         context.metrics["scan_clip_fractions"] = measure_clip_fractions(image, an_roi, an_buffer)
 
@@ -88,7 +93,7 @@ class NormalizationProcessor:
                 "log_bounds" not in context.metrics
                 or cached_buffer is None
                 or abs(cached_buffer - self.config.analysis_buffer) > 1e-5
-                or cached_rect != self.config.analysis_rect
+                or cached_rect != region
                 or cached_clip is None
                 or abs(cached_clip - self.config.luma_range_clip) > 1e-6
                 or cached_color_clip is None
@@ -109,7 +114,7 @@ class NormalizationProcessor:
             )
             context.metrics["log_bounds"] = analyzed
             context.metrics["log_bounds_buffer_val"] = self.config.analysis_buffer
-            context.metrics["log_bounds_rect_val"] = self.config.analysis_rect
+            context.metrics["log_bounds_rect_val"] = region
             context.metrics["log_bounds_clip_val"] = self.config.luma_range_clip
             context.metrics["log_bounds_color_clip_val"] = self.config.color_range_clip
             context.metrics["log_bounds_mode_val"] = context.process_mode
@@ -128,30 +133,7 @@ class NormalizationProcessor:
         pre_trim_bounds = bounds
 
         context.metrics["norm_density_range"] = luminance_density_range(bounds)
-
-        if context.process_mode == ProcessMode.C41:
-            cached_ref_buffer = context.metrics.get("shadow_refs_buffer_val")
-            cached_ref_rect = context.metrics.get("shadow_refs_rect_val")
-            cached_ref_unmix = context.metrics.get("shadow_refs_crosstalk_val")
-            if (
-                "shadow_log_refs" not in context.metrics
-                or cached_ref_buffer is None
-                or abs(cached_ref_buffer - self.config.analysis_buffer) > 1e-5
-                or cached_ref_rect != self.config.analysis_rect
-                or cached_ref_unmix != (self.config.crosstalk_strength, self.config.crosstalk_matrix, self.config.crosstalk_process)
-            ):
-                context.metrics["shadow_log_refs"] = measure_shadow_refs_from_log(
-                    prefiltered,
-                    None,
-                    0.0,
-                )
-                context.metrics["shadow_refs_buffer_val"] = self.config.analysis_buffer
-                context.metrics["shadow_refs_rect_val"] = self.config.analysis_rect
-                context.metrics["shadow_refs_crosstalk_val"] = (
-                    self.config.crosstalk_strength,
-                    self.config.crosstalk_matrix,
-                    self.config.crosstalk_process,
-                )
+        context.metrics["density_above_base"] = density_above_base(context.metrics.get("base_log"), pre_trim_bounds, prefiltered, unmix)
 
         wp3, bp3 = per_channel_point_offsets(self.config)
         if any(v != 0.0 for v in wp3 + bp3):
@@ -189,6 +171,12 @@ class NormalizationProcessor:
         context.metrics["pre_trim_bounds"] = pre_trim_bounds
         context.metrics["normalized_log"] = res
         context.metrics["histogram_density"] = density_histogram(res, context.active_roi)
+        # The Crop tool shows the whole frame, so the parade's columns span it too (the GPU's full_frame).
+        # Export and batch thumbnails render with stage caching off and skip it.
+        if context.cache_stages:
+            parade_roi = None if context.crop_preview_full else context.active_roi
+            context.metrics["density_parade"] = density_parade(img_log, parade_roi)
+            context.metrics["scan_full_scale"] = scan_full_scale_columns(image, parade_roi)
         return res
 
 
@@ -234,9 +222,8 @@ class PhotometricProcessor:
         anchor = context.metrics.get("metered_anchor") if self.config.auto_exposure else None
         lum_range = context.metrics.get("norm_density_range")
         final_bounds = context.metrics.get("final_bounds")
-        strength, shadow_refs_norm, neutral_axis_norm = cast_solve_inputs(
+        strength, neutral_axis_norm = cast_solve_inputs(
             final_bounds,
-            context.metrics.get("shadow_log_refs"),
             context.metrics.get("neutral_axis_refs"),
             self.config.cast_removal_strength,
         )
@@ -246,7 +233,6 @@ class PhotometricProcessor:
             self.config.auto_normalize_contrast,
             strength,
             lum_range,
-            shadow_refs_norm,
             context.metrics.get("textural_range"),
             d_min=d_min,
             anchor=anchor,
@@ -368,6 +354,7 @@ class PhotometricProcessor:
             ev_scale=local_ev_scale(final_bounds),
             grade_map=grade_map,
             bpc=not self.config.paper_black,
+            black_hold=black_hold_taper(self.config, paper),
             toe_trims=(self.config.toe_trim_red, self.config.toe_trim_green, self.config.toe_trim_blue),
             shoulder_trims=(self.config.shoulder_trim_red, self.config.shoulder_trim_green, self.config.shoulder_trim_blue),
             snap_trims=(

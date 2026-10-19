@@ -9,7 +9,7 @@ the config bounded and every node draggable vertically only, with its
 neighbours clamping the drag so the curve can never fold.
 """
 
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 
@@ -76,7 +76,7 @@ def active_mask(config: Any) -> tuple[int, int, int, int]:
     """Per-lane apply flags over (global, red, green, blue). An identity table
     still quantizes to 8 bits, so untouched lanes are skipped on both engines
     and stay bit-exact. Single source for the CPU application and the GPU pack."""
-    return tuple(1 if any(channel_offsets(config, ch)) else 0 for ch in ("global", "red", "green", "blue"))
+    return cast(tuple[int, int, int, int], tuple(1 if any(channel_offsets(config, ch)) else 0 for ch in ("global", "red", "green", "blue")))
 
 
 def without_curves(config: Any) -> Any:
@@ -135,7 +135,7 @@ def bake_channel_lut(offsets: Any, x_positions: Any = None) -> np.ndarray:
     _, first = np.unique(xs, return_index=True)
     xs, ys = xs[np.sort(first)], ys[np.sort(first)]
     if len(xs) < 2:
-        return (np.arange(256, dtype=np.float32) / 255.0)
+        return np.arange(256, dtype=np.float32) / 255.0
     slopes = _pchip_slopes(xs, ys)
     xe = np.arange(256, dtype=np.float64)
     k = np.clip(np.searchsorted(xs, xe, side="right") - 1, 0, len(xs) - 2)

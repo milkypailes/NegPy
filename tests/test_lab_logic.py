@@ -367,6 +367,35 @@ class TestLabLogic(unittest.TestCase):
         # Still denoises well away from the edge.
         self.assertLess(float(np.var(res_lab[:, :40, 1])), float(np.var(lab[:, :40, 1])))
 
+    def test_chroma_denoise_removes_isolated_specks(self) -> None:
+        """A one-pixel color speck is noise at any amplitude; a bilateral keeps one past twice its range sigma."""
+        lab = rgb_to_lab_working(np.full((80, 80, 3), 0.5, dtype=np.float32))
+        specks = ((10, 12), (30, 50), (55, 25), (70, 66))
+        for y, x in specks:
+            lab[y, x, 1] += 40.0
+        res_lab = rgb_to_lab_working(apply_chroma_denoise(lab_to_rgb_working(lab), radius=2.0))
+
+        for y, x in specks:
+            self.assertLess(abs(float(res_lab[y, x, 1] - lab[0, 0, 1])), 3.0)
+
+    def test_chroma_denoise_keeps_a_strong_color_edge(self) -> None:
+        """Chroma above the cutoff survives where it belongs to a real color edge, so the edge does not soften."""
+        lab = rgb_to_lab_working(np.full((40, 60, 3), 0.5, dtype=np.float32))
+        lab[:, 30:, 1] += 30.0
+        res_lab = rgb_to_lab_working(apply_chroma_denoise(lab_to_rgb_working(lab), radius=2.0))
+
+        self.assertLess(float(np.abs(res_lab[20, 24:36, 1] - lab[20, 24:36, 1]).max()), 1.5)
+
+    def test_chroma_denoise_keeps_lightness_grain(self) -> None:
+        rng = np.random.default_rng(3)
+        lab = rgb_to_lab_working(np.full((64, 64, 3), 0.4, dtype=np.float32))
+        lab[:, :, 0] += rng.normal(0, 2, (64, 64)).astype(np.float32)
+        lab[:, :, 2] += rng.normal(0, 6, (64, 64)).astype(np.float32)
+        res_lab = rgb_to_lab_working(apply_chroma_denoise(lab_to_rgb_working(lab), radius=2.0))
+
+        np.testing.assert_allclose(res_lab[:, :, 0], lab[:, :, 0], atol=0.05)
+        self.assertLess(float(np.std(res_lab[:, :, 2])), 0.25 * float(np.std(lab[:, :, 2])))
+
 
 def _lab(l_val: float, chroma: float, hue_deg: float) -> np.ndarray:
     rad = np.radians(hue_deg)

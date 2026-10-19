@@ -366,7 +366,7 @@ def dng_bounded_preview(
 ) -> tuple[bool, Optional[Image.Image]]:
     """Stream a LinearRaw DNG into a small preview with bounded segment memory.
 
-    The boolean is true when the DNG is LinearRaw and must not fall through to a
+    The boolean is true when the DNG's main image is LinearRaw and must not fall through to a
     full-array loader, including when its layout prevents a bounded preview.
     """
     if os.path.splitext(file_path)[1].lower() != ".dng":
@@ -383,7 +383,8 @@ def dng_bounded_preview(
                 shape = tuple(int(v) for v in page.shape)
                 photo_tag = page.tags.get("PhotometricInterpretation")
                 photo = int(photo_tag.value) if photo_tag is not None else 0
-                if len(shape) == 3 and shape[2] in (3, 4) and photo == _DNG_LINEAR_RAW:
+                main_image = int(getattr(page, "subfiletype", 0)) == 0
+                if main_image and len(shape) == 3 and shape[2] in (3, 4) and photo == _DNG_LINEAR_RAW:
                     candidates.append(page)
             if not candidates:
                 return False, None

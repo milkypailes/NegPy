@@ -1369,12 +1369,9 @@ class TestLinearCorrections:
         rgbscan = RgbScanConfig(enabled=True, green_path="g.nef", blue_path="b.nef")
         assert wb_bake_block_reason(rgbscan, ProcessConfig()) == "trichrome"
 
-    def test_wb_bake_block_reason_narrowband(self) -> None:
-        assert wb_bake_block_reason(RgbScanConfig(), ProcessConfig(narrowband_scan=True)) == "narrowband"
-
-    def test_wb_bake_block_reason_sensor_profile_alone(self) -> None:
-        """A calibrated sensor matrix flags Single-Shot Narrowband even with the toggle off."""
-        conf = ProcessConfig(narrowband_scan=False, sensor_matrix=(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0))
+    def test_wb_bake_block_reason_sensor_profile(self) -> None:
+        """A calibrated sensor matrix flags Single-Shot Narrowband."""
+        conf = ProcessConfig(sensor_matrix=(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0))
         assert wb_bake_block_reason(RgbScanConfig(), conf) == "narrowband"
 
     def test_wb_bake_block_reason_clear(self) -> None:
@@ -1390,7 +1387,7 @@ class TestLinearCorrections:
         out = os.path.join(str(tmp_path), "out.tiff")
 
         with self._patch_decode({p: buf}):
-            export_linear_output(p, out, apply_wb=True, process=ProcessConfig(narrowband_scan=True))
+            export_linear_output(p, out, apply_wb=True, process=ProcessConfig(sensor_matrix=(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)))
 
         with tifffile.TiffFile(out) as tf:
             desc = tf.pages[0].description

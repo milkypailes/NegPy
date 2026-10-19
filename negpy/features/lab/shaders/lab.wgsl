@@ -11,7 +11,7 @@ struct LabUniforms {
     sharpen_masking: f32,
     sharpen_method: f32,
     skin_protection: f32,
-    _pad2: f32,
+    chroma_radius_px: f32,
     _pad3: f32,
 };
 
@@ -21,6 +21,8 @@ struct LabUniforms {
 // USM: (blurred L*, original L*) from lab_sharpen_h/v.wgsl.
 // RL:  (deconvolved Y, observed Y) from the rl_*.wgsl chain. 1x1 dummy when sharpen=0.
 @group(0) @binding(3) var sharpen_tex: texture_2d<f32>;
+// (low-pass a*, low-pass b*) from chroma_lowpass_h/v.wgsl. 1x1 dummy when Chroma Denoise is off.
+@group(0) @binding(4) var chroma_tex: texture_2d<f32>;
 
 // Sharpen constants — mirrored from features/lab/logic.py.
 const SHARPEN_GATE_LO = 0.25;
@@ -120,9 +122,9 @@ const FIBONACCI_64 = array<vec2<f32>, 64>(
 // accumulator the same way a Gaussian convolution kernel is normalized (sum=1).
 const BLOOM_GAUSS_SUM = 27.668145;
 
-// Chroma-similarity sigma for the denoise range term (CIELAB a*/b* units).
-// Mirrors CHROMA_DENOISE_SIGMA_R in lab/logic.py.
-const CHROMA_DENOISE_SIGMA_R = 15.0;
+// Chroma Denoise edge test — mirrors CHROMA_EDGE_LO/HI in lab/logic.py.
+const CHROMA_EDGE_LO = 1.0;
+const CHROMA_EDGE_HI = 2.5;
 
 // Working-space TRC (Adobe RGB: pure 563/256 gamma). Lab is the encoded->linear
 // transition: input samples are decoded; the highlight/sharpen perceptual domain uses the same TRC.
@@ -317,35 +319,22 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let coords = vec2<i32>(i32(gid.x), i32(gid.y));
     var color = load_lin(coords);
 
-    // 1. Chroma Denoise
-    // Variable-radius bilateral filter on the CIELAB a*/b* channels. The Fibonacci-disk
-    // taps (weighted exp(-r^2 * 2)) approximate a Gaussian of sigma = radius / 2, so
-    // radius = 2 * chroma_denoise * scale_factor matches the CPU path's sigmaSpace of
-    // (chroma_denoise * scale_factor). The range term rejects taps whose chroma differs
-    // from the centre — without it an isotropic blur bleeds a saturated object's color
-    // outward as a halo. L1 chroma distance mirrors OpenCV's bilateralFilter so the two
-    // paths stay in parity. Weights are normalised by their own sum (not BLOOM_GAUSS_SUM,
-    // which still serves the fixed-weight glow/halation taps below).
-    if (params.chroma_denoise > 0.0) {
-        let radius = 2.0 * params.chroma_denoise * params.scale_factor;
-        if (radius >= 0.5) {
-            let current_lab = rgb_to_lab(color);
-            var blur_ab = current_lab.yz;
-            var wsum = 1.0;
-            for (var tap = 0; tap < 64; tap++) {
-                let offset = FIBONACCI_64[tap];
-                let s_coord = clamp(coords + vec2<i32>(offset * radius), vec2<i32>(0), vec2<i32>(dims) - 1);
-                let s_lab = rgb_to_lab(load_lin(s_coord));
-                let r = length(offset);
-                let d = s_lab.yz - current_lab.yz;
-                let dc = abs(d.x) + abs(d.y);
-                let w = exp(-r * r * 2.0) * exp(-dc * dc / (2.0 * CHROMA_DENOISE_SIGMA_R * CHROMA_DENOISE_SIGMA_R));
-                blur_ab += s_lab.yz * w;
-                wsum += w;
-            }
-            blur_ab = blur_ab / wsum;
-            color = lab_to_rgb(vec3<f32>(current_lab.x, blur_ab.x, blur_ab.y));
-        }
+    // 1. Chroma Denoise — mirrors apply_chroma_denoise in logic.py. chroma_tex holds the
+    // low-pass a*/b*; chroma above it is kept only where the low band's own gradient marks
+    // a color edge (central differences, clamped like the CPU's edge-replicated pad).
+    if (params.chroma_radius_px > 0.0) {
+        let lo = vec2<i32>(0);
+        let hi = vec2<i32>(dims) - 1;
+        let low = textureLoad(chroma_tex, coords, 0).xy;
+        let gx = (textureLoad(chroma_tex, clamp(coords + vec2<i32>(1, 0), lo, hi), 0).xy
+            - textureLoad(chroma_tex, clamp(coords - vec2<i32>(1, 0), lo, hi), 0).xy) * 0.5;
+        let gy = (textureLoad(chroma_tex, clamp(coords + vec2<i32>(0, 1), lo, hi), 0).xy
+            - textureLoad(chroma_tex, clamp(coords - vec2<i32>(0, 1), lo, hi), 0).xy) * 0.5;
+        let g = sqrt(dot(gx, gx) + dot(gy, gy)) * params.chroma_denoise * params.scale_factor;
+        let keep = smoothstep(CHROMA_EDGE_LO, CHROMA_EDGE_HI, g);
+        let current_lab = rgb_to_lab(color);
+        let ab = low + keep * (current_lab.yz - low);
+        color = lab_to_rgb(vec3<f32>(current_lab.x, ab.x, ab.y));
     }
 
     // 2. Global Saturation (CIELAB chroma scaling — preserves L*; gamut-aware

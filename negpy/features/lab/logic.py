@@ -311,34 +311,56 @@ def _saturation_block(img: ImageBuffer, saturation: float, skin_protection: floa
     return ensure_image(np.clip(res_rgb, 0.0, 1.0))
 
 
-# Chroma-similarity sigma for the denoise range term, in CIELAB a*/b* units. Taps further
-# than this in chroma are rejected, so a saturated object cannot bleed color past its own
-# edge. Mirrored as a WGSL literal in lab.wgsl.
-CHROMA_DENOISE_SIGMA_R = 15.0
+# Chroma Denoise edge test: the low band's gradient times sigma, in CIELAB a*/b* units. Chroma
+# above the cutoff is kept from LO, fully from HI. Mirrored as WGSL literals in lab.wgsl.
+CHROMA_EDGE_LO = 1.0
+CHROMA_EDGE_HI = 2.5
+# Below this blur sigma (px) both engines skip the stage.
+CHROMA_DENOISE_MIN_SIGMA = 0.25
+
+
+def chroma_edge_keep(low_ab: np.ndarray, sigma: float) -> np.ndarray:
+    """How much of the chroma above the cutoff a pixel keeps (0 to 1). Central differences on the
+    edge-replicated low band, as the shader reads it with clamped coordinates."""
+    gx = cv2.filter2D(low_ab, -1, _CENTRAL_DIFF, borderType=cv2.BORDER_REPLICATE)
+    gy = cv2.filter2D(low_ab, -1, _CENTRAL_DIFF.T, borderType=cv2.BORDER_REPLICATE)
+    sq = gx * gx
+    sq += gy * gy
+    g = np.sqrt(sq[:, :, 0] + sq[:, :, 1])
+    g *= np.float32(sigma / (CHROMA_EDGE_HI - CHROMA_EDGE_LO))
+    g -= np.float32(CHROMA_EDGE_LO / (CHROMA_EDGE_HI - CHROMA_EDGE_LO))
+    t = np.clip(g, 0.0, 1.0, out=g)
+    return t * t * (3.0 - 2.0 * t)
+
+
+_CENTRAL_DIFF = np.array([[-0.5, 0.0, 0.5]], dtype=np.float32)
+
+
+def chroma_denoise_sigma(radius: float, scale_factor: float) -> float:
+    """The low-pass sigma in render pixels for both engines; 0.0 when the stage does not run."""
+    sigma = radius * scale_factor
+    return sigma if sigma >= CHROMA_DENOISE_MIN_SIGMA else 0.0
 
 
 def apply_chroma_denoise(img: ImageBuffer, radius: float, scale_factor: float = 1.0) -> ImageBuffer:
     """
-    Edge-aware smoothing of A and B in LAB space to reduce color noise. Weighting taps
-    by chroma similarity as well as distance stops the isotropic blur this replaced from
-    blooming a saturated object's color into its surroundings.
+    Band split of CIELAB a*/b* (Fuji, US 5,739,922): chroma above a Gaussian cutoff is noise or
+    grain, except where it belongs to a color edge. L* is untouched, so grain stays as luminance.
     """
-    if radius <= 0:
+    sigma = chroma_denoise_sigma(radius, scale_factor)
+    if sigma == 0.0:
         return img
 
     lab = rgb_to_lab_working(img.astype(np.float32))
-    l_chan, a, b = cv2.split(lab)
+    ab = np.ascontiguousarray(lab[:, :, 1:3])
+    k = gaussian_kernel_1d(sigma)
+    low = cv2.sepFilter2D(ab, -1, k, k)
+    ab -= low
+    ab *= chroma_edge_keep(low, sigma)[:, :, None]
+    ab += low
+    lab[:, :, 1:3] = ab
 
-    sigma = radius * scale_factor
-    # bilateralFilter takes 1 or 3 channels, and the zero plane adds nothing to the L1 range
-    # distance. d<=0 lets OpenCV derive the window from sigmaSpace.
-    ab = cv2.merge([a, b, np.zeros_like(a)])
-    smoothed = cv2.bilateralFilter(ab, 0, CHROMA_DENOISE_SIGMA_R, sigma)
-
-    res_lab = cv2.merge([l_chan, smoothed[:, :, 0], smoothed[:, :, 1]])
-    res_rgb = lab_to_rgb_working(res_lab)
-
-    return ensure_image(np.clip(res_rgb, 0.0, 1.0))
+    return ensure_image(np.clip(lab_to_rgb_working(lab), 0.0, 1.0))
 
 
 # Halation mask threshold in LINEAR reflectance: the regions the negative rendered dense,

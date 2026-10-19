@@ -11,7 +11,7 @@ from dataclasses import replace
 import pytest
 
 from negpy.domain.models import WorkspaceConfig
-from negpy.features.process.logic import effective_linear_raw, linear_raw_token, narrowband_profile_active, should_fold_camera_wb
+from negpy.features.process.logic import effective_linear_raw, linear_raw_token, should_fold_camera_wb
 from negpy.features.process.models import ProcessConfig, ProcessMode
 
 
@@ -66,33 +66,8 @@ class TestPositiveSource:
         assert not ProcessConfig().positive_source
 
 
-class TestNarrowbandProfileActive:
-    """Narrowband is a property of the light, but its profile is a claim about the film.
-
-    RGBScan.icc characterises narrowband capture of *negative* dyes. On a slide it is a
-    fixed 3x3 derived from the wrong dye set, and narrowband sampling at three isolated
-    wavelengths never measures the spectral integration the eye performs, so no input
-    profile recovers it. Refused for E-6 rather than approximated.
-    """
-
-    @pytest.mark.parametrize("positive_source", [True, False])
-    def test_a_slide_never_takes_the_profile(self, positive_source):
-        """Positive changes the render path, not the dye set."""
-        assert not narrowband_profile_active(replace(cfg(ProcessMode.E6, positive_source=positive_source), narrowband_scan=True))
-
-    @pytest.mark.parametrize("mode", [ProcessMode.C41, ProcessMode.BW])
-    def test_every_negative_keeps_it(self, mode):
-        assert narrowband_profile_active(replace(cfg(mode), narrowband_scan=True))
-
-    def test_the_toggle_still_has_to_be_on(self):
-        assert not narrowband_profile_active(cfg(ProcessMode.C41))
-
-
 class TestShouldFoldCameraWb:
-    """A narrowband capture's as-shot WB describes a continuous-spectrum scene it never
-    had, so the capture matrix must never fold it back in — not a milder version of the
-    ordinary fold, its own separate condition on top of effective_linear_raw.
-    """
+    """The capture matrix folds the as-shot multipliers back in only where the decode left them out."""
 
     def test_folds_for_an_ordinary_transfer(self):
         assert should_fold_camera_wb(cfg(ProcessMode.E6, linear_raw=False))
@@ -100,19 +75,8 @@ class TestShouldFoldCameraWb:
     def test_folds_when_the_user_flag_is_on(self):
         assert should_fold_camera_wb(cfg(ProcessMode.C41, linear_raw=True))
 
-    def test_never_folds_for_narrowband_even_though_the_decode_is_neutral(self):
-        assert not should_fold_camera_wb(replace(cfg(ProcessMode.C41, linear_raw=True), narrowband_scan=True))
-
-    def test_a_narrowband_flag_left_on_from_a_negative_still_folds_on_a_slide(self):
-        """The flag is remembered across a mode switch and greyed out on a slide, where no
-        narrowband correction applies (narrowband_profile_active). Skipping the fold there
-        renders the slide unbalanced, the same tint the fold exists to prevent."""
-        assert should_fold_camera_wb(replace(cfg(ProcessMode.E6), narrowband_scan=True))
-
-    def test_narrowband_does_not_matter_when_the_decode_already_carries_wb(self):
-        """Nothing to un-fold: the decode applied WB itself, so the matrix must stay out
-        of it regardless of the light — same as the non-narrowband case."""
-        assert not should_fold_camera_wb(replace(cfg(ProcessMode.C41, linear_raw=False), narrowband_scan=True))
+    def test_never_folds_when_the_decode_already_carries_wb(self):
+        assert not should_fold_camera_wb(cfg(ProcessMode.C41, linear_raw=False))
 
     def test_never_folds_when_reconstruction_bakes_white_balance_in(self):
         """An active reconstruction on the transfer path bakes real white balance into the
@@ -133,9 +97,8 @@ class TestDecodeAndMatrixAgree:
 
     def test_both_sides_read_one_helper(self):
         """The decode asks effective_linear_raw directly; both matrix consumers ask
-        should_fold_camera_wb, which is effective_linear_raw plus one more condition
-        (not narrowband_scan — see TestShouldFoldCameraWb below). Either way, both sides
-        of the agreement trace back to the one flag."""
+        should_fold_camera_wb, which wraps it. Either way, both sides of the agreement
+        trace back to the one flag."""
         import inspect
 
         from negpy.features.transparency import processor as cpu

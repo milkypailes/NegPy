@@ -22,7 +22,6 @@ from negpy.features.process.models import ProcessConfig, ProcessMode
 def cfg(
     mode=ProcessMode.C41,
     level=0,
-    narrowband_scan=False,
     positive_source=False,
     linear_raw=False,
 ) -> ProcessConfig:
@@ -30,7 +29,6 @@ def cfg(
         ProcessConfig(),
         process_mode=mode,
         highlight_reconstruction=level,
-        narrowband_scan=narrowband_scan,
         positive_source=positive_source,
         linear_raw=linear_raw,
     )
@@ -57,11 +55,6 @@ class TestEffectiveHighlightReconstruction:
         """1 (Ignore) is reserved for a separate decode-correctness fix and must never be
         passed here; anything else out of libraw's 0/2-9 range is a bogus/corrupt value."""
         assert effective_highlight_reconstruction(cfg(ProcessMode.E6, level)) == 0
-
-    def test_narrowband_forces_off_even_on_a_slide(self):
-        """A triplet's single raw channel per exposure has no 'highlight color' to
-        reconstruct — same reasoning should_fold_camera_wb applies to the WB fold."""
-        assert effective_highlight_reconstruction(cfg(ProcessMode.E6, 5, narrowband_scan=True)) == 0
 
     def test_the_token_follows_the_effective_value_not_the_stored_one(self):
         """A stale value off E-6 must not be able to change the cache key even though it
@@ -100,9 +93,6 @@ class TestHighlightReconstructionBakesWb:
     @pytest.mark.parametrize("mode", [ProcessMode.C41, ProcessMode.BW])
     def test_off_on_a_negative(self, mode):
         assert not highlight_reconstruction_bakes_wb(cfg(mode, level=5))
-
-    def test_off_under_narrowband(self):
-        assert not highlight_reconstruction_bakes_wb(cfg(ProcessMode.E6, level=5, narrowband_scan=True))
 
     def test_token_catches_what_linear_raw_token_alone_would_miss(self):
         """The explicit Linear RAW toggle and the transfer path's own default neutral

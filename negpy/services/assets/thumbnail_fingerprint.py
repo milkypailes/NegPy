@@ -12,7 +12,7 @@ from typing import Any, Optional
 from negpy.domain.models import WorkspaceConfig
 
 # Bump in any change that alters rendered pixels for unchanged settings, a changed default included.
-THUMBNAIL_RENDER_VERSION = 4
+THUMBNAIL_RENDER_VERSION = 13
 
 # Marks a thumbnail made from the source preview, which runs none of the frame's settings.
 QUICK = "quick"
@@ -22,9 +22,12 @@ _COMMENT_PREFIX = "negpy-thumb:"
 # Sections that never reach the pixels; every other section counts as shaping the thumbnail.
 NON_PIXEL_SECTIONS = frozenset({"metadata", "export"})
 
-# Fields left out of a hashed section: export-only, labels, and detail too fine for a thumbnail.
+# Fields left out of a hashed section: export-only, labels, detail too fine for a thumbnail, and the
+# meter rect, which the source and geometry decide and whose effect lands in the stored bounds.
 _UNHASHED_FIELDS: dict[str, frozenset[str]] = {
-    "process": frozenset({"demosaic_export", "roll_name", "baseline_source", "demosaic_preview", "crosstalk_profile"}),
+    "process": frozenset(
+        {"demosaic_export", "roll_name", "baseline_source", "demosaic_preview", "crosstalk_profile", "meter_rect", "meter_key"}
+    ),
     "lab": frozenset({"sharpen", "sharpen_method", "sharpen_radius", "sharpen_masking", "chroma_denoise"}),
 }
 

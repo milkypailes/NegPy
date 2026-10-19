@@ -203,7 +203,7 @@ def test_a_roll_sensor_matrix_is_locked_out_of_the_merged_frame(tmp_path):
     red, green, blue = _triplet(folder)
     new_path = str(folder / "IMG_1_RGB.tif")
     roll_id = rolls.recognize_folder(repo, str(folder))
-    rolls.set_roll_defaults(repo, roll_id, sensor_matrix=_MATRIX, linear_raw=True, narrowband_scan=True)
+    rolls.set_roll_defaults(repo, roll_id, sensor_matrix=_MATRIX, linear_raw=True)
     cfg = _triplet_config(green, blue)
 
     carry_edit(repo, "red", red, "new", new_path, [green, blue], cfg, "rgb")
@@ -211,7 +211,7 @@ def test_a_roll_sensor_matrix_is_locked_out_of_the_merged_frame(tmp_path):
     assert "sensor" in rolls.frame_override_cards(repo, roll_id, "new")
     resolved = rolls.resolve_roll_config(repo, roll_id, "new", repo.load_file_settings("new"))
     assert resolved.process.sensor_matrix is None
-    assert resolved.process.narrowband_scan is True
+    assert resolved.process.linear_raw is True
 
 
 def test_a_sidecar_moves_only_when_the_red_exposure_has_one(tmp_path):
@@ -232,7 +232,7 @@ def _finish(tmp_path, monkeypatch, results, trash=True):
     from negpy.desktop.controller import AppController
 
     trashed: list = []
-    monkeypatch.setattr("negpy.desktop.controller._move_to_trash", lambda p: trashed.append(p) or True)
+    monkeypatch.setattr("negpy.desktop.controller.move_to_trash", lambda p: trashed.append(p) or "")
     ctrl = MagicMock()
     ctrl.session.repo = _repo(tmp_path)
     ctrl._frame_merge_trash = trash
@@ -461,7 +461,7 @@ def test_a_roll_flat_field_is_locked_out_of_a_merged_stitch(tmp_path):
     primary, part, _b = _triplet(folder)
     new_path = str(folder / "IMG_1_STITCH.tif")
     roll_id = rolls.recognize_folder(repo, str(folder))
-    rolls.set_roll_defaults(repo, roll_id, apply=True, profile_id="ff", sensor_matrix=_MATRIX, narrowband_scan=True)
+    rolls.set_roll_defaults(repo, roll_id, apply=True, profile_id="ff", sensor_matrix=_MATRIX, linear_raw=True)
 
     carry_edit(repo, "digest#stitch", primary, "new", new_path, [part], _stitch_config(primary, part), "stitch")
 
@@ -469,7 +469,7 @@ def test_a_roll_flat_field_is_locked_out_of_a_merged_stitch(tmp_path):
     resolved = rolls.resolve_roll_config(repo, roll_id, "new", repo.load_file_settings("new"))
     assert resolved.flatfield.apply is False
     assert resolved.process.sensor_matrix is None
-    assert resolved.process.narrowband_scan is True
+    assert resolved.process.linear_raw is True
 
 
 def test_carry_edit_writes_a_row_even_when_the_composite_had_none(tmp_path):
@@ -617,7 +617,7 @@ def test_a_saved_row_is_still_resolved_against_the_roll(tmp_path):
     red, green, blue = _triplet(folder)
     new_path = str(folder / "IMG_1_RGB.tif")
     roll_id = rolls.recognize_folder(repo, str(folder))
-    rolls.set_roll_defaults(repo, roll_id, sensor_matrix=_MATRIX, narrowband_scan=True, linear_raw=True)
+    rolls.set_roll_defaults(repo, roll_id, sensor_matrix=_MATRIX, linear_raw=True)
     # A row that predates the roll defaults.
     cfg = _triplet_config(green, blue)
     repo.save_file_settings("red", cfg, file_path=red)
@@ -626,7 +626,6 @@ def test_a_saved_row_is_still_resolved_against_the_roll(tmp_path):
 
     resolved = rolls.resolve_roll_config(repo, roll_id, "new", repo.load_file_settings("new"))
     assert resolved.process.sensor_matrix is None
-    assert resolved.process.narrowband_scan is True
     assert resolved.process.linear_raw is True
 
 

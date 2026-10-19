@@ -141,6 +141,15 @@ def part_paths(entries: Any) -> set:
     return out
 
 
+def source_files(asset: dict) -> list:
+    """Every file one Film Strip frame is made of: its primary, a triplet's green and blue,
+    a composite's parts and their triplets."""
+    paths = [asset.get("path"), asset.get("green_path"), asset.get("blue_path")]
+    paths += [*(asset.get("stitch_paths") or ()), *(asset.get("hdr_paths") or ())]
+    paths += [p for t in asset.get("stitch_triplets") or () for p in t]
+    return [p for p in dict.fromkeys(paths) if p]
+
+
 def rehome_paths(repo: Any, move: Callable[[str], str]) -> None:
     """Pass every primary and part path of every composite through *move*."""
     saved = saved_composites(repo)

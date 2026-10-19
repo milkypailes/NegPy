@@ -38,6 +38,9 @@ class PipelineContext:
     # without white balance (Linear RAW). None when WB was applied at decode.
     camera_wb: Optional[list] = None
     cache_stages: bool = True
+    # Whether the caller reads the Analysis metrics back. A render that does not (a splash, a
+    # thumbnail, a test strip) skips measurements that only the Analysis panel shows.
+    readback_metrics: bool = True
 
 
 class IImageSource(Protocol):

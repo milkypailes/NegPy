@@ -57,7 +57,9 @@ the camera in the linear capture. **Hue Trim** rotates hue for an odd light spec
 >   **Single-Shot Narrowband Calibration** applied. A broadband light and a Bayer sensor
 >   add mixing that a dyes-only matrix cannot model.
 > - Consumer datasheets usually publish one *aggregate* midscale-neutral curve, not
->   separate C/M/Y curves, so even the dye part is read off a plot by eye.
+>   separate C/M/Y curves. For the Kodak films, Kodak's Vision3 dye curves are fitted to
+>   that curve, which assumes the film's masking couplers match Vision3's. The other
+>   consumer matrices are read off the plot by eye.
 >
 > On a narrowband rig they still beat identity, but a matrix you tune yourself is more
 > trustworthy. Bundled matrices are read-only. Use **Make Editable Copy** to start from one.
@@ -157,8 +159,8 @@ You need no spectral data or spectrophotometer to beat *Generic C41*:
 2. Start on **Generic C41** and raise **Strength** until the colors separate, before they
    go garish. On many rigs this is enough.
 3. Still wrong in a specific way? Open the matrix editor, press **Make Editable Copy**, and
-   change the off-diagonal term for the pair that is off. Green leaking into red is
-   `out R / in G`. Change one term at a time, in small steps. `0.02` is visible.
+   change the mixing term for the pair that is off. Green leaking into red is **Red ›
+   From Green**. Change one term at a time, in small steps. `0.02` is visible.
 4. Name it after the **combination**, for example `Gold 200 + Spectracolor`. Re-run **Roll
    Analysis** and check it on a second frame.
 
@@ -172,14 +174,41 @@ The **sliders icon** beside the dropdown opens the **matrix editor**:
 
 - Browse every profile. Bundled matrices and **Generic C41** show a lock and are
   **read-only**. Your own profiles are editable.
-- Drag the off-diagonal grid sliders (`out R/G/B` × `in R/G/B`) and the preview updates live.
-  Row normalization makes the diagonal redundant, so only the six mixing terms are
-  editable. The **Preview strength** slider controls only this preview. The sidebar
-  **Strength** slider applies the matrix.
+- Each channel (**Red**, **Green**, **Blue**) has two sliders, **From** each other channel,
+  from −1 to 1, and the preview updates live. Row normalization makes the diagonal
+  redundant, so only the six mixing terms are editable. The **Preview Strength** slider
+  controls only this preview. The sidebar **Strength** slider applies the matrix.
 - **Make Editable Copy** clones the selected locked matrix into an editable profile.
 - **Save** writes the profile as a `.toml` into `<Documents>/NegPy/crosstalk/`, so it shows
   in the dropdown.
 - **Apply & Close** keeps what you were previewing. **Cancel** reverts.
+
+### Measuring from a chart
+
+A chart shot on the film is the one reference that settles a matrix. Shoot a SpyderCheckr 24 or
+a ColorChecker 24 in daylight on a frame of the roll, scan it on your rig, and open it. The
+**swatch button** beside the dropdown opens **Measure from Chart** (Color Negative only).
+
+1. Drag the four dots onto the centers of the chart's four corner patches. The dot order and the
+   chart's way up do not matter: NegPy reads the grid every way, sideways and mirrored included,
+   and keeps the one whose colors match the chart.
+2. Name the profile after the combination and press **Measure and Save**.
+
+The fit starts from identity and runs the frame's own render for every trial matrix, so
+normalization and Cast Removal re-meter each time. It prints on the Digital stock, so a paper's dyes
+stay out of the rig's matrix. It minimizes CIEDE2000 against the chart's
+published values (D50, adapted to the render's D65), with lightness at half weight because the
+print curve owns tone, and a small pull toward identity. One exposure gain matches the mid grays
+first. The result is saved with `type = "measured"` and applied at Strength 1. Re-run **Roll
+Analysis** on the other frames.
+
+After the fit, each sample box shows its patch's color ΔE00 to the chart's value: the hue and
+chroma difference, with lightness left out because the print curve sets it. Green is within 2,
+amber within 5, red beyond. Moving a dot clears them.
+
+A matrix measured on one stock under one light describes that pair only. The sensor unmix runs
+before Crosstalk, so the fit measures only what the frame's sensor profile leaves; measure again
+if you change that profile.
 
 ## Contributing a matrix
 

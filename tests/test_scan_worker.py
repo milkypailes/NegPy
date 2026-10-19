@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import threading
+from collections.abc import Callable, Iterable, Iterator
 from typing import Any
 
 import pytest
@@ -81,7 +82,7 @@ class _BatchService:
         self.eject_calls.append(device_id)
         return True
 
-    def detect_frames(self, device_id: str, *, film_format: str | None = None) -> int:
+    def detect_frames(self, device_id: str, *, film_format: str | None = None, film_type: str = "negative") -> int:
         self.detect_calls.append(film_format)
         return self.detected
 
@@ -239,6 +240,39 @@ def test_scan_worker_reports_eject_failure() -> None:
 
     assert service.calls == ["coolscan3:test"]
     assert errors == ["transport refused"]
+
+
+class _PollService:
+    def __init__(self, loaded: bool | None = True, error: Exception | None = None) -> None:
+        self.loaded = loaded
+        self.error = error
+
+    def media_loaded(self, device_id: str) -> bool | None:
+        if self.error is not None:
+            raise self.error
+        return self.loaded
+
+
+def test_the_film_poll_reports_the_state() -> None:
+    worker = ScanWorker()
+    worker._service = _PollService(loaded=False)  # type: ignore[assignment]
+    polled: list[tuple[str, bool | None]] = []
+    worker.media_polled.connect(lambda device_id, loaded: polled.append((device_id, loaded)))
+
+    worker.poll_media("nkscan:test")
+
+    assert polled == [("nkscan:test", False)]
+
+
+def test_a_failed_film_poll_reports_no_state() -> None:
+    worker = ScanWorker()
+    worker._service = _PollService(error=RuntimeError("transport refused"))  # type: ignore[assignment]
+    polled: list[tuple[str, bool | None]] = []
+    worker.media_polled.connect(lambda device_id, loaded: polled.append((device_id, loaded)))
+
+    worker.poll_media("nkscan:test")
+
+    assert polled == [("nkscan:test", None)]
 
 
 def test_progress_without_a_phase_is_reported_as_scanning() -> None:
@@ -565,7 +599,9 @@ class _FakeRollSession:
     def set_offset(self, slot: int, offset: float) -> None:
         self.offsets[slot] = offset
 
-    def preview(self, slots, *, cancel):
+    def preview(
+        self, slots: Iterable[int], *, cancel: threading.Event, progress: Callable[..., None] | None = None
+    ) -> Iterator[RollPreview]:
         for slot in slots:
             if self._cancel_at == slot:
                 cancel.set()
@@ -663,7 +699,9 @@ def test_run_roll_preview_reports_a_failure_to_open_the_strip() -> None:
 
 def test_run_roll_preview_closes_the_session_when_a_slot_raises() -> None:
     class _Exploding(_FakeRollSession):
-        def preview(self, slots, *, cancel):
+        def preview(
+            self, slots: Iterable[int], *, cancel: threading.Event, progress: Callable[..., None] | None = None
+        ) -> Iterator[RollPreview]:
             yield RollPreview(slot=1, rgb=object())
             raise RuntimeError("transport died")
 

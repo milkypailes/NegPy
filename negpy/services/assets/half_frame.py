@@ -300,7 +300,7 @@ def remap_workspace_config(config: "WorkspaceConfig", half: int, old_geom: HalfG
         ),
         local=replace(config.local, masks=masks),
         geometry=replace(geometry, crop_rect=None) if geometry.crop_rect is not None else geometry,
-        process=replace(config.process, analysis_rect=None) if config.process.analysis_rect is not None else config.process,
+        process=replace(config.process, analysis_rect=None, meter_rect=None, meter_key=""),
     )
 
 

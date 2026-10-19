@@ -5,7 +5,7 @@ import numpy as np
 
 from negpy.domain.interfaces import PipelineContext
 from negpy.domain.types import ImageBuffer
-from negpy.features.exposure.analysis import density_histogram
+from negpy.features.exposure.analysis import density_histogram, density_parade, scan_full_scale_columns
 from negpy.features.exposure.logic import cast_solve_inputs, filtration_offsets, neutral_axis_affine
 from negpy.features.exposure.models import EXPOSURE_CONSTANTS, ExposureConfig
 from negpy.features.exposure.normalization import (
@@ -99,7 +99,9 @@ class TransparencyBaseProcessor:
         # space than the GPU's. Pre-trim bounds, so a White/Black Point nudge cannot
         # perturb it.
         if self.cast_strength > 0.0:
-            context.metrics["neutral_axis_refs"] = measure_neutral_axis_from_log(prefiltered, pre_trim_bounds, None, 0.0)
+            context.metrics["neutral_axis_refs"] = measure_neutral_axis_from_log(
+                prefiltered, pre_trim_bounds, None, 0.0, exclude_subjects=False
+            )
 
         # Auto Density and Auto Grade meter against the same fixed pre-trim window.
         context.metrics["metered_anchor"] = measure_anchor_from_log(
@@ -113,9 +115,16 @@ class TransparencyBaseProcessor:
         context.metrics["log_bounds_base"] = bounds
         context.metrics["final_bounds"] = bounds
         context.metrics["norm_density_range"] = luminance_density_range(bounds)
+        context.metrics["density_above_base"] = None  # a slide has no clear base to read above
         context.metrics["scan_clip_fractions"] = measure_clip_fractions(image, context.active_roi, self.config.analysis_buffer)
         context.metrics["normalized_log"] = res
         context.metrics["histogram_density"] = density_histogram(res, context.active_roi)
+        # The Crop tool shows the whole frame, so the parade's columns span it too (the GPU's full_frame).
+        # Export and batch thumbnails render with stage caching off and skip it.
+        if context.cache_stages:
+            parade_roi = None if context.crop_preview_full else context.active_roi
+            context.metrics["density_parade"] = density_parade(img_log, parade_roi)
+            context.metrics["scan_full_scale"] = scan_full_scale_columns(image, parade_roi)
         return res
 
 
@@ -163,11 +172,9 @@ class TransferProcessor:
             self.config.highlight_magenta * cmy_max,
             self.config.highlight_yellow * cmy_max,
         )
-        # Shadow refs stay out: the P98 tie is calibrated for a negative. With no neutral
-        # axis this solves to the identity and the capture passes through.
-        strength, _shadow_refs_norm, neutral_axis_norm = cast_solve_inputs(
+        # With no neutral axis this solves to the identity and the capture passes through.
+        strength, neutral_axis_norm = cast_solve_inputs(
             final_bounds,
-            None,
             context.metrics.get("neutral_axis_refs"),
             self.config.cast_removal_strength,
         )

@@ -58,12 +58,15 @@ class GPUCanvasWidget(QWidget):
         self.pan_y: float = 0.0
         self._bg: Tuple[float, float, float] = (0.02, 0.02, 0.02)
         self.fit_height_reserve: float = 0.0
+        # Logical px kept clear on every side of the fit area.
+        self.fit_margin: float = 0.0
 
         # Debounce resize to prevent context thrashing
         self.resize_timer = QTimer()
         self.resize_timer.setSingleShot(True)
         self.resize_timer.setInterval(50)
         self.resize_timer.timeout.connect(self._perform_resize)
+        self._force_drawing = False
 
     def _configure_context(self) -> None:
         """
@@ -222,6 +225,14 @@ class GPUCanvasWidget(QWidget):
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
+        # Bitmap present paints the last frame stretched to the new size until a new one lands.
+        # On macOS force_draw pumps events, so a nested resize waits for resize_timer.
+        if self.current_texture_view is not None and not self._force_drawing:
+            self._force_drawing = True
+            try:
+                self.canvas.force_draw()
+            finally:
+                self._force_drawing = False
         self.resize_timer.start()
 
     def event(self, event) -> bool:
@@ -451,8 +462,9 @@ class GPUCanvasWidget(QWidget):
 
             dpr = self.devicePixelRatioF()
             reserve_px = self.fit_height_reserve * dpr
+            margin_px = 2.0 * self.fit_margin * dpr
             fit_h = max(1.0, wh - reserve_px)
-            r = min(ww / iw, fit_h / ih)
+            r = min(max(1.0, ww - margin_px) / iw, max(1.0, fit_h - margin_px) / ih)
             nw, nh = iw * r, ih * r
 
             nx = (ww - nw) / 2.0

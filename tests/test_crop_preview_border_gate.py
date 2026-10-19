@@ -35,6 +35,7 @@ class TestNegativePeekFramesLikeTheTools(unittest.TestCase):
         )
         stub = SimpleNamespace(state=state, image_updated=MagicMock())
         stub._store_peek_frame = partial(AppController._store_peek_frame, stub)
+        stub._peek_context = partial(AppController._peek_context, stub)
         AppController._paint_negative_peek(stub)
         return state.peek_frame
 

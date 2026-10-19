@@ -14,6 +14,8 @@ from tests.conftest import FakeController, FakeRepo, dialog_classes
 NEGPY = Path(__file__).resolve().parents[1] / "negpy"
 KEY = "dialog_geometry_probe"
 FIXED_SIZE = {"ProgressDialog", "CommandPalette"}
+# A dialog that keeps its size in memory only: an app exit drops it, so it does not persist geometry.
+IN_MEMORY_ONLY = {"PickBetterWindow"}
 # Callables that pass the store on to a dialog they build.
 FORWARDERS = {"resolve_other_gear_pick", "GearItemsPanel", "GearPresetsPanel"}
 SIZING = {"resize", "setMinimumSize", "setMinimumWidth", "setWindowFlags", "float_over_app"}
@@ -45,11 +47,14 @@ def test_every_resizable_dialog_remembers_its_geometry():
     dialogs = {cls.name: (path, cls) for path, cls in dialog_classes()}
     assert {"PreferencesDialog", "ShortcutEditorDialog", "CrosstalkEditorDialog", "RgbTripletDialog", "LiveViewWindow"} <= set(dialogs)
     assert FIXED_SIZE <= set(dialogs)
+    assert IN_MEMORY_ONLY <= set(dialogs)
     missing = []
     for name, (path, cls) in dialogs.items():
         if name in FIXED_SIZE:
             fixed = any(_callee(c) in ("setFixedWidth", "setFixedSize") and _on_self(c) for c in _calls(cls))
             assert fixed, f"{name} no longer fixes its own size, so it needs remember_dialog_geometry"
+        elif name in IN_MEMORY_ONLY:
+            continue
         elif _remember_call(cls) is None:
             missing.append(f"{path.name}: {name}")
     assert not missing, f"dialogs that do not call remember_dialog_geometry in __init__: {missing}"

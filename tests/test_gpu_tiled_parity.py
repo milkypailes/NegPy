@@ -172,6 +172,30 @@ class TestGpuTiledParity(unittest.TestCase):
             self.assertEqual(res.shape[:2], (paper_h, paper_w))
             self.assertEqual(metrics["content_rect"], (off_x, off_y, content_w, content_h))
 
+    def test_tiled_original_export_ignores_texture_cap(self):
+        """The tiled paper is a host buffer: the GPU texture cap must not shrink it."""
+        from unittest.mock import patch
+
+        from negpy.kernel.system.config import APP_CONFIG
+
+        with patch.object(APP_CONFIG, "max_texture_size", 1024):
+            res = self._tiled(_base())
+        self.assertEqual(res.shape[:2], self.img.shape[:2])
+
+    def test_export_paper_over_texture_cap_keeps_its_size(self):
+        """A source under the cap whose Pixels paper is over it tiles at full size."""
+        from unittest.mock import patch
+
+        from negpy.kernel.system.config import APP_CONFIG
+
+        base = _base()
+        settings = replace(base, export=replace(base.export, export_resolution_mode="target_px", export_target_long_edge_px=1200))
+        img = self.img[:, :800]
+        with patch.object(APP_CONFIG, "max_texture_size", 1024):
+            res, metrics = self.engine.process(img, settings, scale_factor=1.0, readback_metrics=False)
+        self.assertEqual(max(res.shape[:2]), 1200)
+        self.assertEqual(metrics["content_rect"][2:], (res.shape[1], res.shape[0]))
+
 
 # A real camera's XYZ->camera rows and as-shot multipliers, so the transfer path's
 # working-space meter grid differs from the camera-space one.

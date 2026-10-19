@@ -23,7 +23,7 @@ from types import SimpleNamespace
 import pytest
 from PyQt6.QtCore import QObject, pyqtSignal
 from PyQt6.QtGui import QValidator
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QWidget
 
 from negpy.desktop.view.sidebar.scan import ScanCaptureMode, ScanSidebar, estimated_frame_bytes
 from negpy.desktop.view.styles.theme import THEME
@@ -134,6 +134,7 @@ class _FakeController(QObject):
     scan_ejected = pyqtSignal(bool)
     scan_eject_error = pyqtSignal(str)
     scan_strip_returned = pyqtSignal(bool)
+    scan_media_polled = pyqtSignal(str, object)
     scan_exposure_metered = pyqtSignal(object, int)
     scan_meter_error = pyqtSignal(str)
 
@@ -142,6 +143,7 @@ class _FakeController(QObject):
         self.session = SimpleNamespace(repo=_FakeRepo(settings))
         self.started: list[tuple[str, object]] = []
         self.ejected_ids: list[str] = []
+        self.polled_ids: list[str] = []
         self.device_requests = 0
         self.backend_requests: list[str] = []
         self.cancels = 0
@@ -166,6 +168,9 @@ class _FakeController(QObject):
 
     def eject_scanner(self, device_id: str) -> None:
         self.ejected_ids.append(device_id)
+
+    def poll_scanner_media(self, device_id: str) -> None:
+        self.polled_ids.append(device_id)
 
 
 _OUT = tempfile.gettempdir()  # an existing absolute folder: Scan refuses any other
@@ -1085,6 +1090,62 @@ def test_a_returned_strip_not_back_in_asks_for_it_again() -> None:
 
     assert sidebar.settings.selected_frames == ()
     assert sidebar.status_strip.message() == "The scanner returned the strip while idle — insert it again"
+
+
+def test_film_removed_outside_negpy_drops_the_frame_selection() -> None:
+    sidebar, controller = _sidebar(FULL_DEVICE)
+    controller.scan_media_polled.emit(FULL_DEVICE.id, True)
+    sidebar.settings = replace(sidebar._settings, selected_frames=(1, 3))
+
+    controller.scan_media_polled.emit(FULL_DEVICE.id, False)
+
+    assert sidebar.settings.selected_frames == ()
+    assert "Film removed" in sidebar.status_strip.message()
+
+
+def test_film_inserted_says_so() -> None:
+    sidebar, controller = _sidebar(FULL_DEVICE)
+    controller.scan_media_polled.emit(FULL_DEVICE.id, False)
+    assert sidebar.status_strip.message() == "No film loaded"
+
+    controller.scan_media_polled.emit(FULL_DEVICE.id, True)
+
+    assert sidebar.status_strip.message() == "Film loaded"
+
+
+def test_a_film_poll_of_another_device_or_without_a_state_changes_nothing() -> None:
+    sidebar, controller = _sidebar(FULL_DEVICE)
+    controller.scan_media_polled.emit(FULL_DEVICE.id, True)
+    sidebar.settings = replace(sidebar._settings, selected_frames=(1,))
+
+    controller.scan_media_polled.emit("another:device", False)
+    controller.scan_media_polled.emit(FULL_DEVICE.id, None)
+
+    assert sidebar.settings.selected_frames == (1,)
+
+
+def test_the_film_poll_waits_for_the_last_answer() -> None:
+    sidebar, controller = _sidebar(FULL_DEVICE)
+    # The right panel shows the footer and the cards, never the sidebar itself
+    host = QWidget()
+    sidebar.footer.setParent(host)
+    host.show()
+
+    sidebar._poll_media()
+    sidebar._poll_media()
+    assert controller.polled_ids == [FULL_DEVICE.id]
+
+    controller.scan_media_polled.emit(FULL_DEVICE.id, True)
+    sidebar._poll_media()
+    assert controller.polled_ids == [FULL_DEVICE.id, FULL_DEVICE.id]
+
+
+def test_no_film_poll_while_the_panel_is_hidden() -> None:
+    sidebar, controller = _sidebar(FULL_DEVICE)
+
+    sidebar._poll_media()
+
+    assert controller.polled_ids == []
 
 
 def test_ejecting_with_nothing_picked_says_only_that() -> None:

@@ -6,6 +6,7 @@ import pytest
 
 from negpy.domain.models import WorkspaceConfig
 from negpy.features.exposure.models import ExposureConfig
+from negpy.features.exposure.normalization import BOUNDS_VERSION
 from negpy.features.geometry.models import GeometryConfig
 from negpy.features.local.models import LocalAdjustmentsConfig, LocalMask
 from negpy.infrastructure.storage.repository import StorageRepository
@@ -92,13 +93,13 @@ def test_load_or_promote_none_when_neither(tmp_path, repo):
     assert load_or_promote(repo, "h6", str(tmp_path / "IMG_006.NEF")) is None
 
 
-def test_write_payload_is_to_dict_json(tmp_path):
+def test_write_payload_is_to_dict_json_with_the_bounds_version(tmp_path):
     src = str(tmp_path / "IMG_007.NEF")
     cfg = _rich_config()
     write_sidecar(src, cfg)
     with open(sidecar_path_for(src), "r", encoding="utf-8") as f:
         data = json.load(f)
-    assert data == json.loads(json.dumps(cfg.to_dict(), default=str))
+    assert data == {**json.loads(json.dumps(cfg.to_dict(), default=str)), "bounds_version": BOUNDS_VERSION}
 
 
 def test_save_file_settings_stores_path(repo):
@@ -345,3 +346,40 @@ def test_promote_sidecars_fills_db_before_open(tmp_path, repo):
     assert repo.load_file_settings("edited").exposure.density == 0.99
     assert repo.load_file_settings("half#2").exposure.density == 0.42
     assert repo.saved_hashes(["comp", "fork#roll:r1"]) == set()
+
+
+_BOUNDS = dict(local_floors=(-1.1, -1.2, -1.0), local_ceils=(-0.2, -0.4, -0.6))
+
+
+def _measured(**process) -> WorkspaceConfig:
+    cfg = WorkspaceConfig()
+    return replace(cfg, process=replace(cfg.process, **_BOUNDS, **process))
+
+
+def _unstamp(path: str) -> None:
+    with open(path) as fh:
+        data = json.load(fh)
+    del data["bounds_version"]
+    with open(path, "w") as fh:
+        json.dump(data, fh)
+
+
+def test_a_sidecar_keeps_bounds_saved_under_the_current_analysis(tmp_path):
+    src = str(tmp_path / "IMG_001.NEF")
+    write_sidecar(src, _measured())
+
+    assert load_sidecar(src).process.local_floors == _BOUNDS["local_floors"]
+
+
+def test_a_sidecar_from_an_older_analysis_drops_its_bounds(tmp_path):
+    src = str(tmp_path / "IMG_001.NEF")
+    _unstamp(write_sidecar(src, _measured()))
+
+    assert not load_sidecar(src).process.is_local_initialized
+
+
+def test_lock_bounds_keeps_them_in_a_sidecar_from_an_older_analysis(tmp_path):
+    src = str(tmp_path / "IMG_001.NEF")
+    _unstamp(write_sidecar(src, _measured(lock_bounds=True)))
+
+    assert load_sidecar(src).process.local_floors == _BOUNDS["local_floors"]

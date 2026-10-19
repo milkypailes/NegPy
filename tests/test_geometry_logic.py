@@ -1740,3 +1740,11 @@ def test_off_frame_mask_vertices_keep_their_place():
     from negpy.features.geometry.logic import map_coords_to_geometry
 
     assert map_coords_to_geometry(-0.2, 1.3, (100, 200)) == pytest.approx((-0.2, 1.3), abs=1e-6)
+
+
+def test_film_edges_on_a_box_too_small_for_a_border_walk_are_zero():
+    # A 16-px box rounds its trim cap to zero lines; the walk must abstain, not raise.
+    from negpy.features.geometry.logic import measure_film_edges
+
+    lum = np.random.default_rng(0).random((16, 16)).astype(np.float32)
+    assert measure_film_edges(lum, (0, 16, 0, 16)) == {"top": 0.0, "bottom": 0.0, "left": 0.0, "right": 0.0}

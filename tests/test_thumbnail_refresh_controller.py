@@ -225,23 +225,6 @@ class TestThumbnailRefreshController:
         assert task.buffer is buf
         self.controller._on_thumbnail_render_cancelled()
 
-    def test_on_rendered_passes_the_frames_own_process_to_the_display_transform(self) -> None:
-        seen: list = []
-        original = self.controller.display_transform_params
-
-        def _spy(*args, **kwargs):
-            seen.append(kwargs.get("process"))
-            return original(*args, **kwargs)
-
-        self.controller.display_transform_params = _spy
-        self.controller.refresh_thumbnails_for(["other"])
-        frame = self.tasks[0].frames[0]
-
-        self.controller._on_thumbnail_rendered(frame, np.zeros((2, 2, 3), dtype=np.float32))
-
-        assert seen == [frame.config.process]
-        self.controller._on_thumbnail_render_cancelled()
-
     def test_on_rendered_after_abort_for_a_frame_no_longer_eligible_emits_nothing(self) -> None:
         """A stale signal from a cut-short generation is dropped when the frame is no
         longer eligible for the resume that cancellation immediately triggers (it
@@ -376,9 +359,8 @@ class TestThumbnailRefreshController:
         self.controller.thumbnail_render_worker.cancel.assert_not_called()
         self.controller._on_thumbnail_render_cancelled()
 
-    def test_dispatch_marks_icc_input_active_for_a_narrowband_frame(self) -> None:
-        narrowband = replace(WorkspaceConfig(), process=replace(WorkspaceConfig().process, narrowband_scan=True))
-        self.session.config_for_asset.return_value = narrowband
+    def test_dispatch_marks_icc_input_active_with_an_input_icc(self) -> None:
+        self.controller.state.icc_input_path = "/custom.icc"
 
         self.controller.refresh_thumbnails_for(["other"])
 

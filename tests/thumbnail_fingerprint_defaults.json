@@ -101,6 +101,7 @@
    "highlight_grade_trim_red": "0.0",
    "highlight_magenta": "0.0",
    "highlight_yellow": "0.0",
+   "hold_black": "false",
    "levels_gamma": "1.0",
    "levels_gamma_blue": "1.0",
    "levels_gamma_green": "1.0",
@@ -246,7 +247,8 @@
    "locked_floors": "[0.0, 0.0, 0.0]",
    "locked_neutral_axis": "null",
    "luma_range_clip": "0.0",
-   "narrowband_scan": "false",
+   "meter_key": "\"\"",
+   "meter_rect": "null",
    "positive_source": "false",
    "process_mode": "\"Color Negative\"",
    "roll_name": "null",
@@ -289,5 +291,5 @@
    "vanadium_strength": "0.0"
   }
  },
- "render_version": 4
+ "render_version": 13
 }

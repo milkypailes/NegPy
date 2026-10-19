@@ -1,9 +1,9 @@
+from negpy.kernel.system.i18n import tr
 import os
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QApplication,
-    QComboBox,
     QFileDialog,
     QHBoxLayout,
     QInputDialog,
@@ -13,9 +13,11 @@ from negpy.desktop.view.confirm import confirm_delete_named
 from negpy.desktop.view.sidebar.base import BaseSidebar
 from negpy.desktop.view.styles.templates import ICON_BUTTON_WIDTH, field_label, hint_label
 from negpy.desktop.view.widgets.file_dialogs import last_open_folder, pick_start_dir
+from negpy.desktop.view.widgets.step_combo import StepCombo
+from negpy.infrastructure.loaders.helpers import get_supported_raw_wildcards
 
-_NONE_LABEL = "— None —"
-_FILE_FILTER = "Reference images (*.dng *.tif *.tiff *.cr2 *.cr3 *.nef *.arw *.raf *.rw2 *.jpg *.jpeg *.png);;All files (*)"
+_NONE_LABEL = tr("— None —")
+_FILE_FILTER = f"Reference images ({get_supported_raw_wildcards()});;All files (*)"
 
 
 class FlatFieldSidebar(BaseSidebar):
@@ -27,16 +29,16 @@ class FlatFieldSidebar(BaseSidebar):
 
     def _init_ui(self) -> None:
         row = QHBoxLayout()
-        row.addWidget(field_label("Profile"))
-        self.profile_combo = QComboBox()
-        self.profile_combo.setToolTip("Saved flat-field reference profiles (scan of the bare light source)")
+        row.addWidget(field_label(tr("Profile")))
+        self.profile_combo = StepCombo()
+        self.profile_combo.setToolTip(tr("Saved flat-field reference profiles (scan of the bare light source)"))
         row.addWidget(self.profile_combo, 1)
 
         self.enable_btn = self._small_toggle(
             "fa5s.lightbulb",
             "",
             False,
-            "Apply Flat Field — apply the selected flat-field reference to this roll",
+            tr("Apply Flat Field — apply the selected flat-field reference to this roll"),
         )
         self.enable_btn.setFixedWidth(ICON_BUTTON_WIDTH)
         row.addWidget(self.enable_btn)
@@ -45,18 +47,20 @@ class FlatFieldSidebar(BaseSidebar):
             "fa5s.eye",
             "",
             False,
-            "Check Flat Field: show how well the selected profile corrects its own reference, "
-            "from any frame. A good profile shows an even gray; a band or patch shows where it is off.",
+            tr(
+                "Check Flat Field: show how well the selected profile corrects its own reference, "
+                "from any frame. A good profile shows an even gray; a band or patch shows where it is off."
+            ),
         )
         self.check_btn.setFixedWidth(ICON_BUTTON_WIDTH)
         row.addWidget(self.check_btn)
 
-        self.add_btn = self._icon_action("fa5s.plus", "Pick a reference image and save it as a named profile")
-        self.delete_btn = self._icon_action("fa5s.trash", "Remove the selected profile")
+        self.add_btn = self._icon_action("fa5s.plus", tr("Pick a reference image and save it as a named profile"))
+        self.delete_btn = self._icon_action("fa5s.trash", tr("Remove the selected profile"))
         # add_btn and delete_btn go on the card's FLAT FIELD CORRECTION header (ControlsPanel).
         self.layout.addLayout(row)
 
-        self.hint = hint_label("Add a scan of the bare light source to enable.")
+        self.hint = hint_label(tr("Add a scan of the bare light source to enable."))
         self.layout.addWidget(self.hint)
         self._refresh_profiles()
 
@@ -91,11 +95,11 @@ class FlatFieldSidebar(BaseSidebar):
 
     def _on_add(self) -> None:
         start = pick_start_dir(last_open_folder(self.controller.session.repo))
-        path, _ = QFileDialog.getOpenFileName(self, "Select Flat Field Reference", start, _FILE_FILTER)
+        path, _ = QFileDialog.getOpenFileName(self, tr("Select Flat Field Reference"), start, _FILE_FILTER)
         if not path:
             return
         default_name = os.path.splitext(os.path.basename(path))[0]
-        name, ok = QInputDialog.getText(self, "Save Flat Field Profile", "Profile name:", text=default_name)
+        name, ok = QInputDialog.getText(self, tr("Save Flat Field Profile"), tr("Profile name:"), text=default_name)
         if ok and name:
             # save_flatfield_profile decodes the reference RAW to bake the gain, a brief blocking beat
             # on the GUI thread, so show a wait cursor.
@@ -111,9 +115,9 @@ class FlatFieldSidebar(BaseSidebar):
         profile_id = self.profile_combo.currentData()
         if profile_id and confirm_delete_named(
             self,
-            "Flat Field Profile",
+            tr("Flat Field Profile"),
             self.profile_combo.currentText(),
-            informative="Every frame using it loses its correction; the baked gain map cannot be recovered.",
+            informative=tr("Every frame using it loses its correction; the baked gain map cannot be recovered."),
         ):
             self.controller.delete_flatfield_profile(profile_id)
             self._refresh_profiles()

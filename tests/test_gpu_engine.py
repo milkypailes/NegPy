@@ -41,9 +41,7 @@ class TestGPUEngine(unittest.TestCase):
         img = (rng.random((100, 100, 3), dtype=np.float32) * 0.5 + 0.2).astype(np.float32)
         _, metrics = self.engine.process(img, WorkspaceConfig())
 
-        self.assertIn("shadow_log_refs", metrics)
         self.assertIn("neutral_axis_refs", metrics)
-        self.assertIsNotNone(metrics["shadow_log_refs"])
 
     def test_gpu_process_to_texture(self):
         """Verify process_to_texture returns a GPUTexture."""
@@ -209,6 +207,35 @@ class TestGPUEngine(unittest.TestCase):
         diff = float(np.abs(res_left - res_right).max())
         self.assertGreater(diff, 0.05, "Tiled export ignored freehand analysis_rect — output identical either way")
 
+    def _holder_settings(self, **process):
+        from dataclasses import replace
+
+        base = WorkspaceConfig()
+        return replace(base, process=replace(base.process, analysis_buffer=0.0, **process))
+
+    def test_gpu_meters_the_meter_rect_on_a_frame_with_no_crop(self):
+        """Direct and tiled renders both meter the picture box, as a freehand region over it would."""
+        from tests.test_analysis_region import _PICTURE, _holder_frame
+
+        img = _holder_frame()
+        for run in (lambda s: self.engine.process(img, s), lambda s: self.engine._process_tiled(img, s, scale_factor=1.0)):
+            metered, _ = run(self._holder_settings(meter_rect=_PICTURE))
+            freehand, _ = run(self._holder_settings(analysis_rect=_PICTURE))
+            whole, _ = run(self._holder_settings())
+            np.testing.assert_allclose(metered, freehand, atol=1e-5)
+            self.assertGreater(float(np.abs(metered - whole).max()), 0.05)
+
+    def test_gpu_meter_rect_yields_to_a_crop(self):
+        from dataclasses import replace
+
+        from tests.test_analysis_region import _PICTURE, _holder_frame
+
+        img = _holder_frame()
+        cropped = self._holder_settings(meter_rect=_PICTURE)
+        cropped = replace(cropped, geometry=replace(cropped.geometry, crop_rect=(0.1, 0.1, 0.9, 0.9)))
+        plain = replace(cropped, process=replace(cropped.process, meter_rect=None))
+        np.testing.assert_allclose(self.engine.process(img, cropped)[0], self.engine.process(img, plain)[0], atol=1e-6)
+
     def test_gpu_tiled_export_stale_auto_flags_are_inert(self):
         """Every retouch field reaching the engine (direct calls, old sessions) must be an
         inert no-op, not a crash — detection and repair both live upstream of it now."""
@@ -323,6 +350,20 @@ class TestGpuTilingPolicy(unittest.TestCase):
 
         with patch("negpy.services.rendering.gpu_engine.APP_CONFIG.max_texture_size", 1024):
             self.assertTrue(engine.requires_tiling(SimpleNamespace(shape=(900, 1100, 3)), WorkspaceConfig()))
+
+    def test_export_paper_over_texture_cap_tiles(self):
+        from dataclasses import replace
+
+        engine = self._engine(max_texture=8192)
+        settings = WorkspaceConfig()
+        pixels = replace(settings, export=replace(settings.export, export_resolution_mode="target_px", export_target_long_edge_px=6000))
+        small = SimpleNamespace(shape=(1000, 1500, 3))
+
+        with patch("negpy.services.rendering.gpu_engine.APP_CONFIG.max_texture_size", 4096):
+            self.assertTrue(engine.requires_tiling(small, pixels))
+            self.assertFalse(engine.requires_tiling(small, settings))
+            # A preview paper is capped in its own layout instead.
+            self.assertFalse(engine.requires_tiling(small, pixels, render_size_ref=1600.0))
 
     def test_releasing_pool_destroys_every_texture_except_retained(self):
         engine = GPUEngine.__new__(GPUEngine)

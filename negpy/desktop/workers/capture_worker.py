@@ -4,6 +4,9 @@ Owns the live Scanlight serial connection (so the RGB sliders stay responsive)
 and one libgphoto2 session, held open across captures and shared with live view.
 """
 
+from negpy.kernel.system.i18n import tr
+
+import math
 import os
 import threading
 import time
@@ -34,7 +37,7 @@ from negpy.services.capture.calibration import (
     normalize_start_point,
     scan_ladder,
 )
-from negpy.services.capture.service import CaptureService, capture_single
+from negpy.services.capture.service import CaptureError, CaptureService, capture_single
 
 logger = get_logger(__name__)
 
@@ -60,6 +63,7 @@ class CaptureRequest:
     as_roll: bool = False
     single_capture: bool = False  # RGB preset shot as one exposure with all three LEDs lit
     sensor_profile: str = ""  # the single-capture preset's sensor profile, for the frame's roll
+    capture_delay_s: float = 0.0  # seconds to hold the first exposure; Stop ends the wait
 
 
 @dataclass(frozen=True)
@@ -135,6 +139,7 @@ class CaptureWorker(QObject):
 
     light_set = pyqtSignal(int, int, int, int)  # r, g, b, w actually applied
     progress = pyqtSignal(float)  # 0.0..1.0
+    countdown = pyqtSignal(int)  # whole seconds left of the Capture Delay; 0 when the shot starts
     channel = pyqtSignal(str)  # "R"/"G"/"B" as each triplet channel starts
     #: One set_camera_setting call ran to completion: verified, rejected, or skipped without a
     #: session. Always fires, so the sidebar's pending-write gate on Scan cannot stick.
@@ -273,7 +278,7 @@ class CaptureWorker(QObject):
             # A missing Scanlight is a persistent condition the Light LED already shows, so keep
             # it out of the shared status line, where it would linger and go stale.
             if not ("auto-discover" in msg or "No serial ports" in msg):
-                self.error.emit(f"Scanlight: {e}")
+                self.error.emit(tr("Scanlight: {e}", e=e))
 
     # ----- capture -----
 
@@ -282,7 +287,7 @@ class CaptureWorker(QObject):
         _t0 = time.perf_counter()
         try:
             if not self._holds_camera():
-                self.status.emit("Connecting to camera…")
+                self.status.emit(tr("Connecting to camera…"))
             # The same session that streams live view takes the shot: no reconnect, and the
             # preview pauses for the second or two the body needs.
             camera = self._acquire_camera()
@@ -292,7 +297,8 @@ class CaptureWorker(QObject):
                 # Normal white-light scanning, with no Scanlight: one plain camera shot imported
                 # as an ordinary single RAW, with no LED control and no triplet. The operator's
                 # own light stays on, and the shutter is whatever the live-view steppers set.
-                self.status.emit("Capturing…")
+                self._wait_before_capture(req.capture_delay_s)
+                self.status.emit(tr("Capturing…"))
                 path = capture_single(
                     camera,
                     roll_name=req.roll_name,
@@ -307,8 +313,9 @@ class CaptureWorker(QObject):
             # RGB / white-preset captures drive the Scanlight, so it must be connected.
             light = self._ensure_light(req.port)
             service = CaptureService(light, camera)
+            self._wait_before_capture(req.capture_delay_s)  # after the light check, so a dead light fails at once
             if req.white_mode:  # one broadband white exposure (slide / B&W), no RGB triplet
-                self.status.emit("Capturing white frame…")
+                self.status.emit(tr("Capturing white frame…"))
                 path = service.capture_white(
                     roll_name=req.roll_name,
                     frame_number=req.frame_number,
@@ -333,16 +340,16 @@ class CaptureWorker(QObject):
                 aperture=req.aperture or None,
             )
             if req.single_capture:  # one narrowband exposure, imported as an ordinary single RAW
-                self.status.emit("Capturing…")
+                self.status.emit(tr("Capturing…"))
                 self.finished.emit([service.capture_rgb_single(settings, cancel=self._cancel)])
                 return
 
-            self.status.emit("Capturing R / G / B…")
+            self.status.emit(tr("Capturing R / G / B…"))
             _names = {"R": "red", "G": "green", "B": "blue"}
 
             def _on_channel(letter: str) -> None:
                 self.channel.emit(letter)
-                self.status.emit(f"Capturing {_names.get(letter, letter)} channel…")
+                self.status.emit(tr("Capturing {value} channel…", value=_names.get(letter, letter)))
 
             result = service.capture_triplet(
                 settings,
@@ -362,6 +369,17 @@ class CaptureWorker(QObject):
             self._close_camera()  # discard a possibly-broken held session
             logger.exception("capture failed")
             self.error.emit(str(e))
+
+    def _wait_before_capture(self, delay_s: float) -> None:
+        """Hold the first exposure for `delay_s`; Stop ends the wait as a cancellation."""
+        if delay_s <= 0:
+            return
+        deadline = time.monotonic() + delay_s
+        while (left := deadline - time.monotonic()) > 0:
+            self.countdown.emit(math.ceil(left))
+            if self._cancel.wait(min(left, 1.0)):
+                raise CaptureError("canceled before the first exposure")
+        self.countdown.emit(0)
 
     def _cleanup_partial_frame(self, req: CaptureRequest) -> None:
         """After a cancelled/failed capture, delete this frame's exposures so the output
@@ -516,7 +534,7 @@ class CaptureWorker(QObject):
             self.live_view_unsupported.emit(str(e))
         except Exception as e:
             logger.exception("start_live_view failed")
-            self.error.emit(f"Live view: {e}")
+            self.error.emit(tr("Live view: {e}", e=e))
 
     @pyqtSlot()
     def stop_live_view(self) -> None:
@@ -540,7 +558,7 @@ class CaptureWorker(QObject):
         """Turn a failed Qt camera-control callback into a recoverable disconnect."""
         logger.exception("%s failed", action)
         self._close_camera()
-        self.error.emit(f"Camera control failed: {exc}. Reconnect and try again.")
+        self.error.emit(tr("Camera control failed: {exc}. Reconnect and try again.", exc=exc))
 
     @pyqtSlot(bool)
     def set_focus_magnifier(self, on: bool) -> None:
@@ -587,7 +605,7 @@ class CaptureWorker(QObject):
 
             light = self._ensure_light(req.port)
             if not self._holds_camera():
-                self.status.emit("Connecting to camera…")
+                self.status.emit(tr("Connecting to camera…"))
             camera = self._acquire_camera()  # the same session live view streams on
             # Half-res decode: calibration only meters a uniform base patch, so it is much
             # faster. The raw-Bayer clip check stays full-res, and the scans still decode
@@ -623,7 +641,7 @@ class CaptureWorker(QObject):
                 self.cancelled.emit()
                 return
             logger.exception("calibration failed")
-            self.error.emit(f"Calibration: {e}")
+            self.error.emit(tr("Calibration: {e}", e=e))
 
     @pyqtSlot(ExposureProbeRequest)
     def run_exposure_probe(self, req: ExposureProbeRequest) -> None:
@@ -644,7 +662,7 @@ class CaptureWorker(QObject):
         with scratch as scratch_dir:
             try:
                 if not self._holds_camera():
-                    self.status.emit("Connecting to camera…")
+                    self.status.emit(tr("Connecting to camera…"))
                 camera = self._acquire_camera()
                 # Pinned to the label the reading is computed against, not whatever a queued
                 # stepper write leaves on the body.

@@ -54,13 +54,22 @@ only the off-diagonal/diagonal *ratios* matter — absolute row scale is irrelev
 3. **Read the leakage values into matrix `A`** (rows = R/G/B measurement bands, cols = C/M/Y
    dyes). Dye→channel: **cyan↔Red, magenta↔Green, yellow↔Blue**. Sample each dye's diffuse
    density at band centers **R≈650 / G≈550 / B≈450 nm** (datasheets use Status M). Each dye's
-   own-band value is the diagonal; the other two are its unwanted absorption (positive).
+   own-band value is the diagonal; the other two are its unwanted absorption.
    Reading a graph by eye is ±~0.05 density — fine, the result gets row-normalized.
 
+   Read the dyes **above D-min**. Kodak motion-picture sheets say "D-mins subtracted" on the
+   plot; if a sheet draws each dye over the Minimum Density curve, subtract that curve first.
+   A net curve includes the masking couplers, so it can dip slightly **below zero** in another
+   band (Vision3 magenta at 450 nm): read that value as negative, do not clamp it to 0.
+
    - **Tier 1:** read all nine values off the separated curves.
-   - **Tier 2:** diagonal = own band; estimate the off-diagonals from the visible secondary
-     humps in the aggregate curve plus known dye chemistry (magenta's unwanted *blue* and some
-     *red*; cyan a little *green/blue*; yellow nearly clean). Name it `"… (approx)"`.
+   - **Tier 2:** trace the midscale-neutral and Minimum Density curves into
+     `scripts/crosstalk_dyes/<film>_neutral.csv` (`wavelength_nm,midscale,minimum`) and run
+     `uv run python scripts/fit_crosstalk_estimates.py`. It fits their difference with Kodak's
+     Vision3 dye curves and prints the readings. Do not guess the off-diagonals from dye
+     chemistry: the masking couplers of a C-41 or ECN-2 negative cancel most of the unwanted
+     absorptions that the dyes alone have. The estimate assumes the film's masking matches
+     Vision3's, which fits Kodak films best. Name it `"… (approx)"`.
    - **Tier 3:** stop. State that the datasheet lacks dye-density data. Optionally emit a
      conservative starter close to NegPy's Default, named `"… (approx, starter)"`, and suggest
      chart-based calibration instead. Never invent precision.
@@ -77,8 +86,10 @@ only the off-diagonal/diagonal *ratios* matter — absolute row scale is irrelev
 5. **Review & self-validate** — never trust the loader's silence (it skips malformed files
    without error):
    - 3×3 numeric, no booleans.
-   - Diagonal `1.0`; off-diagonals **negative** (a correction *subtracts* contamination) and
-     small — flag anything `|·| > 0.2` as a likely misread/transpose.
+   - Diagonal `1.0`; off-diagonals mostly **negative** (a correction *subtracts* contamination)
+     and small — flag anything `|·| > 0.2` as a likely misread/transpose. A small positive term
+     (up to ~0.05) is correct where a reading was negative: the masking coupler removed more
+     density in that band than the dye added.
    - Confirm it actually loads:
      ```bash
      uv run python -c "from negpy.services.assets.crosstalk import CrosstalkProfiles as C; \
@@ -105,7 +116,10 @@ only the off-diagonal/diagonal *ratios* matter — absolute row scale is irrelev
 
 - **Transposing rows/cols** — `A` is bands×dyes; the output is out-channels×in-channels. Keep
   R/G/B order throughout.
-- **Positive off-diagonals in the output** — wrong sign; a correction must *subtract* leakage.
+- **Large positive off-diagonals in the output** — wrong sign; a correction must *subtract*
+  leakage. Only a below-zero reading on a net curve gives a small positive term.
+- **Reading over D-min** — a dye curve drawn on top of the Minimum Density curve inflates every
+  unwanted absorption; subtract D-min first.
 - **Using sensitivity curves as dye density** — they measure different things; not interchangeable.
 - **Over-claiming precision** — an aggregate (Tier 2) curve gives an estimate; say so in the name.
 - **Forgetting it's density-domain** — read *density* off the dye-density plot, not transmittance.
@@ -113,26 +127,26 @@ only the off-diagonal/diagonal *ratios* matter — absolute row scale is irrelev
 ## Worked example — Kodak Gold 200 (Tier 2)
 
 `Read` the datasheet PDF pages as images. The CURVES section has Characteristic, Spectral-
-Sensitivity, and Spectral-Dye-Density plots — but the dye-density plot is a single *aggregate*
-"midscale neutral" curve → **Tier 2**. Diagonals = `1.0`; estimate off-diagonals from the
-curve's secondary absorptions + dye chemistry (magenta's unwanted blue is the biggest term):
+Sensitivity, and Spectral-Dye-Density plots — but the dye-density plot holds only the
+*aggregate* midscale neutral and the Minimum Density curve → **Tier 2**. Kodak's PDFs draw
+both as vector paths: read them exactly into `scripts/crosstalk_dyes/kodak_gold_200_neutral.csv`
+and run the estimator, which prints:
 
 ```
-A (rows R/G/B, cols C/M/Y):   R:[1.0,  0.06, 0.02]
-                              G:[0.04, 1.0,  0.05]
-                              B:[0.02, 0.12, 1.0 ]
+{"name": "kodak_gold_200", "readings": [[0.7727, 0.069, 0.0056], [0.0797, 0.9412, 0.0686], [0.0804, -0.0046, 1.0018]]}
 ```
 
-Run the deriver → emitted TOML (note `name` flags it approximate):
+Pipe that line to the deriver → emitted TOML (note `name` flags it approximate):
 
 ```toml
 name = "Kodak Gold 200 (approx)"
 matrix = [
-  [1.0000,  -0.0579,  -0.0171],
-  [-0.0390,   1.0000,  -0.0492],
-  [-0.0152,  -0.1191,   1.0000],
+  [1.0000,  -0.0733,  -0.0006],
+  [-0.0961,   1.0000,  -0.0679],
+  [-0.1054,   0.0126,   1.0000],
 ]
 ```
 
-The strong `B,−0.119(G)` term is the magenta-dye unwanted-blue correction. Validate it loads,
-then write it to `crosstalk/kodak_gold_200.toml` (contribute) or the Documents folder (personal).
+The magenta → blue term is small and positive: Vision3's masking couplers remove more blue
+density than the magenta dye adds. Validate it loads, then write it to
+`crosstalk/kodak_gold_200.toml` (contribute) or the Documents folder (personal).
