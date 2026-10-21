@@ -189,7 +189,7 @@ class TestGpuTiledParity(unittest.TestCase):
         from negpy.kernel.system.config import APP_CONFIG
 
         base = _base()
-        settings = replace(base, export=replace(base.export, export_resolution_mode="target_px", export_target_long_edge_px=1200))
+        settings = replace(base, export=replace(base.export, export_resolution_mode="target_px", export_target_edge_px=1200))
         img = self.img[:, :800]
         with patch.object(APP_CONFIG, "max_texture_size", 1024):
             res, metrics = self.engine.process(img, settings, scale_factor=1.0, readback_metrics=False)

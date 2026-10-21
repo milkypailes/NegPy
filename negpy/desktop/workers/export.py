@@ -47,13 +47,14 @@ def _protects_metadata(task: "ExportTask") -> bool:
     return task.metadata_config is not None and task.metadata_config.protect_original_metadata
 
 
-def _export_resolution(task: "ExportTask") -> Optional[Resolution]:
+def _export_resolution(task: "ExportTask", shape: Optional[tuple[int, ...]] = None) -> Optional[Resolution]:
     """Resolution to write into the exported file, or None to make no claim at all.
 
     Protect original metadata returns the source's own record untouched — the exact
     rationals and unit, and nothing when it declares nothing. Otherwise Original
     resamples no pixels, so the source still describes them; Print and Pixels do, so
-    the size the user asked for wins.
+    the size the user asked for wins. ``shape`` is the rendered buffer, whose dimensions
+    the Pixels mode needs when it sets the short edge.
 
     The cached EXIF only covers files the user has selected, so a batch export of
     untouched frames has to reach the file itself.
@@ -63,7 +64,8 @@ def _export_resolution(task: "ExportTask") -> Optional[Resolution]:
         return source
     if task.export_settings.export_resolution_mode == ExportResolutionMode.ORIGINAL and source is not None:
         return source
-    return Resolution.from_dpi(PrintService.resolution_tag_dpi(task.export_settings))
+    img_h, img_w = (int(shape[0]), int(shape[1])) if shape is not None else (0, 0)
+    return Resolution.from_dpi(PrintService.resolution_tag_dpi(task.export_settings, img_w=img_w, img_h=img_h))
 
 
 def _srgb_icc_bytes() -> Optional[bytes]:
@@ -427,7 +429,7 @@ class ExportWorker(QObject):
     def _finish_task(self, task: ExportTask, buffer: np.ndarray, color_space: str, embed_plan: Optional[tuple]) -> Optional[str]:
         """Encode + metadata + atomic write for one rendered frame, on the finisher
         thread. Returns an error message, or None on success."""
-        resolution = _export_resolution(task)
+        resolution = _export_resolution(task, buffer.shape)
         bits, status = self._processor.encode_export(
             buffer,
             task.export_settings,

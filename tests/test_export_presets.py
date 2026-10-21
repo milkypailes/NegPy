@@ -45,7 +45,7 @@ def _make_preset(**kwargs) -> ExportPreset:
         paper_aspect_ratio=AspectRatio.ORIGINAL,
         export_print_size=30.0,
         export_dpi=300,
-        export_target_long_edge_px=2000,
+        export_target_edge_px=2000,
         output_mode=ExportPresetOutputMode.SAME_AS_SOURCE,
         output_subfolder="",
         output_path="",

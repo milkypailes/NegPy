@@ -42,7 +42,7 @@ def _export_line(export: Any) -> str:
     if mode == ExportResolutionMode.PRINT:
         size = f"Print {export.export_print_size:g} cm @ {export.export_dpi} dpi"
     elif mode == ExportResolutionMode.TARGET_PX:
-        size = f"Export {export.export_target_long_edge_px} px"
+        size = f"Export {export.export_target_edge_px} px {export.export_target_edge} edge"
     else:
         size = ""
     paper = export.paper_aspect_ratio

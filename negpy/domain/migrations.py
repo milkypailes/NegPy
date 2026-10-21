@@ -23,6 +23,8 @@ from typing import Any, Dict
 KEY_RENAMES: Dict[str, str] = {
     "export_border_size": "border_size",
     "export_border_color": "border_color",
+    # The Pixels size sets the long or the short edge, so the field names the edge it sets.
+    "export_target_long_edge_px": "export_target_edge_px",
     # Shadow-neutral + density-balance became Cast Removal, then Cast Removal
     # became a 0..1 strength (bool coerced in ExposureConfig.__post_init__).
     "auto_shadow_neutral": "cast_removal_strength",

@@ -10,6 +10,7 @@ from negpy.domain.models import (
     ExportFormat,
     ExportPresetOutputMode,
     ExportResolutionMode,
+    ExportTargetEdge,
     TiffCompression,
 )
 
@@ -29,7 +30,8 @@ def _values(**overrides) -> dict:
         "paper_aspect_ratio": AspectRatio.ORIGINAL,
         "export_print_size": 24.0,
         "export_dpi": 360,
-        "export_target_long_edge_px": 3000,
+        "export_target_edge": ExportTargetEdge.SHORT,
+        "export_target_edge_px": 3000,
         "output_sharpen": 0.35,
         "output_mode": ExportPresetOutputMode.SUBFOLDER_OF_SOURCE,
         "output_subfolder": "web",

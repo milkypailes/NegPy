@@ -99,7 +99,7 @@ def test_target_px_mode_tags_the_derived_dpi(proc, fmt, read_dpi):
         export_dpi=300,
         export_resolution_mode=ExportResolutionMode.TARGET_PX.value,
         export_print_size=_PRINT_SIZE_CM,
-        export_target_long_edge_px=_TARGET_PX,
+        export_target_edge_px=_TARGET_PX,
     )
 
     bits, _ = proc._encode_export(_buf(), settings, ColorSpace.SRGB.value, ColorSpace.SRGB.value)
@@ -182,7 +182,7 @@ def _pixels_settings(fmt: ExportFormat) -> ExportConfig:
         export_dpi=300,
         export_resolution_mode=ExportResolutionMode.TARGET_PX.value,
         export_print_size=_PRINT_SIZE_CM,
-        export_target_long_edge_px=_TARGET_PX,
+        export_target_edge_px=_TARGET_PX,
     )
 
 

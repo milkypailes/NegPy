@@ -1,8 +1,10 @@
 import numpy as np
+from dataclasses import replace
+
 from negpy.features.finish.models import FinishConfig
 from negpy.features.toning.models import ToningConfig
 from negpy.services.export.print import PrintService
-from negpy.domain.models import ExportConfig, ExportResolutionMode
+from negpy.domain.models import ExportConfig, ExportResolutionMode, ExportTargetEdge
 
 
 def test_calculate_paper_px_original():
@@ -66,7 +68,7 @@ def test_apply_layout_target_px_original_aspect():
     img = np.zeros((400, 600, 3), dtype=np.float32)
     config = ExportConfig(
         export_resolution_mode=ExportResolutionMode.TARGET_PX.value,
-        export_target_long_edge_px=1000,
+        export_target_edge_px=1000,
         paper_aspect_ratio="Original",
     )
     result, _ = PrintService.apply_layout(img, config)
@@ -81,11 +83,61 @@ def test_apply_layout_target_px_fixed_ratio():
     img = np.zeros((400, 600, 3), dtype=np.float32)
     config = ExportConfig(
         export_resolution_mode=ExportResolutionMode.TARGET_PX.value,
-        export_target_long_edge_px=1000,
+        export_target_edge_px=1000,
         paper_aspect_ratio="1:1",
     )
     result, _ = PrintService.apply_layout(img, config)
     assert result.shape == (1000, 1000, 3)
+
+
+def test_apply_layout_target_px_short_edge_landscape():
+    """The short-edge target lands on the exported paper's short edge; the long edge follows."""
+    img = np.zeros((400, 600, 3), dtype=np.float32)
+    config = ExportConfig(
+        export_resolution_mode=ExportResolutionMode.TARGET_PX.value,
+        export_target_edge=ExportTargetEdge.SHORT,
+        export_target_edge_px=500,
+        paper_aspect_ratio="Original",
+    )
+    result, _ = PrintService.apply_layout(img, config)
+    assert result.shape[:2] == (500, 750)
+
+
+def test_apply_layout_target_px_short_edge_portrait():
+    img = np.zeros((600, 400, 3), dtype=np.float32)
+    config = ExportConfig(
+        export_resolution_mode=ExportResolutionMode.TARGET_PX.value,
+        export_target_edge=ExportTargetEdge.SHORT,
+        export_target_edge_px=500,
+        paper_aspect_ratio="Original",
+    )
+    result, _ = PrintService.apply_layout(img, config)
+    assert result.shape[:2] == (750, 500)
+
+
+def test_apply_layout_target_px_short_edge_fixed_ratio():
+    # 4:5 paper, so the long edge is 5/4 of the short one.
+    img = np.zeros((400, 600, 3), dtype=np.float32)
+    config = ExportConfig(
+        export_resolution_mode=ExportResolutionMode.TARGET_PX.value,
+        export_target_edge=ExportTargetEdge.SHORT,
+        export_target_edge_px=500,
+        paper_aspect_ratio="4:5",
+    )
+    result, _ = PrintService.apply_layout(img, config)
+    assert result.shape[:2] == (625, 500)
+
+
+def test_paper_long_edge_px_follows_the_selected_edge():
+    long_edge = ExportConfig(
+        export_resolution_mode=ExportResolutionMode.TARGET_PX.value,
+        export_target_edge=ExportTargetEdge.LONG,
+        export_target_edge_px=1000,
+    )
+    short_edge = replace(long_edge, export_target_edge=ExportTargetEdge.SHORT)
+
+    assert PrintService.paper_long_edge_px(long_edge, 600, 400) == 1000
+    assert PrintService.paper_long_edge_px(short_edge, 600, 400) == 1500
 
 
 def _original_mode_config() -> ExportConfig:
@@ -133,14 +185,14 @@ def test_target_px_ignores_print_size_and_dpi():
     img = np.zeros((200, 300, 3), dtype=np.float32)
     a = ExportConfig(
         export_resolution_mode=ExportResolutionMode.TARGET_PX.value,
-        export_target_long_edge_px=800,
+        export_target_edge_px=800,
         paper_aspect_ratio="Original",
         export_print_size=10.0,
         export_dpi=72,
     )
     b = ExportConfig(
         export_resolution_mode=ExportResolutionMode.TARGET_PX.value,
-        export_target_long_edge_px=800,
+        export_target_edge_px=800,
         paper_aspect_ratio="Original",
         export_print_size=100.0,
         export_dpi=600,
@@ -159,7 +211,7 @@ def test_apply_layout_downscale_is_area_averaged():
     rng = np.random.default_rng(11)
     img = rng.random((900, 900, 3)).astype(np.float32)
     config = ExportConfig(
-        export_target_long_edge_px=300,
+        export_target_edge_px=300,
         paper_aspect_ratio="1:1",
         export_resolution_mode=ExportResolutionMode.TARGET_PX.value,
     )
