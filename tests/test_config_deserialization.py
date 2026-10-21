@@ -8,6 +8,7 @@ from negpy.domain.models import (
     ExportFormat,
     ExportPreset,
     ExportResolutionMode,
+    ExportTargetEdge,
     TiffCompression,
     WorkspaceConfig,
 )
@@ -243,6 +244,13 @@ class TestConfigDeserialization(unittest.TestCase):
         # and saved export presets, neither of which goes through from_flat_dict.
         self.assertEqual(ExportConfig(export_fmt="DNG").export_fmt, ExportFormat.TIFF)
         self.assertEqual(ExportPreset.from_dict({"export_fmt": "DNG"}).export_fmt, ExportFormat.TIFF)
+
+    def test_legacy_target_long_edge_becomes_the_edge_size(self):
+        """The Pixels size sets the long or the short edge, so the key names the size, not the edge."""
+        config = WorkspaceConfig.from_flat_dict({"export_target_long_edge_px": 2345})
+        self.assertEqual(config.export.export_target_edge_px, 2345)
+        self.assertEqual(config.export.export_target_edge, ExportTargetEdge.LONG)
+        self.assertEqual(ExportPreset.from_dict({"export_target_long_edge_px": 2345}).export_target_edge_px, 2345)
 
     def test_legacy_tiff_compression_value_coerces_to_zip(self):
         # The key was dropped while TIFF was zlib-only. It is a live setting again,

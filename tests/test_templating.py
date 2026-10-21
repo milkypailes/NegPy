@@ -45,7 +45,7 @@ def test_size_and_dpi_original_res():
 def test_target_px_filename_var():
     conf = ExportConfig(
         export_resolution_mode=ExportResolutionMode.TARGET_PX.value,
-        export_target_long_edge_px=2048,
+        export_target_edge_px=2048,
         filename_pattern="{{ original_name }}_{{ target_px }}",
     )
     result = render_export_filename("shot.jpg", conf)

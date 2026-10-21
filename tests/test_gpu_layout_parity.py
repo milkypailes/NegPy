@@ -5,7 +5,7 @@ from dataclasses import replace
 import numpy as np
 import pytest
 
-from negpy.domain.models import ExportResolutionMode, WorkspaceConfig
+from negpy.domain.models import ExportResolutionMode, ExportTargetEdge, WorkspaceConfig
 from negpy.infrastructure.gpu.device import GPUDevice
 from negpy.services.export.print import PrintService
 
@@ -13,7 +13,8 @@ pytestmark = pytest.mark.skipif(not GPUDevice.get().is_available, reason="GPU no
 
 
 @pytest.mark.parametrize("shape", [(900, 1200), (1200, 900), (777, 1311)])
-def test_gpu_layout_matches_the_cpu_layout(shape):
+@pytest.mark.parametrize("edge", [ExportTargetEdge.LONG, ExportTargetEdge.SHORT])
+def test_gpu_layout_matches_the_cpu_layout(shape, edge):
     from negpy.services.rendering.gpu_engine import GPUEngine
 
     rng = np.random.default_rng(3)
@@ -23,7 +24,12 @@ def test_gpu_layout_matches_the_cpu_layout(shape):
     cfg = replace(
         cfg,
         geometry=replace(cfg.geometry, autocrop_offset=0),
-        export=replace(cfg.export, export_resolution_mode=ExportResolutionMode.TARGET_PX.value, export_target_long_edge_px=400),
+        export=replace(
+            cfg.export,
+            export_resolution_mode=ExportResolutionMode.TARGET_PX.value,
+            export_target_edge=edge,
+            export_target_edge_px=400,
+        ),
         finish=replace(cfg.finish, border_size=0.3),
     )
     engine = GPUEngine()

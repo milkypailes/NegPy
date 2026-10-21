@@ -14,7 +14,7 @@ The **Export** and **Scan** sidebars name files with Jinja2 templates.
 | `{{ paper_ratio }}` | Selected aspect ratio. | `3:2`, `Original` |
 | `{{ size }}` | Print size in cm. Empty with "Original Resolution". | `30cm` |
 | `{{ dpi }}` | Export DPI. Empty with "Original Resolution". | `300dpi` |
-| `{{ target_px }}` | Long-edge size in pixels. Empty unless Pixels mode. | `2048px` |
+| `{{ target_px }}` | Target edge size in pixels, long or short. Empty unless Pixels mode. | `2048px` |
 | `{{ border }}` | "border" if the width is > 0, else empty. | `border` |
 | `{{ date }}` | Current date, YYYYMMDD. | `20260125` |
 | `{{ roll }}` | Scanlight capture roll name (Metadata → Roll), or parsed from a `{roll}_Frame{NNN}` stem. Not the Roll Analysis card's roll name. | `Roll001` |

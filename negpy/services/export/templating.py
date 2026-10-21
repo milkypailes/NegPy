@@ -128,7 +128,7 @@ def render_export_filename(
     - paper_ratio: e.g. 3:2
     - size: Export size in cm (PRINT mode only, else empty)
     - dpi: Export DPI (PRINT mode only, else empty)
-    - target_px: Target long edge in pixels (TARGET_PX mode only, else empty)
+    - target_px: Target edge in pixels (TARGET_PX mode only, else empty)
     - border: "border" if border size > 0, else empty
     - date: Current date in YYYYMMDD format
     - capture_date / capture_year: Original capture date (YYYYMMDD / YYYY), empty when unset
@@ -164,7 +164,7 @@ def render_export_filename(
         "paper_ratio": export_settings.paper_aspect_ratio,
         "size": f"{export_settings.export_print_size:.0f}cm" if is_print else "",
         "dpi": f"{export_settings.export_dpi}dpi" if is_print else "",
-        "target_px": f"{export_settings.export_target_long_edge_px}px" if is_target_px else "",
+        "target_px": f"{export_settings.export_target_edge_px}px" if is_target_px else "",
         "border": "border" if border_size > 0 else "",
         "date": datetime.now().strftime("%Y%m%d"),
     }

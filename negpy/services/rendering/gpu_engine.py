@@ -9,7 +9,7 @@ import cv2
 import numpy as np
 import wgpu  # type: ignore
 
-from negpy.domain.models import AspectRatio, ExportResolutionMode, WorkspaceConfig
+from negpy.domain.models import AspectRatio, ExportResolutionMode, ExportTargetEdge, WorkspaceConfig
 from negpy.features.exposure.analysis import (
     COLOR_HIST_BINS,
     DENSITY_HIST_BINS,
@@ -2539,8 +2539,8 @@ class GPUEngine:
             paper_long_px = int(size_ref)
             mode = ExportResolutionMode.PRINT
         elif mode == ExportResolutionMode.TARGET_PX:
-            dpi = PrintService.effective_dpi(settings.export)
-            paper_long_px = max(1, int(settings.export.export_target_long_edge_px))
+            dpi = PrintService.effective_dpi(settings.export, cw, ch)
+            paper_long_px = PrintService.paper_long_edge_px(settings.export, cw, ch)
         else:
             dpi = settings.export.export_dpi
             paper_long_px = int((settings.export.export_print_size / 2.54) * dpi)
@@ -2575,14 +2575,21 @@ class GPUEngine:
             off_x = (paper_w - content_w) // 2
             off_y = PrintService.weighted_offset_y(paper_h, content_h, border_px, border_bottom_px)
         else:
+            short_target = mode == ExportResolutionMode.TARGET_PX and settings.export.export_target_edge == ExportTargetEdge.SHORT
             if settings.export.paper_aspect_ratio == AspectRatio.ORIGINAL:
                 # Same formulas as PrintService.apply_layout, or the mat gains a 1 px line.
                 if cw >= ch:
                     content_w = max(10, paper_long_px - 2 * border_px)
                     content_h = max(1, int(content_w / (cw / ch)))
+                    if short_target:
+                        content_h = max(10, int(settings.export.export_target_edge_px) - border_y_px)
+                        content_w = max(1, int(content_h * (cw / ch)))
                 else:
                     content_h = max(10, paper_long_px - border_y_px)
                     content_w = max(1, int(content_h * (cw / ch)))
+                    if short_target:
+                        content_w = max(10, int(settings.export.export_target_edge_px) - 2 * border_px)
+                        content_h = max(1, int(content_w / (cw / ch)))
                 paper_w, paper_h = content_w + 2 * border_px, content_h + border_y_px
                 off_x, off_y = border_px, border_px
             else:
