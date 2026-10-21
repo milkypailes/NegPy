@@ -356,7 +356,7 @@ class TestGpuTilingPolicy(unittest.TestCase):
 
         engine = self._engine(max_texture=8192)
         settings = WorkspaceConfig()
-        pixels = replace(settings, export=replace(settings.export, export_resolution_mode="target_px", export_target_long_edge_px=6000))
+        pixels = replace(settings, export=replace(settings.export, export_resolution_mode="target_px", export_target_edge_px=6000))
         small = SimpleNamespace(shape=(1000, 1500, 3))
 
         with patch("negpy.services.rendering.gpu_engine.APP_CONFIG.max_texture_size", 4096):

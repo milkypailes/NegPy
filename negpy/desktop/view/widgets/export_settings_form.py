@@ -30,6 +30,7 @@ from negpy.domain.models import (
     ExportFormat,
     ExportPresetOutputMode,
     ExportResolutionMode,
+    ExportTargetEdge,
     TiffCompression,
     export_blocked,
 )
@@ -256,7 +257,7 @@ class ExportSettingsForm(QWidget):
             (("", tr("Original")), ("", tr("Print")), ("", tr("Pixels"))),
             tr(
                 "Original exports at the source resolution. Print sizes the export for a print: paper "
-                "size and DPI. Pixels sizes it to a pixel count on the long edge"
+                "size and DPI. Pixels sizes it to a pixel count on the long or short edge"
             ),
         )
         self.mode_btn.currentChanged.connect(self._on_mode_toggled)
@@ -283,17 +284,24 @@ class ExportSettingsForm(QWidget):
         self.dpi_input.valueChanged.connect(self._on_changed)
         print_inner.addLayout(self._field_row("DPI", self.dpi_input))
 
-        # TARGET_PX mode: long edge in pixels
+        # TARGET_PX mode: the pixel size sets the long or the short edge
         self._target_px_container = QWidget()
         target_px_inner = QVBoxLayout(self._target_px_container)
         target_px_inner.setContentsMargins(0, 0, 0, 0)
+        self.target_edge_btn = SegmentedChoice(
+            (("", tr("Long")), ("", tr("Short"))),
+            tr("Edge the pixel size sets. The other edge follows the paper ratio"),
+            data=(ExportTargetEdge.LONG, ExportTargetEdge.SHORT),
+        )
+        self.target_edge_btn.currentChanged.connect(self._on_changed)
+        target_px_inner.addLayout(self._field_row(tr("Edge"), self.target_edge_btn))
         self.target_px_input = QSpinBox()
         self.target_px_input.setRange(256, 32768)
         self.target_px_input.setValue(2000)
         self.target_px_input.setSuffix(" px")
-        self.target_px_input.setToolTip(tr("Long edge of the exported image"))
+        self.target_px_input.setToolTip(tr("Size of the selected edge of the exported image"))
         self.target_px_input.valueChanged.connect(self._on_changed)
-        target_px_inner.addLayout(self._field_row(tr("Long edge"), self.target_px_input))
+        target_px_inner.addLayout(self._field_row(tr("Size"), self.target_px_input))
         self.output_sharpen_slider = CompactSlider(tr("Sharpening"), 0.0, 1.0, 0.0)
         self.output_sharpen_slider.setToolTip(tr("Sharpens the export at its final size, after the resize. It adds to the Lab Sharpening"))
         self.output_sharpen_slider.valueChanged.connect(self._on_changed)
@@ -741,7 +749,9 @@ class ExportSettingsForm(QWidget):
             self._update_ratio_visibility(v["export_resolution_mode"])
             self.size_input.setValue(v["export_print_size"])
             self.dpi_input.setValue(v["export_dpi"])
-            self.target_px_input.setValue(v["export_target_long_edge_px"])
+            edge_idx = self.target_edge_btn.findData(v.get("export_target_edge", ExportTargetEdge.LONG))
+            self.target_edge_btn.setCurrentIndex(edge_idx if edge_idx >= 0 else 0)
+            self.target_px_input.setValue(v["export_target_edge_px"])
             self.output_sharpen_slider.setValue(v.get("output_sharpen", 0.0))
             _select_data(self.ratio_combo, str(v["paper_aspect_ratio"]))
 
@@ -788,7 +798,8 @@ class ExportSettingsForm(QWidget):
             "paper_aspect_ratio": self.ratio_combo.currentData(),
             "export_print_size": self.size_input.value(),
             "export_dpi": self.dpi_input.value(),
-            "export_target_long_edge_px": self.target_px_input.value(),
+            "export_target_edge": self.target_edge_btn.currentData(),
+            "export_target_edge_px": self.target_px_input.value(),
             "output_sharpen": self.output_sharpen_slider.value(),
             "output_mode": self.output_mode_combo.currentData() or ExportPresetOutputMode.ABSOLUTE,
             "output_subfolder": self.subfolder_edit.text(),

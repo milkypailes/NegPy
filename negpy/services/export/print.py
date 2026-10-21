@@ -2,7 +2,7 @@ from PIL import Image
 import cv2
 import numpy as np
 from typing import Optional, Tuple
-from negpy.domain.models import ExportConfig, AspectRatio, ExportResolutionMode
+from negpy.domain.models import ExportConfig, AspectRatio, ExportResolutionMode, ExportTargetEdge
 from negpy.features.finish.models import FinishConfig
 from negpy.features.toning.logic import apply_chemical_toning, apply_split_toning
 from negpy.features.toning.models import ToningConfig
@@ -113,22 +113,43 @@ class PrintService:
         return f"#{r:02x}{g:02x}{b:02x}"
 
     @staticmethod
-    def paper_long_edge_px(export_settings: ExportConfig) -> int:
-        """Long-edge paper size in pixels for non-ORIGINAL modes."""
+    def paper_long_over_short(aspect_ratio_str: str, img_w: int = 0, img_h: int = 0) -> float:
+        """Paper's long edge over its short edge. Original needs the image dimensions."""
+        if aspect_ratio_str == AspectRatio.ORIGINAL:
+            if img_w > 0 and img_h > 0:
+                return max(img_w, img_h) / min(img_w, img_h)
+            return 1.0
+        try:
+            w_r, h_r = map(float, aspect_ratio_str.split(":"))
+            ratio = w_r / h_r
+        except (ValueError, ZeroDivisionError):
+            return 1.0
+        return max(ratio, 1.0 / ratio)
+
+    @staticmethod
+    def paper_long_edge_px(export_settings: ExportConfig, img_w: int, img_h: int) -> int:
+        """Paper long edge in pixels for the Print and Pixels modes."""
         if export_settings.export_resolution_mode == ExportResolutionMode.TARGET_PX:
-            return max(1, int(export_settings.export_target_long_edge_px))
+            target = max(1, int(export_settings.export_target_edge_px))
+            if export_settings.export_target_edge != ExportTargetEdge.SHORT:
+                return target
+            ratio = PrintService.paper_long_over_short(export_settings.paper_aspect_ratio, img_w, img_h)
+            return max(1, int(round(target * ratio)))
         return int((export_settings.export_print_size / 2.54) * export_settings.export_dpi)
 
     @staticmethod
-    def effective_dpi(export_settings: ExportConfig) -> int:
+    def effective_dpi(export_settings: ExportConfig, img_w: int = 0, img_h: int = 0) -> int:
         """Physical DPI for PRINT/ORIGINAL; virtual DPI derived from target px in TARGET_PX (for border calc)."""
         if export_settings.export_resolution_mode == ExportResolutionMode.TARGET_PX:
             denom = max(0.1, export_settings.export_print_size) / 2.54
-            return max(1, int(export_settings.export_target_long_edge_px / denom))
+            span = float(export_settings.export_target_edge_px)
+            if export_settings.export_target_edge == ExportTargetEdge.SHORT:
+                span *= PrintService.paper_long_over_short(export_settings.paper_aspect_ratio, img_w, img_h)
+            return max(1, int(span / denom))
         return export_settings.export_dpi
 
     @staticmethod
-    def resolution_tag_dpi(export_settings, source_dpi: Optional[int] = None) -> int:
+    def resolution_tag_dpi(export_settings, source_dpi: Optional[int] = None, img_w: int = 0, img_h: int = 0) -> int:
         """DPI to tag an exported file with.
 
         ORIGINAL resamples nothing, so the pixels keep the source's sampling density and
@@ -138,7 +159,7 @@ class PrintService:
         unit and a persisted config can hold a 0 the spinbox cannot produce."""
         if export_settings.export_resolution_mode == ExportResolutionMode.ORIGINAL:
             return max(1, int(source_dpi or export_settings.export_dpi))
-        return max(1, PrintService.effective_dpi(export_settings))
+        return max(1, PrintService.effective_dpi(export_settings, img_w, img_h))
 
     @staticmethod
     def paper_dims_from_long_edge(long_edge_px: int, aspect_ratio_str: str, img_w: int, img_h: int) -> Tuple[int, int]:
@@ -197,7 +218,7 @@ class PrintService:
         img_h, img_w = img.shape[:2]
         img_aspect = img_w / img_h
         mode = export_settings.export_resolution_mode
-        dpi = PrintService.effective_dpi(export_settings)
+        dpi = PrintService.effective_dpi(export_settings, img_w, img_h)
         border_px = int((border_size / 2.54) * dpi)
         border_bottom_px = int(border_px * weight)
         border_y_px = border_px + border_bottom_px
@@ -226,15 +247,22 @@ class PrintService:
                     paper_h = min_paper_h
                     paper_w = int(paper_h * paper_ratio)
         else:
-            paper_long_px = PrintService.paper_long_edge_px(export_settings)
+            paper_long_px = PrintService.paper_long_edge_px(export_settings, img_w, img_h)
+            short_target = mode == ExportResolutionMode.TARGET_PX and export_settings.export_target_edge == ExportTargetEdge.SHORT
 
             if export_settings.paper_aspect_ratio == AspectRatio.ORIGINAL:
                 if img_w >= img_h:
                     target_w = max(10, paper_long_px - 2 * border_px)
                     target_h = int(target_w / img_aspect)
+                    if short_target:
+                        target_h = max(10, int(export_settings.export_target_edge_px) - border_y_px)
+                        target_w = int(target_h * img_aspect)
                 else:
                     target_h = max(10, paper_long_px - border_y_px)
                     target_w = int(target_h * img_aspect)
+                    if short_target:
+                        target_w = max(10, int(export_settings.export_target_edge_px) - 2 * border_px)
+                        target_h = int(target_w / img_aspect)
                 paper_w = target_w + 2 * border_px
                 paper_h = target_h + border_y_px
             else:

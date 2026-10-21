@@ -270,13 +270,13 @@ def _use_half_size_decode(raw: Any) -> bool:
 _DERIVE_RESOLUTION: Any = object()
 
 
-def _tiff_resolution(resolution: Optional[Resolution], export_settings) -> Resolution:
+def _tiff_resolution(resolution: Optional[Resolution], export_settings, img_w: int = 0, img_h: int = 0) -> Resolution:
     """TIFF cannot say "no resolution". Leaving the tags out makes tifffile write
     XResolution (1, 1) with ResolutionUnit NONE, which readers report as 1 DPI, so a
     file with nothing to preserve states the export's own resolution instead. Being
     unable to stay silent is not a licence to state something false."""
     if resolution is None:
-        return Resolution.from_dpi(PrintService.resolution_tag_dpi(export_settings))
+        return Resolution.from_dpi(PrintService.resolution_tag_dpi(export_settings, img_w=img_w, img_h=img_h))
     return resolution
 
 
@@ -1666,7 +1666,9 @@ class ImageProcessor:
         icc_input = export_settings.icc_input_path
         icc_output = export_settings.icc_output_path
         if resolution is _DERIVE_RESOLUTION:
-            resolution = Resolution.from_dpi(PrintService.resolution_tag_dpi(export_settings))
+            resolution = Resolution.from_dpi(
+                PrintService.resolution_tag_dpi(export_settings, img_w=int(buffer.shape[1]), img_h=int(buffer.shape[0]))
+            )
 
         # A target with no ICC profile (ACES/XYZ, or a stale custom name) can be neither
         # converted to nor tagged, so the file would carry untagged working-space pixels.
@@ -1698,7 +1700,7 @@ class ImageProcessor:
                 encode_tiff(
                     img_out,
                     icc=icc_bytes,
-                    resolution=_tiff_resolution(resolution, export_settings),
+                    resolution=_tiff_resolution(resolution, export_settings, int(img_out.shape[1]), int(img_out.shape[0])),
                     compression=export_settings.tiff_compression,
                     **meta_kwargs,
                 ),

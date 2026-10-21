@@ -204,12 +204,12 @@ class TestFlatConfigHelpers(unittest.TestCase):
     def test_flat_export_config_honours_target_px(self):
         src = ExportConfig(
             export_resolution_mode=ExportResolutionMode.TARGET_PX.value,
-            export_target_long_edge_px=6000,
+            export_target_edge_px=6000,
             paper_aspect_ratio=AspectRatio.R_3_2,
         )
         out = flat_export_config(src)
         self.assertEqual(out.export_resolution_mode, ExportResolutionMode.TARGET_PX.value)
-        self.assertEqual(out.export_target_long_edge_px, 6000)
+        self.assertEqual(out.export_target_edge_px, 6000)
         self.assertEqual(out.paper_aspect_ratio, AspectRatio.R_3_2)
 
     def test_flat_export_config_honours_print_mode(self):
@@ -233,7 +233,7 @@ class TestFlatConfigHelpers(unittest.TestCase):
         export = flat_export_config(
             ExportConfig(
                 export_resolution_mode=ExportResolutionMode.TARGET_PX.value,
-                export_target_long_edge_px=6000,
+                export_target_edge_px=6000,
             )
         )
         result, _ = PrintService.apply_layout(img, export)

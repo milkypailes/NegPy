@@ -52,6 +52,13 @@ class ExportResolutionMode(StrEnum):
     TARGET_PX = "target_px"
 
 
+class ExportTargetEdge(StrEnum):
+    """Which edge the Pixels size sets; the other edge follows the paper ratio."""
+
+    LONG = "long"
+    SHORT = "short"
+
+
 class TiffCompression(StrEnum):
     """Values are the literal ``tifffile`` compression arguments.
 
@@ -191,7 +198,8 @@ class ExportConfig:
     export_print_size: float = 30.0
     export_dpi: int = 300
     export_resolution_mode: ExportResolutionMode = ExportResolutionMode.ORIGINAL
-    export_target_long_edge_px: int = 2000
+    export_target_edge: ExportTargetEdge = ExportTargetEdge.LONG
+    export_target_edge_px: int = 2000
     # Unsharp mask amount on a resized export, applied at the exported size.
     output_sharpen: float = 0.0
     filename_pattern: str = "{{ original_name }}"
@@ -214,6 +222,11 @@ class ExportConfig:
             self,
             "export_resolution_mode",
             coerce_enum(ExportResolutionMode, self.export_resolution_mode, ExportResolutionMode.ORIGINAL),
+        )
+        object.__setattr__(
+            self,
+            "export_target_edge",
+            coerce_enum(ExportTargetEdge, self.export_target_edge, ExportTargetEdge.LONG),
         )
         object.__setattr__(self, "output_mode", coerce_enum(ExportPresetOutputMode, self.output_mode, ExportPresetOutputMode.ABSOLUTE))
         object.__setattr__(self, "tiff_compression", coerce_enum(TiffCompression, self.tiff_compression, TiffCompression.ZIP))
@@ -250,7 +263,8 @@ class ExportPreset:
     paper_aspect_ratio: str = AspectRatio.ORIGINAL
     export_print_size: float = 30.0
     export_dpi: int = 300
-    export_target_long_edge_px: int = 2000
+    export_target_edge: ExportTargetEdge = ExportTargetEdge.LONG
+    export_target_edge_px: int = 2000
     output_sharpen: float = 0.0
 
     # Output destination
@@ -268,6 +282,7 @@ class ExportPreset:
     def __post_init__(self) -> None:
         self.export_fmt = coerce_enum(ExportFormat, migrate_export_fmt(self.export_fmt), ExportFormat.JPEG)
         self.export_resolution_mode = coerce_enum(ExportResolutionMode, self.export_resolution_mode, ExportResolutionMode.ORIGINAL)
+        self.export_target_edge = coerce_enum(ExportTargetEdge, self.export_target_edge, ExportTargetEdge.LONG)
         self.output_mode = coerce_enum(ExportPresetOutputMode, self.output_mode, ExportPresetOutputMode.SAME_AS_SOURCE)
         self.tiff_compression = coerce_enum(TiffCompression, self.tiff_compression, TiffCompression.ZIP)
 
@@ -293,7 +308,8 @@ class ExportPreset:
             "paper_aspect_ratio": self.paper_aspect_ratio,
             "export_print_size": self.export_print_size,
             "export_dpi": self.export_dpi,
-            "export_target_long_edge_px": self.export_target_long_edge_px,
+            "export_target_edge": self.export_target_edge,
+            "export_target_edge_px": self.export_target_edge_px,
             "output_sharpen": self.output_sharpen,
             "output_mode": self.output_mode,
             "output_subfolder": self.output_subfolder,
@@ -308,7 +324,8 @@ class ExportPreset:
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "ExportPreset":
         known = cls.__dataclass_fields__.keys()
-        return cls(**{k: v for k, v in d.items() if k in known})
+        data = migrate_flat_config(dict(d))
+        return cls(**{k: v for k, v in data.items() if k in known})
 
 
 def preset_display_name(preset: ExportPreset) -> str:
@@ -340,7 +357,8 @@ def preset_from_export_config(conf: ExportConfig, name: str = "Current settings"
         paper_aspect_ratio=conf.paper_aspect_ratio,
         export_print_size=conf.export_print_size,
         export_dpi=conf.export_dpi,
-        export_target_long_edge_px=conf.export_target_long_edge_px,
+        export_target_edge=conf.export_target_edge,
+        export_target_edge_px=conf.export_target_edge_px,
         output_sharpen=conf.output_sharpen,
         output_mode=conf.output_mode,
         output_subfolder=conf.output_subfolder,
