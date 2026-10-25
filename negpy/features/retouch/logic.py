@@ -2,14 +2,12 @@ import hashlib
 import math
 from typing import List, Optional, Tuple
 
-import cv2
+import negpy_core
 import numpy as np
-from numba import prange  # type: ignore
 
 from negpy.domain.types import ImageBuffer
 from negpy.features.geometry.logic import smooth_polyline
-from negpy.features.retouch.models import HEAL_SIZE_MAX, HEAL_SIZE_MIN, HEAL_SIZE_REF, IR_METHOD_NEGPY
-from negpy.kernel.system.parallel import parallel_njit
+from negpy.features.retouch.models import HEAL_SIZE_MAX, HEAL_SIZE_MIN, HEAL_SIZE_REF
 from negpy.kernel.image.logic import get_luminance
 from negpy.kernel.image.validation import ensure_image
 from negpy.kernel.system.logging import get_logger
@@ -23,7 +21,7 @@ _PROXY_MIN_SPREAD = 0.8
 _DETECT_PAD_PX = 2.5
 # Optical detection: density excess over a robust background, averaged over 3x3, in units of
 # its local MAD σ. Under the average a speck keeps its full excess while grain drops by 3.
-# The robust filters run on 8-bit planes (cv2.medianBlur is O(1) there); the excess is
+# The robust filters run on 8-bit planes (the uint8 median blur is O(1) there); the excess is
 # scaled by _DETECT_MAD_GAIN first so grain σ spans enough levels.
 _DETECT_AVG_PX = 3
 _DETECT_MAD_GAIN = 4.0
@@ -44,7 +42,7 @@ _DETECT_GROW_REACH = 2  # times dust_size, px
 # defect raises its own bar. Clean film of any grain sits under the knee.
 _DETECT_TEXTURE_KNEE = 0.02
 _DETECT_TEXTURE_GAIN = 40.0  # bar multiplier per unit of σ over the knee
-# A hair-shaped component (_is_hair) tests its median σ against a higher, steeper knee: a hair across
+# A hair-shaped component (negpy_core's is_hair) tests its median σ against a higher, steeper knee: a hair across
 # busy film stays under it, a seed grown along a tonal edge does not.
 _DETECT_HAIR_TEXTURE_KNEE = 0.075
 _DETECT_HAIR_TEXTURE_GAIN = 150.0
@@ -207,12 +205,12 @@ _REPAIR_MAX_COMPONENTS = 256
 
 # Strong hairs and scratches route to structure-following inpaint instead of the weighted
 # fill: a long twist crosses varied background, and averaging across it smears the structure
-# the inpaint follows. Detection-scale px. See _is_hair.
+# the inpaint follows. Detection-scale px. See is_hair in negpy_core/src/retouch.rs.
 _HAIR_MIN_AREA = 20
 _HAIR_MIN_ELONG = 8.0  # area/thickness² ≈ length/thickness; round specks measure 1–3
-# cv2.inpaint fill: the dilate covers the PSF skirt at 1:1 (apply_hair_inpaint widens it to
+# Inpaint fill: the dilate covers the PSF skirt at 1:1 (apply_hair_inpaint widens it to
 # track the mask's upsample), then the NS radius, then gamma to give the 8-bit encode a
-# perceptual spread (cv2.inpaint is 8-bit only). Navier-Stokes propagates outward from the
+# perceptual spread (the inpaint is 8-bit). Navier-Stokes propagates outward from the
 # mask boundary only, so each defect is filled in its own bbox + _HAIR_INPAINT_PAD. Same
 # pixels, without gamma-encoding the whole frame to serve a hairline.
 _HAIR_DILATE_PX = 1
@@ -224,70 +222,24 @@ _HAIR_TILE_HALO = 32  # px of neighbourhood a tile's core fill can see
 _HAIR_INPAINT_PAD = 16
 
 
-def _proxy_norm(img: ImageBuffer) -> Tuple[float, float]:
-    """(lo, spread) percentile normalization of the detection proxy."""
-    dens = -np.log10(np.clip(get_luminance(img), 1e-6, None))
-    lo, hi = np.percentile(dens, (0.5, 99.5))
-    return float(lo), max(float(hi - lo), _PROXY_MIN_SPREAD)
-
-
-def _is_hair(labels_sub: np.ndarray, area: int) -> bool:
-    """Hair/scratch (thin) rather than speck: ``2*max(distanceTransform)`` is the widest
-    the defect ever gets, so ``area/thickness²`` reads as length/thickness for a ribbon.
-
-    Thin, not straight — bending moves no interior pixel further from its edge, so a
-    twist scores like a straight hair, where PCA extent/width (the obvious measure)
-    calls it compact. The real hair on samples/ir/18.tiff: PCA aspect 2.45 = "speck",
-    thinness 26.3 = hair.
-    """
-    if area < _HAIR_MIN_AREA:
-        return False
-    # Pad, or a component touching the sub-image border reads as thin along that edge.
-    dist = cv2.distanceTransform(np.pad(labels_sub.astype(np.uint8), 1), cv2.DIST_L2, 5)
-    thickness = 2.0 * float(dist.max())
-    return area / max(thickness * thickness, 1e-6) >= _HAIR_MIN_ELONG
-
-
-def _box_mean_std(plane: np.ndarray, win: int) -> Tuple[np.ndarray, np.ndarray]:
-    """Local mean and standard deviation of ``plane`` over a ``win``×``win`` box."""
-    mean = cv2.blur(plane, (win, win))
-    var = cv2.blur(plane * plane, (win, win)) - mean * mean
-    return mean, np.sqrt(np.clip(var, 0.0, None))
-
-
 def _density(img: ImageBuffer) -> np.ndarray:
     """Log density of the luminance. Local contrast measured here is exposure-invariant:
     a gain on the source is an offset in density and cancels in every difference."""
-    return -np.log10(np.clip(get_luminance(img), 1e-6, None)).astype(np.float32)
+    return -negpy_core.log_density_open(get_luminance(img))
 
 
 def _mask_to_score(mask: np.ndarray, pad_px: float) -> np.ndarray:
     """Binary defect mask → the continuous score every repair consumes: at the floor on
     the defect, ramping to clean over ``pad_px``. The ramp is the skirt allowance a hard
     mask edge would leave behind as a halo."""
-    d = cv2.distanceTransform((np.asarray(mask) == 0).astype(np.uint8), cv2.DIST_L2, 3)
-    t = np.clip(d / max(pad_px, 1e-3), 0.0, 1.0)
-    return (_IR_SCORE_FLOOR + (1.0 - _IR_SCORE_FLOOR) * (t * t * (3.0 - 2.0 * t))).astype(np.float32)
+    return negpy_core.mask_to_score((np.asarray(mask) != 0).astype(np.uint8), float(pad_px), _IR_SCORE_FLOOR)
 
 
 def split_hairs(mask: np.ndarray) -> Tuple[np.ndarray, Optional[np.ndarray]]:
     """Defect mask → ``(compact, hairs)``. Compact defects go to the weighted fill; long
     twisted ones to structure-following inpaint, which keeps detail the fill would average
     across. ``hairs`` is None when nothing is thin enough."""
-    n_lbl, labels, stats, _ = cv2.connectedComponentsWithStats(np.ascontiguousarray(mask, dtype=np.uint8), connectivity=8)
-    compact = np.zeros(mask.shape[:2], dtype=np.uint8)
-    hairs: Optional[np.ndarray] = None
-    for i in range(1, n_lbl):
-        x0, y0 = int(stats[i, cv2.CC_STAT_LEFT]), int(stats[i, cv2.CC_STAT_TOP])
-        bw, bh = int(stats[i, cv2.CC_STAT_WIDTH]), int(stats[i, cv2.CC_STAT_HEIGHT])
-        labels_sub = labels[y0 : y0 + bh, x0 : x0 + bw] == i
-        if _is_hair(labels_sub, int(stats[i, cv2.CC_STAT_AREA])):
-            if hairs is None:
-                hairs = np.zeros(mask.shape[:2], dtype=np.uint8)
-            hairs[y0 : y0 + bh, x0 : x0 + bw][labels_sub] = 1
-        else:
-            compact[y0 : y0 + bh, x0 : x0 + bw][labels_sub] = 1
-    return compact, hairs
+    return negpy_core.split_hairs(np.ascontiguousarray(mask, dtype=np.uint8), (_HAIR_MIN_AREA, _HAIR_MIN_ELONG))
 
 
 def _u8(plane: np.ndarray) -> np.ndarray:
@@ -316,6 +268,13 @@ def detection_margin(shape: Tuple[int, int], dust_size: int) -> int:
     return v_win // 2 + w_win // 2 + reach + int(math.ceil(_DETECT_PAD_PX * scale)) + 2
 
 
+def _proxy_norm(img: ImageBuffer) -> Tuple[float, float]:
+    """(lo, spread) percentile normalization of the detection proxy."""
+    dens = np.ascontiguousarray(_density(img), dtype=np.float32)
+    lo, hi = negpy_core.percentiles(dens.ravel(), [0.5, 99.5])
+    return float(lo), max(float(hi - lo), _PROXY_MIN_SPREAD)
+
+
 def compute_dust_stats(img: ImageBuffer, dust_size: int, *, reference: Optional[ImageBuffer] = None) -> Tuple[np.ndarray, ...]:
     """Threshold-independent detection maps ``(proxy, background, z, texture)``, the
     expensive part of a detection pass, cacheable across threshold changes. ``z`` is the
@@ -325,20 +284,15 @@ def compute_dust_stats(img: ImageBuffer, dust_size: int, *, reference: Optional[
     ``reference`` is the whole frame ``img`` is a crop of. The windows take its film scale
     and the proxy its frame-wide normalization, so a region's maps match the full scan."""
     ref = img if reference is None else reference
-    lo, spread = _proxy_norm(ref)
-    proxy = np.clip((_density(img) - lo) / spread, 0.0, 1.0).astype(np.float32)
     # Size is film footprint at _IR_DETECT_REF; the windows follow the plane (see _ir_win).
     base_size, v_win, w_win = _detect_windows(film_scale(ref.shape[:2]), dust_size)
     # Median: the level of the film around a defect narrower than half the window. Opening:
     # identity on the soft ramp of a tonal edge and on anything wider than a speck, both of
     # which the median alone calls dense. Whichever is higher is the background.
-    disk = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * int(round(base_size)) + 1,) * 2)
-    background = np.maximum(cv2.medianBlur(_u8(proxy), v_win).astype(np.float32) / 255.0, cv2.morphologyEx(proxy, cv2.MORPH_OPEN, disk))
-    excess = cv2.blur(proxy - background, (_DETECT_AVG_PX, _DETECT_AVG_PX))
-    mad = cv2.medianBlur(_u8(np.abs(excess) * _DETECT_MAD_GAIN), w_win).astype(np.float32) / (255.0 * _DETECT_MAD_GAIN)
-    z = excess / np.maximum(mad / 0.6745, _DETECT_SIGMA_MIN)
-    _, texture = _box_mean_std(proxy, w_win)
-    return tuple(np.ascontiguousarray(a.astype(np.float32)) for a in (proxy, background, z, texture))
+    disk = negpy_core.ellipse_kernel((2 * int(round(base_size)) + 1,) * 2)
+    constants = (_PROXY_MIN_SPREAD, _DETECT_AVG_PX, _DETECT_MAD_GAIN, _DETECT_SIGMA_MIN)
+    norm = _proxy_norm(ref) if reference is not None else None
+    return negpy_core.dust_stats(_density(img), v_win, w_win, disk, constants, norm)
 
 
 def detect_bar(slider: float) -> float:
@@ -352,50 +306,6 @@ def detect_bar(slider: float) -> float:
     return _DETECT_Z_DEFAULT * (_DETECT_Z_TIGHT / _DETECT_Z_DEFAULT) ** t
 
 
-def _keep_components(
-    z: np.ndarray,
-    seeds: np.ndarray,
-    lab: np.ndarray,
-    comp_stats: np.ndarray,
-    background: np.ndarray,
-    proxy: np.ndarray,
-    texture: np.ndarray,
-    hi: float,
-    hi_hair: float,
-    scale: float,
-    dust_size: int,
-) -> np.ndarray:
-    """Per-component verdict: a compact candidate keeps its seed verdict, a hair-shaped one
-    is tested against the hair bar and its own texture ramp. Shared by both optical detectors,
-    which differ only in their proxy and morphology."""
-    n_lbl = int(comp_stats.shape[0])
-    bar = hi * (1.0 + _DETECT_TEXTURE_GAIN * np.maximum(texture - _DETECT_TEXTURE_KNEE, 0.0))
-    strong = np.zeros(n_lbl, dtype=bool)
-    strong[np.unique(lab[seeds & (z >= bar)])] = True
-    peak = np.zeros(n_lbl, dtype=np.float32)
-    np.maximum.at(peak, lab[seeds], z[seeds])
-    keep = np.zeros(n_lbl, dtype=bool)
-    hairs = []
-    for i in np.flatnonzero(peak[1:] > 0) + 1:
-        x0, y0 = int(comp_stats[i, cv2.CC_STAT_LEFT]), int(comp_stats[i, cv2.CC_STAT_TOP])
-        bw, bh = int(comp_stats[i, cv2.CC_STAT_WIDTH]), int(comp_stats[i, cv2.CC_STAT_HEIGHT])
-        if _is_hair(lab[y0 : y0 + bh, x0 : x0 + bw] == i, int(comp_stats[i, cv2.CC_STAT_AREA])):
-            hairs.append(i)
-        else:
-            keep[i] = strong[i]
-    if hairs:
-        is_hair = np.zeros(n_lbl, dtype=bool)
-        is_hair[hairs] = True
-        _, filled = _box_mean_std(np.where(is_hair[lab], background, proxy), _texture_win(scale, dust_size))
-        hair_tex = np.minimum(texture, _DETECT_HAIR_FILL_GAIN * filled)
-        for i in hairs:
-            x0, y0 = int(comp_stats[i, cv2.CC_STAT_LEFT]), int(comp_stats[i, cv2.CC_STAT_TOP])
-            bw, bh = int(comp_stats[i, cv2.CC_STAT_WIDTH]), int(comp_stats[i, cv2.CC_STAT_HEIGHT])
-            tex = float(np.median(hair_tex[y0 : y0 + bh, x0 : x0 + bw][lab[y0 : y0 + bh, x0 : x0 + bw] == i]))
-            keep[i] = peak[i] >= hi_hair * (1.0 + _DETECT_HAIR_TEXTURE_GAIN * max(tex - _DETECT_HAIR_TEXTURE_KNEE, 0.0))
-    return keep
-
-
 def detect_luma_score(
     img: ImageBuffer,
     dust_threshold: float,
@@ -405,7 +315,7 @@ def detect_luma_score(
     *,
     reference: Optional[ImageBuffer] = None,
 ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-    """Statistical dust detection on the linear source → ``(score, hair_mask)``: a fill score for
+    """Statistical dust detection on the linear source -> ``(score, hair_mask)``: a fill score for
     compact specks, an inpaint mask for hairs. A speck must clear ``dust_threshold``'s bar, a hair
     ``hair_threshold``'s (default: the same), each raised by its own texture ramp. ``reference`` is
     the whole frame a crop belongs to (see ``compute_dust_stats``)."""
@@ -414,21 +324,21 @@ def detect_luma_score(
     proxy, background, z, texture = stats[:4]
     hi = detect_bar(dust_threshold)
     hi_hair = hi if hair_threshold is None else detect_bar(hair_threshold)
-    seeds = (z >= min(hi, hi_hair)) & (proxy > _DETECT_PROXY_MIN)
-    if not np.any(seeds):
-        return None, None
     scale = film_scale((img if reference is None else reference).shape[:2])
     lo = max(_DETECT_Z_GROW, min(hi, hi_hair) * _DETECT_Z_GROW_FRAC)
     reach = int(round(_DETECT_GROW_REACH * max(1, dust_size) * scale))
-    near = cv2.dilate(seeds.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * reach + 1,) * 2)) > 0
-    n_lbl, lab, stats_cc, _ = cv2.connectedComponentsWithStats((near & (z >= lo)).astype(np.uint8), connectivity=8)
-    keep = _keep_components(z, seeds, lab, stats_cc, background, proxy, texture, hi, hi_hair, scale, dust_size)
-    if not keep.any():
-        return None, None
-    hit = keep[lab].astype(np.uint8)
-    compact, hair_mask = split_hairs(hit)
-    score = _mask_to_score(compact, _DETECT_PAD_PX * scale) if compact.any() else None
-    return score, hair_mask
+    disk = negpy_core.ellipse_kernel((2 * reach + 1,) * 2)
+    planes = tuple(np.ascontiguousarray(a, dtype=np.float32) for a in (proxy, background, z, texture))
+    return negpy_core.detect_luma_score(
+        planes,
+        (hi, hi_hair, lo),
+        disk,
+        (_DETECT_PROXY_MIN, _DETECT_TEXTURE_KNEE, _DETECT_TEXTURE_GAIN),
+        (_HAIR_MIN_AREA, _HAIR_MIN_ELONG),
+        (_DETECT_HAIR_TEXTURE_KNEE, _DETECT_HAIR_TEXTURE_GAIN, _DETECT_HAIR_FILL_GAIN),
+        _texture_win(scale, dust_size),
+        (_DETECT_PAD_PX * scale, _IR_SCORE_FLOOR),
+    )
 
 
 def detect_bright_luma_score(
@@ -444,7 +354,7 @@ def detect_bright_luma_score(
     film around it. Measured in linear space, not density: density is logarithmic, so a
     bright speck's deficit is squashed by the proxy normalization while a dark speck's
     excess is unbounded. Morphology mirrors too (close keeps bright marks, background
-    takes the minimum), with the same seed bar, grain-relative σ and hysteresis. The
+    takes the minimum), with the same seed bar, grain-relative sigma and hysteresis. The
     texture ramp is measured on the same linear proxy: uniform areas (sky, walls) keep
     full sensitivity, busy film only reports strong outliers. Returns ``(score, hair_mask)``
     like the dark side: a bright hair is the same thin mark, so it takes the same hair bar
@@ -459,38 +369,26 @@ def detect_bright_luma_score(
     if not math.isfinite(min(hi, hi_hair)):
         return None, None
     ref = img if reference is None else reference
-    lin = get_luminance(img).astype(np.float32)
-    white = max(float(np.percentile(get_luminance(ref), 99.5)), 1e-6)
-    # Gain-invariant like the density z: a gain scales the surplus and its σ together.
-    # Normalized by level, not range, so flat film cannot squash the surplus the way
-    # the density spread floor would.
-    proxy = np.ascontiguousarray(lin / white)
+    lin = np.ascontiguousarray(get_luminance(img), dtype=np.float32)
+    white = max(float(negpy_core.percentiles(np.ascontiguousarray(get_luminance(ref), dtype=np.float32).ravel(), [99.5])[0]), 1e-6)
     scale = film_scale(ref.shape[:2])
     base_size, v_win, w_win = _detect_windows(scale, dust_size)
-    clipped = np.clip(proxy, 0.0, 1.0)
-    disk = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * int(round(base_size)) + 1,) * 2)
-    background = np.minimum(
-        cv2.medianBlur(_u8(clipped), v_win).astype(np.float32) / 255.0, cv2.morphologyEx(clipped, cv2.MORPH_CLOSE, disk)
-    )
-    excess = cv2.blur(proxy - background, (_DETECT_AVG_PX, _DETECT_AVG_PX))
-    mad = cv2.medianBlur(_u8(np.abs(excess) * _DETECT_MAD_GAIN), w_win).astype(np.float32) / (255.0 * _DETECT_MAD_GAIN)
-    z = excess / np.maximum(mad / 0.6745, _DETECT_SIGMA_MIN)
-    _, texture = _box_mean_std(proxy, w_win)
-    seed_bar = min(hi, hi_hair)
-    seeds = z >= seed_bar
-    if not np.any(seeds):
-        return None, None
-    lo = max(_DETECT_Z_GROW, seed_bar * _DETECT_Z_GROW_FRAC)
+    disk = negpy_core.ellipse_kernel((2 * int(round(base_size)) + 1,) * 2)
+    constants = (_PROXY_MIN_SPREAD, _DETECT_AVG_PX, _DETECT_MAD_GAIN, _DETECT_SIGMA_MIN)
+    stats = negpy_core.dust_stats_bright(lin, white, v_win, w_win, disk, constants)
+    lo = max(_DETECT_Z_GROW, min(hi, hi_hair) * _DETECT_Z_GROW_FRAC)
     reach = int(round(_DETECT_GROW_REACH * max(1, dust_size) * scale))
-    near = cv2.dilate(seeds.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * reach + 1,) * 2)) > 0
-    _n_lbl, lab, stats_cc, _ = cv2.connectedComponentsWithStats((near & (z >= lo)).astype(np.uint8), connectivity=8)
-    keep = _keep_components(z, seeds, lab, stats_cc, background, proxy, texture, hi, hi_hair, scale, dust_size)
-    if not keep.any():
-        return None, None
-    hit = keep[lab].astype(np.uint8)
-    compact, hair_mask = split_hairs(hit)
-    score = _mask_to_score(compact, _DETECT_PAD_PX * scale) if compact.any() else None
-    return score, hair_mask
+    reach_disk = negpy_core.ellipse_kernel((2 * reach + 1,) * 2)
+    return negpy_core.detect_luma_score(
+        stats,
+        (hi, hi_hair, lo),
+        reach_disk,
+        (-1.0, _DETECT_TEXTURE_KNEE, _DETECT_TEXTURE_GAIN),
+        (_HAIR_MIN_AREA, _HAIR_MIN_ELONG),
+        (_DETECT_HAIR_TEXTURE_KNEE, _DETECT_HAIR_TEXTURE_GAIN, _DETECT_HAIR_FILL_GAIN),
+        _texture_win(scale, dust_size),
+        (_DETECT_PAD_PX * scale, _IR_SCORE_FLOOR),
+    )
 
 
 def exclusion_cover(strokes: List[Tuple], shape: Tuple[int, int]) -> np.ndarray:
@@ -499,19 +397,16 @@ def exclusion_cover(strokes: List[Tuple], shape: Tuple[int, int]) -> np.ndarray:
     loose dabs would leave the film between them repaired. Smoothed past two points and
     round-capped, so the band matches the one the overlay draws."""
     h, w = shape[:2]
-    cover = np.zeros((h, w), dtype=np.uint8)
     scale = max(w, h) / HEAL_SIZE_REF
+    bands = []
     for points, size in strokes:
         radius = max(1, int(round(float(size) * scale * 0.5)))
         chain = [(float(p[0]) * w, float(p[1]) * h) for p in points]
         if len(chain) >= 3:
             chain = smooth_polyline(chain, closed=False)
-        pts = np.round(np.array(chain, dtype=np.float32)).astype(np.int32)
-        if len(pts) > 1:
-            cv2.polylines(cover, [pts], False, 1, thickness=max(1, 2 * radius))
-        for cx, cy in pts:  # round caps and joins, as a thick polyline alone ends flat
-            cv2.circle(cover, (int(cx), int(cy)), radius, 1, -1)
-    return cover
+        pts = np.ascontiguousarray(np.round(np.array(chain, dtype=np.float32)).astype(np.int32))
+        bands.append((pts, radius, max(1, 2 * radius)))
+    return negpy_core.stroke_cover((h, w), bands)
 
 
 def drop_exclusions(
@@ -531,10 +426,8 @@ def drop_exclusions(
     if score is not None:
         # Feather the rim, as the manual heal does its own: the score is a ramp, and cutting
         # one at the brush edge prints the edge as a step.
-        d = cv2.distanceTransform(cover, cv2.DIST_L2, 3)
-        alpha = np.clip(d / _MANUAL_RIM_PX, 0.0, 1.0)
-        score = (score + alpha * (1.0 - score)).astype(np.float32)
-        if not (score < 1.0).any():
+        score = np.array(score, dtype=np.float32)
+        if not negpy_core.release_score(score, cover, _MANUAL_RIM_PX):
             score = None
     if hair_mask is not None:
         # Binary, so it takes the footprint unfeathered.
@@ -630,13 +523,13 @@ def dust_detections_to_heal_strokes(
         if hit.any():
             masks.append(hit)
     elif score is not None:
-        hit = cv2.resize(np.asarray(score).astype(np.float32), (w, h), interpolation=cv2.INTER_LINEAR) < 1.0
+        hit = negpy_core.resize_linear(np.ascontiguousarray(score, dtype=np.float32), (w, h)) < 1.0
         if np.any(hit):
             masks.append(hit.astype(np.uint8))
     for hm in hair_masks or []:
         arr = np.asarray(hm)
         if arr.shape[:2] != (h, w):
-            arr = (cv2.resize(arr.astype(np.float32), (w, h), interpolation=cv2.INTER_NEAREST) > 0).astype(np.uint8)
+            arr = (negpy_core.resize_nearest(np.ascontiguousarray(arr, dtype=np.uint8), (w, h)) > 0).astype(np.uint8)
         else:
             arr = (arr > 0).astype(np.uint8)
         if arr.any():
@@ -644,9 +537,9 @@ def dust_detections_to_heal_strokes(
 
     comps: List[Tuple[int, np.ndarray]] = []
     for m in masks:
-        n_lbl, labels, stats, _ = cv2.connectedComponentsWithStats(np.ascontiguousarray(m), connectivity=8)
+        n_lbl, labels, stats, _ = negpy_core.connected_components_with_stats(np.ascontiguousarray(m), 8)
         for i in range(1, n_lbl):
-            area = int(stats[i, cv2.CC_STAT_AREA])
+            area = int(stats[i, 4])
             if area < 2:
                 continue
             comps.append((area, (labels == i)))
@@ -672,7 +565,11 @@ def dust_detections_to_heal_strokes(
             cy, cx = float(ys.mean()), float(xs.mean())
             strokes.append(([[cx / w, cy / h]], size, 0.0, 0.0))
         else:
-            dilated = cv2.dilate(comp.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (max(1, int(step_full) | 1),) * 2))
+            dilated = negpy_core.morphology_ex(
+                np.ascontiguousarray(comp, dtype=np.uint8),
+                1,
+                negpy_core.ellipse_kernel((max(1, int(step_full) | 1),) * 2),
+            )
             step = max(1, int(round(step_full)))
             for gy in range(y0, y1 + 1, step):
                 for gx in range(x0, x1 + 1, step):
@@ -686,6 +583,17 @@ def dust_detections_to_heal_strokes(
     return strokes
 
 
+def _contour_area(points: List[Tuple[int, int]]) -> float:
+    """Shoelace area of a closed polygon, as ``cv2.contourArea`` reads it."""
+    if len(points) < 3:
+        return 0.0
+    area = 0.0
+    for i, (x1, y1) in enumerate(points):
+        x2, y2 = points[(i + 1) % len(points)]
+        area += x1 * y2 - x2 * y1
+    return abs(area) * 0.5
+
+
 def _trace_contour_stroke(sub: np.ndarray, x0: int, y0: int, w: int, h: int, ref_scale: float, pad: float) -> Optional[Tuple]:
     """Component → one closed contour stroke tracing it, or None when the brush cannot
     cover it. The brush spans the defect's own thickness plus the skirt pad, which
@@ -694,25 +602,24 @@ def _trace_contour_stroke(sub: np.ndarray, x0: int, y0: int, w: int, h: int, ref
     gaps. ``(x0, y0)`` is the sub-image offset in the full plane. None past the
     largest brush: the caller tiles those instead."""
     # Padded: the crop holds no background, against which the transform measures.
-    dist = cv2.distanceTransform(np.pad(np.ascontiguousarray(sub.astype(np.uint8)), 1), cv2.DIST_L2, 5)
+    dist = negpy_core.distance_transform(np.pad(np.ascontiguousarray(sub, dtype=np.uint8), 1), 2, 5)
     size = 2.0 * (float(dist.max()) + pad) / ref_scale
     if size > HEAL_SIZE_MAX:
         return None
     size = max(size, HEAL_SIZE_MIN)
-    contours, _ = cv2.findContours(np.ascontiguousarray(sub.astype(np.uint8)), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    eps = max(1.0, size * ref_scale * 0.25)
+    contours = negpy_core.contour_outlines(np.ascontiguousarray(sub, dtype=np.uint8), 0.0, eps)
     if not contours:
         return None
-    contour = max(contours, key=cv2.contourArea)
-    eps = max(1.0, size * ref_scale * 0.25)
-    approx = cv2.approxPolyDP(contour, eps, True)
+    approx = max(contours, key=_contour_area)
     if len(approx) >= 3:
-        points = [[[float(p[0][0] + x0) / w, float(p[0][1] + y0) / h] for p in approx]]
+        points = [[[float(p[0] + x0) / w, float(p[1] + y0) / h] for p in approx]]
         points[0].append(points[0][0])  # close the loop; the bake paints open chains
     elif len(approx) == 2:
         # Degenerate-thin: the loop simplifies to its two ends, which the capsule joins.
         # A bend surviving the epsilon keeps its points above; a smaller one fits inside
         # the search area either way.
-        points = [[[float(p[0][0] + x0) / w, float(p[0][1] + y0) / h] for p in approx]]
+        points = [[[float(p[0] + x0) / w, float(p[1] + y0) / h] for p in approx]]
     else:
         return None
     return (points[0], size, 0.0, 0.0)
@@ -734,7 +641,7 @@ def filter_strokes_by_score(
     h, w = int(shape[0]), int(shape[1])
     plane = np.asarray(score)
     if plane.shape[:2] != (h, w):
-        plane = cv2.resize(plane.astype(np.float32), (w, h), interpolation=cv2.INTER_LINEAR)
+        plane = negpy_core.resize_linear(np.ascontiguousarray(plane, dtype=np.float32), (w, h))
     ref_scale = max(h, w) / HEAL_SIZE_REF
     kept: List[Tuple] = []
     dropped: List[Tuple] = []
@@ -801,50 +708,25 @@ def strokes_to_score(
         if x1 <= x0 or y1 <= y0:
             continue
 
-        cover = np.zeros((y1 - y0, x1 - x0), dtype=np.uint8)
-        local = np.round(pts - (x0, y0)).astype(np.int32)
-        if len(local) > 1:
-            cv2.polylines(cover, [local], False, 1, thickness=max(1, int(round(2.0 * radius))))
-        for cx, cy in local:  # round caps and joins — a thick polyline alone leaves flat ends
-            cv2.circle(cover, (int(cx), int(cy)), max(1, int(round(radius))), 1, -1)
-        if not cover.any():
+        local = np.ascontiguousarray(np.round(pts - (x0, y0)).astype(np.int32))
+        brush = (max(1, int(round(radius))), max(1, int(round(2.0 * radius))))
+        # Inside the brush a pixel repairs by how far it stands out from the film around it:
+        # MAD about zero over the whole crop, so the defect stays a minority in its own noise
+        # estimate, then hysteresis from the core, because grain is isolated and never joins.
+        constants = (
+            win,
+            _MANUAL_Z_MIN,
+            _MANUAL_Z_HI,
+            _MANUAL_Z_GROW,
+            _MANUAL_Z_GROW_FRAC,
+            _DETECT_PAD_PX * film_scale((h, w)),
+            _IR_SCORE_FLOOR,
+            _MANUAL_RIM_PX,
+        )
+        region = negpy_core.heal_region(_density(img[y0:y1, x0:x1]), local, brush, constants)
+        if region is None:
             continue
-
-        crop = _density(img[y0:y1, x0:x1])
-        detail = cv2.blur(crop - cv2.blur(crop, (win, win)), (3, 3))
-        # MAD about zero over the whole crop, so the defect stays a minority in its own
-        # noise estimate. 0.6745 is the half-normal median, which turns it into a σ.
-        sigma = float(np.median(np.abs(detail))) / 0.6745
-        z = np.abs(detail) / max(sigma, 1e-9)
-
-        inside = cover > 0
-        peak = float(z[inside].max())
-        if peak < _MANUAL_Z_MIN:
-            continue  # the brush found clean film; repairing it would only smooth grain
-        # Self-normalize a faint defect against its own peak, so a real mark under the
-        # absolute bar still repairs.
-        hi = _MANUAL_Z_HI if peak >= _MANUAL_Z_HI else peak * 0.9
-        # Hysteresis, because a single bar cannot do this job: a defect's core clears any bar
-        # but its soft skirt does not, and a bar low enough to catch the skirt catches grain
-        # everywhere. Grow from the core to the low bar through connected pixels only. Grain
-        # is isolated, so it never joins.
-        lo = max(_MANUAL_Z_GROW, hi * _MANUAL_Z_GROW_FRAC)
-        strong = inside & (z >= hi)
-        if not strong.any():
-            continue
-        _n, lab = cv2.connectedComponents((inside & (z >= lo)).astype(np.uint8), connectivity=8)
-        seeded = np.unique(lab[strong])
-        keep = np.isin(lab, seeded[seeded > 0]).astype(np.uint8)
-
-        # Pad past the defect, like the detector does: the soft PSF skirt falls under any bar
-        # that keeps grain out, and left unrepaired it prints as a dark outline.
-        region = _mask_to_score(keep, _DETECT_PAD_PX * film_scale((h, w)))
-        # Soften the search area's rim, or a defect crossing it repairs to a hard line.
-        d = cv2.distanceTransform(cover, cv2.DIST_L2, 3)
-        alpha = np.clip(d / _MANUAL_RIM_PX, 0.0, 1.0)
-
-        region = 1.0 - alpha * (1.0 - region)
-        np.minimum(score[y0:y1, x0:x1], region.astype(np.float32), out=score[y0:y1, x0:x1])
+        np.minimum(score[y0:y1, x0:x1], region, out=score[y0:y1, x0:x1])
         touched = True
 
     return score if touched else None
@@ -889,14 +771,9 @@ def _scratch_ridge(img: ImageBuffer) -> np.ndarray:
     divided by a local scale of that same response. Local, because a global scale lets one
     busy corner of the frame set the bar and bury a faint scratch running through smooth sky.
     """
-    dens = _density(img)
-    fine = cv2.GaussianBlur(dens, (1, 0), sigmaX=0, sigmaY=_SCRATCH_FINE_PX)
-    broad = cv2.GaussianBlur(dens, (1, 0), sigmaX=0, sigmaY=_SCRATCH_BROAD_PX)
-    ridge = fine - broad
-    win = (_SCRATCH_NOISE_WIN, _SCRATCH_NOISE_WIN)
-    # mean|x| is 0.8σ for gaussian noise, and the bars above are quoted in that ratio.
-    scale = cv2.blur(np.abs(ridge), win) / 0.8
-    return ridge / np.maximum(scale, 1e-6)
+    # The noise scale is mean|x| over 0.8, its ratio to σ for gaussian noise: the bars above
+    # are quoted in σ.
+    return negpy_core.scratch_ridge(_density(img), (_SCRATCH_FINE_PX, _SCRATCH_BROAD_PX, _SCRATCH_NOISE_WIN))
 
 
 def _shear_rows(plane: np.ndarray, slope: float, about_x: float, width: int) -> np.ndarray:
@@ -907,7 +784,7 @@ def _shear_rows(plane: np.ndarray, slope: float, about_x: float, width: int) -> 
     ``row``.
     """
     m = np.float32([[1.0, 0.0, 0.0], [-slope, 1.0, slope * about_x]])
-    return cv2.warpAffine(plane, m, (width, plane.shape[0]), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    return negpy_core.warp_affine(np.ascontiguousarray(plane, dtype=np.float32), m.astype(np.float64), (width, plane.shape[0]))
 
 
 def trace_scratch(img: ImageBuffer, nx: float, ny: float, threshold: float = 0.5) -> Optional[Tuple[float, float, float, float, float]]:
@@ -933,22 +810,19 @@ def trace_scratch(img: ImageBuffer, nx: float, ny: float, threshold: float = 0.5
     z, z0 = _scratch_ridge_rows(img, y0 - reach, y1 + reach)
     pull = np.exp(-0.5 * ((np.arange(y0, y1) - cy) / _SCRATCH_CLICK_PULL) ** 2)
 
-    best: Optional[Tuple[float, float, int, np.ndarray]] = None
-    for slope in np.arange(-_SCRATCH_SLOPE_MAX, _SCRATCH_SLOPE_MAX + 1e-9, _SCRATCH_SLOPE_STEP):
-        # Sheared with its reach, then cut: a line leaves the search rows across a wide frame.
-        sheared = _shear_rows(z, float(slope), cx, w)[y0 - z0 : y1 - z0]
-        strength = np.abs(sheared.mean(axis=1)) * pull
-        k = int(np.argmax(strength))
-        if best is None or strength[k] > best[0]:
-            best = (float(strength[k]), float(slope), k, sheared[k])
-    if best is None or best[0] < _SCRATCH_MIN_EVIDENCE:
+    slopes = np.arange(-_SCRATCH_SLOPE_MAX, _SCRATCH_SLOPE_MAX + 1e-9, _SCRATCH_SLOPE_STEP)
+    # Each slope shears the ridge with its reach, then cuts the search rows: a line leaves them
+    # across a wide frame.
+    found = negpy_core.scratch_slope_search(np.ascontiguousarray(z, dtype=np.float32), cx, (y0 - z0, y1 - z0), pull, slopes)
+    if found is None or found[0] < _SCRATCH_MIN_EVIDENCE:
         return None
-    _, slope, k, along = best
+    _, index, k, along = found
+    slope = float(slopes[index])
 
     # A transport scratch fades in and out, so measure its extent instead of assuming it
     # spans the frame.
     on = (along * np.sign(along.mean()) > bar).astype(np.float32)
-    run = cv2.blur(on.reshape(1, -1), (_SCRATCH_RUN_WIN, 1)).ravel() >= _SCRATCH_RUN_FRAC
+    run = negpy_core.box_filter(on.reshape(1, -1), (_SCRATCH_RUN_WIN, 1)).ravel() >= _SCRATCH_RUN_FRAC
     if not run.any():
         return None
     cols = np.flatnonzero(run)
@@ -1018,7 +892,7 @@ def lines_to_score(img: ImageBuffer, lines: List[Tuple], threshold: float = 0.5)
         along = sheared[row]
         sign = np.sign(along.mean()) or 1.0
         on = (along * sign > bar).astype(np.float32)
-        run = cv2.blur(on.reshape(1, -1), (_SCRATCH_RUN_WIN, 1)).ravel() >= _SCRATCH_RUN_FRAC
+        run = negpy_core.box_filter(on.reshape(1, -1), (_SCRATCH_RUN_WIN, 1)).ravel() >= _SCRATCH_RUN_FRAC
         lo, hi = int(max(0, min(x0, x1))), int(min(w, max(x0, x1)) + 1)
         keep = np.zeros(w, dtype=bool)
         keep[lo:hi] = run[lo:hi]
@@ -1050,24 +924,12 @@ def ir_detect_target(buffer_long_edge: int, preview_long_edge: int) -> int:
 
 def _ir_live(plane: np.ndarray) -> np.ndarray:
     """Film under the head: everything but the below-floor regions large enough to be holder."""
-    dead = plane < _IR_DEAD_FLOOR
-    if not dead.any():
-        return np.ones(plane.shape[:2], dtype=bool)
-    n_lbl, labels, stats, _ = cv2.connectedComponentsWithStats(dead.astype(np.uint8), connectivity=8)
-    holder = np.zeros(n_lbl, dtype=bool)
-    holder[1:] = stats[1:, cv2.CC_STAT_AREA] >= _IR_DEAD_MIN_AREA * dead.size
-    return ~holder[labels]
+    return negpy_core.ir_live(np.ascontiguousarray(plane, dtype=np.float32), _IR_DEAD_FLOOR, _IR_DEAD_MIN_AREA)
 
 
 def _ir_glare(plane: np.ndarray, live: np.ndarray) -> Optional[np.ndarray]:
     """Pixels more than ``_IR_GLARE_SIGMA`` over the median of the live film, or None."""
-    sample = plane.ravel()[_fit_sample(live)]
-    if sample.size < 500:
-        return None
-    med = float(np.median(sample))
-    sigma = 1.4826 * float(np.median(np.abs(sample - med)))
-    glare = plane > med + _IR_GLARE_SIGMA * sigma
-    return glare if glare.any() else None
+    return negpy_core.ir_glare(np.ascontiguousarray(plane, dtype=np.float32), np.ascontiguousarray(live), _IR_FIT_MAX_PX, _IR_GLARE_SIGMA)
 
 
 def _ir_detect_scale(plane: np.ndarray) -> float:
@@ -1108,20 +970,11 @@ def _erode_resize_bounded(plane: np.ndarray, dims: Tuple[int, int], kernel: np.n
         read_top = max(0, source_top - radius)
         read_bottom = min(h, source_bottom + radius)
         source = np.ascontiguousarray(plane[read_top:read_bottom], dtype=np.float32)
-        eroded = cv2.erode(source, kernel)
-        core = eroded[source_top - read_top : source_bottom - read_top]
-        horizontal = cv2.resize(core, (dw, len(core)), interpolation=cv2.INTER_AREA)
-        # Keep the full-image sampling grid across fractional block boundaries.
-        for row in range(top, bottom):
-            start = row * scale_y
-            end = start + scale_y
-            first, last = math.floor(start), min(h, math.ceil(end))
-            indices = np.arange(first, last)
-            overlap = np.minimum(indices + 1, end) - np.maximum(indices, start)
-            # OpenCV's area table omits fractional edges at or below this cutoff.
-            weights = (np.where(overlap > 1e-3, overlap, 0.0) / min(scale_y, h - start)).astype(np.float32)
-            values = horizontal[first - source_top : last - source_top]
-            output[row] = np.sum(values * weights.reshape((-1,) + (1,) * (values.ndim - 1)), axis=0)
+        eroded = negpy_core.morphology_ex(source, negpy_core.MORPH_ERODE, kernel)
+        core = np.ascontiguousarray(eroded[source_top - read_top : source_bottom - read_top])
+        horizontal = negpy_core.resize_area(core, (dw, len(core)))
+        # The vertical pass keeps the full-image sampling grid across fractional block boundaries.
+        negpy_core.area_rows_into(horizontal, output[top:bottom], top, source_top, scale_y, h)
     return output
 
 
@@ -1147,14 +1000,17 @@ def downsample_ir(plane: np.ndarray, target_long_edge: int, dims: Optional[Tuple
         dims = (max(1, int(round(w * s))), max(1, int(round(h * s))))
     if dims == (w, h):
         return np.ascontiguousarray(plane)
+    # An HxWx1 plane comes back as HxW.
+    if plane.ndim == 3 and plane.shape[2] == 1:
+        plane = plane[:, :, 0]
     # Erode by the resample footprint: a 1.25x downsample must not fatten by a 4.5x kernel.
     k = max(1, int(round(long_edge / max(dims))) | 1)
     if k > 1:
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        kernel = negpy_core.ellipse_kernel((k, k))
         if plane.nbytes > _IR_DOWNSAMPLE_WORK_BYTES:
             return _erode_resize_bounded(plane, dims, kernel)
-        plane = cv2.erode(np.ascontiguousarray(plane), kernel)
-    return cv2.resize(plane, dims, interpolation=cv2.INTER_AREA).astype(np.float32)
+        plane = negpy_core.morphology_ex(np.ascontiguousarray(plane), negpy_core.MORPH_ERODE, kernel)
+    return negpy_core.resize_area(np.ascontiguousarray(plane), dims)
 
 
 def normalize_ir(plane: np.ndarray, glare: Optional[np.ndarray] = None) -> np.ndarray:
@@ -1164,9 +1020,7 @@ def normalize_ir(plane: np.ndarray, glare: Optional[np.ndarray] = None) -> np.nd
     ``glare`` pixels stay out of the base."""
     plane = np.ascontiguousarray(plane, dtype=np.float32)
     win = _ir_win(_IR_BASE_WIN, _ir_detect_scale(plane))
-    src = plane if glare is None else np.where(glare, np.float32(0.0), plane)
-    base = cv2.blur(cv2.dilate(src, cv2.getStructuringElement(cv2.MORPH_RECT, (win, win))), (win, win))
-    return plane / np.maximum(base, 1e-4)
+    return negpy_core.normalize_ir(plane, None if glare is None else np.ascontiguousarray(glare), win)
 
 
 def ir_detect_cutoff(slider: float, attenuation: bool) -> float:
@@ -1183,65 +1037,8 @@ def ir_defect_score(ratio: np.ndarray, cutoff: float) -> np.ndarray:
     scale: a sampling allowance, not a film footprint — widening it with the plane re-fattens
     the mask the finer detection just tightened."""
     span = max(_IR_GAIN_IDENTITY - cutoff, 1e-4)
-    t = (np.ascontiguousarray(ratio, dtype=np.float32) - cutoff) / span
-    score = np.clip(t * (1.0 - _IR_SCORE_FLOOR) + _IR_SCORE_FLOOR, _IR_SCORE_FLOOR, 1.0)
-    return cv2.erode(score, np.ones((3, 3), np.uint8))
-
-
-def score_weighted_fill(
-    img: np.ndarray,
-    score: np.ndarray,
-    scales: Tuple[int, ...] = _IR_FILL_SCALES,
-    reject_floor_mass: bool = False,
-) -> np.ndarray:
-    """Multiscale score-normalized average, blended coarse→fine by clean fraction.
-    Where no support holds clean film the quotient tends to zero and the original-floor
-    rule in apply_score_repair keeps the source pixel.
-
-    ``reject_floor_mass`` measures that clean fraction *above* the score floor. A defect
-    pixel scores 0.02 rather than 0, so a support seeing nothing but defect still carries
-    den ≈ 0.02 — enough confidence to win, with the defect's own value as its candidate,
-    and the fill quietly puts back a share of what it was asked to remove. Callers keeping
-    the original-floor rule leave this off: it corrects them downstream, and rejecting those
-    rungs outright shifts weight onto the coarsest support, which is the one that reaches
-    across a tonal edge and over-lifts the dense side of it. A repair allowed to darken has
-    no such corrector, so it has to pay for honest confidence there instead.
-    """
-    weighted = img * score[..., None]
-    fill = np.empty_like(img)
-    for i, k in enumerate(scales):
-        if i == len(scales) - 1:
-            num = cv2.GaussianBlur(weighted, (k, k), 0)
-            den = cv2.GaussianBlur(score, (k, k), 0)
-        else:
-            num = cv2.boxFilter(weighted, -1, (k, k))
-            den = cv2.boxFilter(score, -1, (k, k))
-        _fill_rung(num, den, fill, i == 0, reject_floor_mass)
-    return fill
-
-
-@parallel_njit(cache=True)
-def _fill_rung(num, den, fill, first, reject_floor_mass):
-    """One rung of the fill ladder in place: the score-normalized candidate, blended over the
-    coarser result by the rung's clean fraction. Same float32 operation order as the array
-    form, one pass over the frame."""
-    f32 = np.float32
-    h, w = den.shape
-    floor = f32(_IR_SCORE_FLOOR)
-    inv_span = f32(1.0) - floor
-    tau = f32(_IR_FILL_TAU)
-    for y in prange(h):
-        for x in range(w):
-            d = max(den[y, x], f32(1e-6))
-            if first:
-                for c in range(3):
-                    fill[y, x, c] = num[y, x, c] / d
-            else:
-                mass = (den[y, x] - floor) / inv_span if reject_floor_mass else den[y, x]
-                conf = min(max(mass / tau, f32(0.0)), f32(1.0))
-                keep = f32(1.0) - conf
-                for c in range(3):
-                    fill[y, x, c] = fill[y, x, c] * keep + (num[y, x, c] / d) * conf
+    constants = (cutoff, span, 1.0 - _IR_SCORE_FLOOR, _IR_SCORE_FLOOR)
+    return negpy_core.ir_defect_score(np.ascontiguousarray(ratio, dtype=np.float32), constants)
 
 
 def _fill_supports(buffer_long_edge: int, factor: float) -> Tuple[int, ...]:
@@ -1252,32 +1049,6 @@ def _fill_supports(buffer_long_edge: int, factor: float) -> Tuple[int, ...]:
     fine = [int(round(k * factor)) | 1 for k in _IR_FILL_SCALES]
     film = max(factor, buffer_long_edge / _IR_DETECT_REF)
     return tuple(dict.fromkeys([int(round(_IR_FILL_SCALES[0] * film)) | 1] + fine))
-
-
-def _borrow_clean_grain(src: np.ndarray, clean: np.ndarray, sigma: float, idx: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """Detail of the nearest clean pixel, high-passed at ``sigma``, for the flat pixel
-    indices ``idx`` only: an (N, 3) array, N = len(idx), plus the ``sigma`` blur of ``src``
-    it was measured against, for a caller that needs the same low-pass again.
-
-    Real film rather than synthesized noise: the donor is the closest pixel the IR score calls
-    clean, so it carries the same emulsion, density and scanner noise as the hole it fills.
-    Ceiling: deep inside a wide defect every pixel resolves to the same few boundary donors and
-    the paste flattens toward a constant, leaving those interiors to the fill's own blend.
-    Only the repaired pixels take grain, so the donor lookup runs on their indices alone; the
-    distance transform still covers the frame, because a donor can sit anywhere near a hole.
-    """
-    h, w = clean.shape
-    # DIST_LABEL_PIXEL numbers the zero pixels 1..N in raster order, so flatnonzero inverts it.
-    _, labels = cv2.distanceTransformWithLabels((~clean).astype(np.uint8), cv2.DIST_L2, 3, labelType=cv2.DIST_LABEL_PIXEL)
-    nearest = np.flatnonzero(clean.ravel())[labels.ravel()[idx].astype(np.intp) - 1]
-    # Mirror through the donor, do not sample it: a whole row across a hair shares one
-    # nearest clean pixel, and pasting that verbatim streaks the grain into bands.
-    ny, nx = np.divmod(nearest, w)
-    py, px = np.divmod(idx, w)
-    mirrored = np.clip(2 * ny - py, 0, h - 1) * w + np.clip(2 * nx - px, 0, w - 1)
-    take = np.where(clean.ravel()[mirrored], mirrored, nearest)
-    blur = cv2.GaussianBlur(src, (0, 0), sigma)
-    return src.reshape(-1, 3)[take] - blur.reshape(-1, 3)[take], blur
 
 
 def apply_score_repair(
@@ -1307,62 +1078,11 @@ def apply_score_repair(
         factor = factor or 1.0
     else:
         factor = max(h / score_det.shape[0], w / score_det.shape[1])
-        score = cv2.resize(score_det, (w, h), interpolation=cv2.INTER_LINEAR)
-    out = score_weighted_fill(src, score, _fill_supports(long_edge or max(h, w), factor), reject_floor_mass=not floor)
-    # The fill buffer becomes the output: blended over the source under the write ramp.
-    a = np.empty((h, w), dtype=np.float32)
-    _blend_fill(src, score, out, a)
-    # A weighted average lands grainless, so a repair reads as a smooth patch against film.
-    sigma = max(1.0, factor)
-    clean = score >= _IR_WRITE_HI
-    idx = np.flatnonzero(~clean)
-    blur_src: Optional[np.ndarray] = None
-    if clean.any() and idx.size:
-        grain, blur_src = _borrow_clean_grain(src, clean, sigma, idx)
-        out.reshape(-1, 3)[idx] += a.reshape(-1, 1)[idx] * grain
-    # Original-floor rule: dust is dark in negative transmittance, so repairs only lighten.
-    # Compared on the low-frequency deficit, because per pixel the rule is a half-wave
-    # rectifier that keeps the fill's grain peaks, clips its troughs and leaves the repair
-    # bright and half-textured. Under the same ramp, so an untouched pixel stays identical.
-    if floor:
-        if blur_src is None:
-            blur_src = cv2.GaussianBlur(src, (0, 0), sigma)
-        _add_floor_deficit(out, a, blur_src, cv2.GaussianBlur(out, (0, 0), sigma))
-    else:
-        np.maximum(out, 0.0, out=out)
+        score = negpy_core.resize_linear(np.ascontiguousarray(score_det, dtype=np.float32), (w, h))
+    supports = list(_fill_supports(long_edge or max(h, w), factor))
+    constants = (_IR_SCORE_FLOOR, _IR_FILL_TAU, _IR_WRITE_HI, _IR_WRITE_HI - _IR_WRITE_LO)
+    out = negpy_core.apply_score_repair(src, score, supports, bool(floor), max(1.0, factor), constants)
     return ensure_image(out)
-
-
-@parallel_njit(cache=True)
-def _blend_fill(src, score, fill, a_out):
-    """``fill`` becomes ``src * (1 - a) + fill * a`` under the smoothstep write ramp of the
-    score; the ramp is kept in ``a_out`` for the grain and floor passes."""
-    f32 = np.float32
-    h, w = score.shape
-    hi = f32(_IR_WRITE_HI)
-    span = f32(_IR_WRITE_HI - _IR_WRITE_LO)
-    for y in prange(h):
-        for x in range(w):
-            a = min(max((hi - score[y, x]) / span, f32(0.0)), f32(1.0))
-            a = a * a * (f32(3.0) - f32(2.0) * a)
-            a_out[y, x] = a
-            keep = f32(1.0) - a
-            for c in range(3):
-                fill[y, x, c] = src[y, x, c] * keep + fill[y, x, c] * a
-
-
-@parallel_njit(cache=True)
-def _add_floor_deficit(out, a, blur_src, blur_out):
-    """``out += a * max(blur_src - blur_out, 0)``, then clamps at zero, in place."""
-    f32 = np.float32
-    h, w = a.shape
-    for y in prange(h):
-        for x in range(w):
-            av = a[y, x]
-            for c in range(3):
-                deficit = blur_src[y, x, c] - blur_out[y, x, c]
-                v = out[y, x, c] + av * max(deficit, f32(0.0))
-                out[y, x, c] = max(v, f32(0.0))
 
 
 def film_scale(shape: Tuple[int, int]) -> float:
@@ -1403,34 +1123,19 @@ def repair_components(
         factor = factor or 1.0
     else:
         factor = max(h / score_det.shape[0], w / score_det.shape[1])
-        score = cv2.resize(score_det, (w, h), interpolation=cv2.INTER_LINEAR)
+        score = negpy_core.resize_linear(np.ascontiguousarray(score_det, dtype=np.float32), (w, h))
         if dirty is not None and dirty.shape[:2] != (h, w):
-            dirty = cv2.resize(dirty.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST) > 0
-    m = (score < 1.0).astype(np.uint8)
-    if not m.any():
-        return img
-    n_lbl, labels, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
-    # Past this many, cropping costs more than the whole-frame convolutions it avoids —
-    # and more than reusing base_out row by row, so this path stays non-incremental.
-    if n_lbl - 1 > _REPAIR_MAX_COMPONENTS:
-        return apply_score_repair(img, score, floor=floor, factor=factor)
+            dirty = negpy_core.resize_nearest(dirty.astype(np.uint8), (w, h)) > 0
     src = np.ascontiguousarray(img, dtype=np.float32)
     out = np.ascontiguousarray(base_out, dtype=np.float32).copy() if base_out is not None else src.copy()
-    # Reach of the coarsest support, so every crop holds the clean film the fill averages.
-    pad = max(_fill_supports(max(h, w), factor))
-    for i in range(1, n_lbl):
-        bx, by = int(stats[i, cv2.CC_STAT_LEFT]), int(stats[i, cv2.CC_STAT_TOP])
-        cw, ch = int(stats[i, cv2.CC_STAT_WIDTH]), int(stats[i, cv2.CC_STAT_HEIGHT])
-        if dirty is not None and not dirty[by : by + ch, bx : bx + cw][labels[by : by + ch, bx : bx + cw] == i].any():
-            continue  # untouched since base_out was made: its fill there is already correct
-        x0, y0 = max(0, bx - pad), max(0, by - pad)
-        x1 = min(w, bx + cw + pad)
-        y1 = min(h, by + ch + pad)
-        sub = apply_score_repair(src[y0:y1, x0:x1], score[y0:y1, x0:x1], floor=floor, long_edge=max(h, w), factor=factor)
-        # This component only: a neighbour clipped by the crop repairs badly here and gets
-        # its own padded crop anyway.
-        mb = labels[y0:y1, x0:x1] == i
-        out[y0:y1, x0:x1][mb] = np.asarray(sub)[mb]
+    supports = _fill_supports(max(h, w), factor)
+    constants = (_IR_SCORE_FLOOR, _IR_FILL_TAU, _IR_WRITE_HI, _IR_WRITE_HI - _IR_WRITE_LO)
+    # Past the cap, cropping costs more than the whole-frame convolutions it avoids. The pad is
+    # the coarsest support's reach, so every crop holds the clean film the fill averages.
+    dirty_mask = None if dirty is None else np.ascontiguousarray(dirty, dtype=bool)
+    args = (list(supports), bool(floor), max(1.0, factor), constants, max(supports), _REPAIR_MAX_COMPONENTS)
+    if not negpy_core.repair_components(src, score, out, *args, dirty_mask):
+        return img
     return ensure_image(out)
 
 
@@ -1442,29 +1147,12 @@ def route_wide_defects(score: np.ndarray, *, budget: Optional[float] = _IR_ROUTE
     detector, where a misregistered IR plane can call half the frame a defect; a full-width
     line clears it on its own, so it would refuse exactly the case that needs the inpaint.
     """
-    at_floor = (score <= _IR_SCORE_FLOOR + 1e-6).astype(np.uint8)
-    if not at_floor.any():
-        return None
-    n_lbl, labels, stats, _ = cv2.connectedComponentsWithStats(at_floor, connectivity=8)
     scale = _ir_detect_scale(score)
-    radius = int(round(_IR_ROUTE_RADIUS * scale))
-    side = 2 * radius - 1
-    routed = np.zeros_like(at_floor)
-    hit = False
-    for i in range(1, n_lbl):
-        bw, bh = int(stats[i, cv2.CC_STAT_WIDTH]), int(stats[i, cv2.CC_STAT_HEIGHT])
-        if min(bw, bh) < side:  # can't contain a side² solid → radius under the bar
-            continue
-        x0, y0 = int(stats[i, cv2.CC_STAT_LEFT]), int(stats[i, cv2.CC_STAT_TOP])
-        own = labels[y0 : y0 + bh, x0 : x0 + bw] == i
-        if float(cv2.distanceTransform(np.pad(own.astype(np.uint8), 1), cv2.DIST_C, 3).max()) >= radius:
-            # Written inside the bounding box: a hand-placed score arrives at full resolution.
-            routed[y0 : y0 + bh, x0 : x0 + bw][own] = 1
-            hit = True
-    if not hit:
+    k = negpy_core.ellipse_kernel((2 * int(round(_IR_ROUTE_DILATE * scale)) + 1,) * 2)
+    bar = np.float32(_IR_SCORE_FLOOR + 1e-6)
+    routed = negpy_core.route_wide_defects(np.ascontiguousarray(score, dtype=np.float32), bar, int(round(_IR_ROUTE_RADIUS * scale)), k)
+    if routed is None:
         return None
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * int(round(_IR_ROUTE_DILATE * scale)) + 1,) * 2)
-    routed = cv2.dilate(routed, k)
     frac = float(routed.mean())
     if budget is not None and frac > budget:
         logger.warning("Retouch: routed defects cover %.1f%% of the frame — inpaint skipped, fill only", frac * 100.0)
@@ -1483,7 +1171,8 @@ def _ir_decontaminate(ratio: np.ndarray, vis_log: np.ndarray) -> Tuple[np.ndarra
     # defect away as ghost and the division stops lifting it. Trim by ratio percentile: a
     # fixed cutoff fails because a strong ghost drags clean film below it, and residual
     # fails because the dust fits itself perfectly.
-    keep = _fit_sample(ratio >= np.percentile(ratio, _IR_XTALK_TRIM))
+    ratio = np.ascontiguousarray(ratio, dtype=np.float32)
+    keep = _fit_sample(ratio >= np.float32(negpy_core.percentiles(ratio.ravel(), [_IR_XTALK_TRIM])[0]))
     y = np.log(np.clip(ratio.ravel()[keep], 1e-4, 1.0))
     x = vis_log.reshape(-1, vis_log.shape[-1])[keep]
     if y.size < 500:
@@ -1496,7 +1185,7 @@ def _ir_decontaminate(ratio: np.ndarray, vis_log: np.ndarray) -> Tuple[np.ndarra
     ghost = float(np.abs(b).sum())
     if ghost < _IR_XTALK_MIN:
         return ratio, ghost
-    return np.clip(ratio / np.exp((vis_log * b).sum(-1)), 0.0, 1.5).astype(np.float32), ghost
+    return negpy_core.ir_ghost_divide(ratio, np.ascontiguousarray(vis_log, dtype=np.float32), b.tolist()), ghost
 
 
 def _fit_refraction_gammas(ratio: np.ndarray, vis_log: np.ndarray, img_det: np.ndarray) -> Tuple[float, ...]:
@@ -1509,32 +1198,19 @@ def _fit_refraction_gammas(ratio: np.ndarray, vis_log: np.ndarray, img_det: np.n
     dominated it, reading γ 1.9/2.2/2.2 for dust measuring ~1.0/1.1/1.2 and over-correcting
     every speck into a dark cyan blob. Median alone reads 1.3/1.8/1.8, flat-only least
     squares 1.4/2.1/2.0, and γ 1.5 already tints."""
-    band = (ratio > 0.70) & (ratio < 0.92)
-    if int(band.sum()) < 500:
-        return (_IR_GAMMA_FALLBACK,) * 3
-    # ksize=5 carries its own smoothing, so no separate blur.
-    edge = np.abs(cv2.Laplacian(img_det[:, :, 1], cv2.CV_32F, ksize=5))
-    flat = band & (edge < np.percentile(edge[band], _IR_FIT_FLAT_PCT))
-    fit = _fit_sample(flat if int(flat.sum()) >= _IR_FIT_MIN_PX else band)
-    # The band bounds the ratio away from 1, so the per-pixel slope needs no guard.
-    xb = np.log(ratio.ravel()[fit])
-    vl = vis_log.reshape(-1, 3)[fit]
-    return tuple(float(np.clip(np.median(vl[:, c] / xb), _IR_GAMMA_LO, _IR_GAMMA_HI)) for c in range(3))
+    f32 = (np.ascontiguousarray(a, dtype=np.float32) for a in (ratio, vis_log, img_det))
+    gamma = (_IR_GAMMA_LO, _IR_GAMMA_HI)
+    return negpy_core.fit_refraction_gammas(*f32, (0.70, 0.92), _IR_FIT_FLAT_PCT, _IR_FIT_MIN_PX, _IR_FIT_MAX_PX, _IR_GAMMA_FALLBACK, gamma)
 
 
 def _ir_clean_base(img_det: np.ndarray, ratio: np.ndarray) -> np.ndarray:
     """Local clean-film level per channel over ``_IR_CAP_WIN``: mean of the pixels the
     IR ratio calls clean, minus ``_IR_CAP_SIGMA`` of their σ (see the constants block)."""
-    win_px = _ir_win(_IR_CAP_WIN, _ir_detect_scale(ratio))
-    win = (win_px, win_px)
-    w_clean = (ratio >= _IR_GAIN_IDENTITY).astype(np.float32)
-    den = np.maximum(cv2.blur(w_clean, win), 1e-6)[..., None]
-    mean = cv2.blur(img_det * w_clean[..., None], win) / den
-    var = cv2.blur(img_det * img_det * w_clean[..., None], win) / den - mean * mean
-    base = mean - _IR_CAP_SIGMA * np.sqrt(np.clip(var, 0.0, None))
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, win)
-    dil = cv2.blur(cv2.dilate(img_det, kernel), win)
-    return np.where(den > _IR_CAP_MIN_SUPPORT, base, dil)
+    win = _ir_win(_IR_CAP_WIN, _ir_detect_scale(ratio))
+    constants = (win, _IR_GAIN_IDENTITY, _IR_CAP_SIGMA, _IR_CAP_MIN_SUPPORT)
+    return negpy_core.ir_clean_base(
+        np.ascontiguousarray(img_det, dtype=np.float32), np.ascontiguousarray(ratio, dtype=np.float32), constants
+    )
 
 
 def _ir_normalize_ratio(ratio: np.ndarray, live: np.ndarray) -> np.ndarray:
@@ -1542,23 +1218,11 @@ def _ir_normalize_ratio(ratio: np.ndarray, live: np.ndarray) -> np.ndarray:
     ``_IR_GAIN_IDENTITY``, dip scale on ``_IR_REF_SIGMA`` (see the constants block). ``live``
     only: the dead-margin 1.0s inflate σ ~20% on a strip scan. MAD, not std, so a dusty
     minority can't move either landmark."""
-    sample = ratio[live]
-    if sample.size < 500:  # nothing measurable: leave the landmarks alone
-        return ratio
-    med = float(np.median(sample))
-    sigma = 1.4826 * float(np.median(np.abs(sample - med)))
-    pivot = float(np.clip(med - _IR_NOISE_SIGMA * sigma, _IR_PIVOT_LO, _IR_GAIN_IDENTITY))
-    if pivot <= _IR_PIVOT_LO:
-        logger.warning("IR dust: clean-film pivot floored at %.2f (IR σ %.3f) — very noisy IR plane", _IR_PIVOT_LO, sigma)
-    # A clipped pivot is an exact no-op: x/x is 1.0 in IEEE, float32 × 1.0 exact.
-    scale = _IR_GAIN_IDENTITY / pivot
-    ratio = (ratio * scale).astype(np.float32)
-    # The rescale carries σ with it, so there is no second median pass. Dips only: a
-    # noiseless plane takes the full _IR_SCALE_MAX and would land its clean level above 1.
-    k = float(np.clip(_IR_REF_SIGMA / max(sigma * scale, 1e-6), 1.0, _IR_SCALE_MAX))
-    if k > 1.0:
-        stretched = _IR_GAIN_IDENTITY - (_IR_GAIN_IDENTITY - ratio) * k
-        ratio = np.where(ratio < _IR_GAIN_IDENTITY, stretched, ratio).astype(np.float32)
+    ratio = np.array(ratio, dtype=np.float32)
+    constants = (_IR_GAIN_IDENTITY, _IR_NOISE_SIGMA, _IR_PIVOT_LO, _IR_REF_SIGMA, _IR_SCALE_MAX)
+    measured = negpy_core.ir_normalize_ratio(ratio, np.ascontiguousarray(live), constants)
+    if measured is not None and measured[0] <= _IR_PIVOT_LO:
+        logger.warning("IR dust: clean-film pivot floored at %.2f (IR σ %.3f) — very noisy IR plane", _IR_PIVOT_LO, measured[1])
     return ratio
 
 
@@ -1575,9 +1239,9 @@ def ir_ratio_and_gain(ir_det: np.ndarray, img_det: np.ndarray) -> Tuple[np.ndarr
     ratio[~live] = 1.0
     img_det = np.ascontiguousarray(img_det, dtype=np.float32)
     if img_det.shape[:2] != ratio.shape[:2]:
-        img_det = cv2.resize(img_det, (ratio.shape[1], ratio.shape[0]), interpolation=cv2.INTER_AREA)
+        img_det = negpy_core.resize_area(np.ascontiguousarray(img_det, dtype=np.float32), (ratio.shape[1], ratio.shape[0]))
 
-    vis_log = np.stack([np.log(np.clip(normalize_ir(img_det[:, :, c]), 1e-4, 1.0)) for c in range(3)], axis=-1)
+    vis_log = negpy_core.ir_vis_log(img_det, _ir_win(_IR_BASE_WIN, _ir_detect_scale(img_det)))
     ratio, ghost = _ir_decontaminate(ratio, vis_log)
     # On the fitted exponent, not on how far the ratio dips. A few percent of IR noise,
     # deepened by the min-preserving downsample, reads as silver on clean C41 rolls.
@@ -1587,24 +1251,20 @@ def ir_ratio_and_gain(ir_det: np.ndarray, img_det: np.ndarray) -> Tuple[np.ndarr
     ratio = _ir_normalize_ratio(ratio, live)
 
     gammas = _fit_refraction_gammas(ratio, vis_log, img_det)
-    base = np.clip(ratio / _IR_GAIN_IDENTITY, 1e-4, 1.0)
-    gain = np.empty(ratio.shape + (3,), dtype=np.float32)
-    for c in range(3):
-        gain[:, :, c] = np.minimum(_IR_GAIN_CLAMP, base ** (-gammas[c]))
     # Never lift a pixel past its own local clean base (see _IR_CAP_WIN). Floored at 1, so
     # the cap only holds the bake back and never darkens a pixel.
     clean = _ir_clean_base(img_det, ratio)
-    np.minimum(gain, np.maximum(clean / np.maximum(img_det, 1e-5), 1.0), out=gain)
+    gain = negpy_core.ir_gain(
+        ratio, img_det, np.ascontiguousarray(clean, dtype=np.float32), list(gammas), (_IR_GAIN_IDENTITY, _IR_GAIN_CLAMP)
+    )
     return ratio, gain, degenerate, gammas
 
 
 def apply_ir_attenuation(img: ImageBuffer, gain_det: np.ndarray) -> ImageBuffer:
     """Visible buffer × upsampled per-channel IR gain map (new array — buffers are read-only)."""
     h, w = img.shape[:2]
-    gain = gain_det if gain_det.shape[:2] == (h, w) else cv2.resize(gain_det, (w, h), interpolation=cv2.INTER_LINEAR)
-    # cv2.multiply, not `a * b`: the product of two float32 buffers is already float32, so
-    # the astype numpy needs here would copy the whole frame a second time.
-    return ensure_image(cv2.multiply(np.ascontiguousarray(img, dtype=np.float32), gain))
+    gain = gain_det if gain_det.shape[:2] == (h, w) else negpy_core.resize_linear(np.ascontiguousarray(gain_det, dtype=np.float32), (w, h))
+    return ensure_image(negpy_core.multiply(np.ascontiguousarray(img, dtype=np.float32), np.ascontiguousarray(gain, dtype=np.float32)))
 
 
 def luma_bake_token(retouch) -> str:
@@ -1625,22 +1285,7 @@ def ir_bake_token(retouch, has_ir: bool) -> str:
     source_hash so a toggle or threshold drag invalidates the engine cache."""
     if not (retouch.ir_dust_remove and has_ir):
         return ""
-    method = getattr(retouch, "ir_method", IR_METHOD_NEGPY)
-    tail = "" if method == IR_METHOD_NEGPY else f"|{method}"
-    return f"|ir{int(retouch.ir_attenuation)}r{round(float(retouch.ir_threshold), 3)}{tail}"
-
-
-@parallel_njit(cache=True)
-def _hair_encode(crop, lo, inv_span, out_u8):
-    """``clip((crop - lo) / span, 0, 1) ** (1/γ)`` to 8-bit, for cv2.inpaint."""
-    f32 = np.float32
-    inv_gamma = f32(1.0 / _HAIR_INPAINT_GAMMA)
-    h, w = crop.shape[0], crop.shape[1]
-    for y in prange(h):
-        for x in range(w):
-            for c in range(3):
-                v = min(max((crop[y, x, c] - lo) * inv_span, f32(0.0)), f32(1.0))
-                out_u8[y, x, c] = np.uint8(v**inv_gamma * f32(255.0) + f32(0.5))
+    return f"|ir{int(retouch.ir_attenuation)}r{round(float(retouch.ir_threshold), 3)}"
 
 
 def apply_hair_inpaint(
@@ -1649,10 +1294,10 @@ def apply_hair_inpaint(
     radius: int = _HAIR_INPAINT_RADIUS,
     dilate_px: Optional[int] = None,
 ) -> ImageBuffer:
-    """Structure-following fill of long/twisted defects (``cv2.inpaint``, Navier–Stokes)
+    """Structure-following fill of long/twisted defects (Navier–Stokes inpaint, ``negpy_core::inpaint``)
     baked into the linear source. Each detection-scale mask is upsampled to the buffer,
     unioned and dilated to cover the PSF skirt; only masked pixels are overwritten (the
-    rest stay byte-identical — the 8-bit encode cv2.inpaint requires touches only the
+    rest stay byte-identical — the 8-bit encode of the inpaint touches only the
     fabricated hairline). Returns a new array (buffers are read-only)."""
     h, w = img.shape[:2]
     masks = [hm for hm in hair_masks if hm is not None]
@@ -1665,73 +1310,24 @@ def apply_hair_inpaint(
         dilate_px = max(_HAIR_DILATE_PX, round(factor))
     m = np.zeros((h, w), dtype=np.uint8)
     for hm in masks:
-        r = hm if hm.shape[:2] == (h, w) else cv2.resize(hm.astype(np.float32), (w, h), interpolation=cv2.INTER_LINEAR)
+        r = hm if hm.shape[:2] == (h, w) else negpy_core.resize_linear(np.ascontiguousarray(hm, dtype=np.float32), (w, h))
         m |= (np.asarray(r) > 0.5).astype(np.uint8)
     if not m.any():
         return img
     if dilate_px > 0:
-        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * dilate_px + 1, 2 * dilate_px + 1))
-        m = cv2.dilate(m, k)
+        k = negpy_core.ellipse_kernel((2 * dilate_px + 1, 2 * dilate_px + 1))
+        m = negpy_core.morphology_ex(m, negpy_core.MORPH_DILATE, k)
     src = np.ascontiguousarray(img, dtype=np.float32)
-    out = src.copy()
-    n_lbl, labels, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
-    for i in range(1, n_lbl):
-        bx = int(stats[i, cv2.CC_STAT_LEFT])
-        by = int(stats[i, cv2.CC_STAT_TOP])
-        x0, y0 = max(0, bx - _HAIR_INPAINT_PAD), max(0, by - _HAIR_INPAINT_PAD)
-        x1 = min(w, bx + int(stats[i, cv2.CC_STAT_WIDTH]) + _HAIR_INPAINT_PAD)
-        y1 = min(h, by + int(stats[i, cv2.CC_STAT_HEIGHT]) + _HAIR_INPAINT_PAD)
-        # Mask the whole crop, not just this component: a neighbour reaching into the bbox
-        # must stay unknown, or it becomes clone source and its dust is filled back in.
-        sub_m = np.ascontiguousarray(m[y0:y1, x0:x1])
-        crop = np.ascontiguousarray(src[y0:y1, x0:x1])
-        # Encode against the crop's clean range: clip(0,1) posterizes fills in dark regions.
-        # A hair can join enough specks that one component spans the frame, so the range is
-        # read off a strided sample of the clean pixels rather than all of them.
-        step = max(1, int(math.isqrt(max(1, crop.shape[0] * crop.shape[1] // _HAIR_RANGE_SAMPLE_PX))))
-        ctx = crop[::step, ::step][sub_m[::step, ::step] == 0]
-        lo = float(np.percentile(ctx, 0.5)) if ctx.size else 0.0
-        hi = float(np.percentile(ctx, 99.5)) if ctx.size else 1.0
-        span = max(hi - lo, 1e-4)
-        # The fill is 8-bit, so its decode is a 256-entry table.
-        dec_lut = ((np.arange(256, dtype=np.float32) / 255.0) ** _HAIR_INPAINT_GAMMA) * span + lo
-        ch, cw = crop.shape[:2]
-        # The inpaint walks the whole image it is handed, and a hair joining specks can make
-        # this crop the frame: tile it, skip tiles without this component, keep a halo so
-        # the fill at a tile's core sees the same neighbourhood.
-        for ty0 in range(0, ch, _HAIR_TILE_PX):
-            for tx0 in range(0, cw, _HAIR_TILE_PX):
-                ty1, tx1 = min(ch, ty0 + _HAIR_TILE_PX), min(cw, tx0 + _HAIR_TILE_PX)
-                if not (labels[y0 + ty0 : y0 + ty1, x0 + tx0 : x0 + tx1] == i).any():
-                    continue
-                ay0, ay1 = max(0, ty0 - _HAIR_TILE_HALO), min(ch, ty1 + _HAIR_TILE_HALO)
-                ax0, ax1 = max(0, tx0 - _HAIR_TILE_HALO), min(cw, tx1 + _HAIR_TILE_HALO)
-                tile = np.ascontiguousarray(crop[ay0:ay1, ax0:ax1])
-                enc = np.empty(tile.shape, dtype=np.uint8)
-                _hair_encode(tile, np.float32(lo), np.float32(1.0 / span), enc)
-                filled = cv2.inpaint(enc, np.ascontiguousarray(sub_m[ay0:ay1, ax0:ax1]), radius, cv2.INPAINT_NS)
-                # ...but keep only this component, alpha-feathered across the dilate band: full
-                # fill on the detected defect, ramp over the skirt. A neighbour clipped by the
-                # bbox fills badly here and gets its own padded crop anyway. dilate_px=0 means
-                # no feather. Only the tile's core is written; the halo belongs to its neighbours.
-                mb = labels[y0 + ay0 : y0 + ay1, x0 + ax0 : x0 + ax1] == i
-                d = cv2.distanceTransform(mb.astype(np.uint8), cv2.DIST_C, 3)
-                core = np.zeros(mb.shape, dtype=bool)
-                core[ty0 - ay0 : ty1 - ay0, tx0 - ax0 : tx1 - ax0] = True
-                sel = np.flatnonzero(mb & core)
-                a = np.minimum(d.ravel()[sel] / float(dilate_px + 1), 1.0)[:, None]
-                # Written flat into the frame: the crop view is not contiguous, so a reshape
-                # of it would write to a copy.
-                dec = dec_lut[filled.reshape(-1, 3)[sel]]
-                tile_px = tile.reshape(-1, 3)[sel]
-                ry, rx = np.divmod(sel, ax1 - ax0)
-                out.reshape(-1, 3)[(y0 + ay0 + ry) * w + (x0 + ax0 + rx)] = tile_px * (1.0 - a) + dec * a
+    # Each component fills in its padded box, tiled with a halo; a neighbour reaching into the
+    # box stays unknown, or it becomes clone source and its dust is filled back in.
+    out = negpy_core.hair_fill(
+        src,
+        m,
+        (float(radius), dilate_px, _HAIR_INPAINT_PAD, _HAIR_TILE_PX, _HAIR_TILE_HALO, _HAIR_RANGE_SAMPLE_PX, _HAIR_INPAINT_GAMMA),
+    )
     # Navier-Stokes propagates a smooth field, so the fill lands grainless. See
     # apply_score_repair, which fills the same kind of hole by a different route.
-    idx = np.flatnonzero(m)
-    clean = m == 0
-    if clean.any() and idx.size:
-        out.reshape(-1, 3)[idx] += _borrow_clean_grain(src, clean, max(1.0, factor), idx)[0]
+    negpy_core.add_clean_grain(out, np.ascontiguousarray(src, dtype=np.float32), m == 0, max(1.0, factor))
     return out
 
 

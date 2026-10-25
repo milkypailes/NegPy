@@ -6,7 +6,6 @@ from typing import Any, List, Dict, ContextManager, Optional, Tuple
 from PIL import Image
 from negpy.domain.interfaces import IImageLoader
 from negpy.infrastructure.loaders.helpers import NonStandardFileWrapper, linear_uint16_to_display_uint8
-from negpy.kernel.image.logic import uint16_to_float32
 
 
 class PakonLoader(IImageLoader):
@@ -97,7 +96,7 @@ class PakonLoader(IImageLoader):
                 data = data.reshape((h, w, 3))[..., ::-1]
 
             metadata = {"orientation": 0, "ir": None}
-            return NonStandardFileWrapper(uint16_to_float32(np.ascontiguousarray(data))), metadata
+            return NonStandardFileWrapper(source_u16=np.ascontiguousarray(data)), metadata
         except Exception as e:
             # Fallback to Rawpy or re-raise to be caught by worker
             raise RuntimeError(f"Pakon Load Failure: {e}") from e

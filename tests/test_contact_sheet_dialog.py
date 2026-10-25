@@ -8,7 +8,8 @@ from PyQt6.QtWidgets import QApplication
 
 from negpy.desktop.view.widgets.contact_sheet_dialog import ContactSheetDialog
 from negpy.domain.models import WorkspaceConfig
-from negpy.services.export.contact_sheet_layout import DEFAULT_PAPER, ContactSheetSettings, SheetFormat
+from negpy.services.export.contact_sheet_layout import DEFAULT_PAPER, ContactSheetSettings
+from negpy.services.film_edge.geometry import SheetFormat
 from negpy.services.export.contact_sheet_roll import PROOF_GRADE, FrameFacts, SheetFrame, SheetLook, StraightProof, straight_proof_config
 
 
@@ -92,7 +93,7 @@ def _drag(canvas, start, end):
 def test_opens_on_the_saved_paper(dialog):
     d = dialog()
     assert d.settings() == ContactSheetSettings()
-    assert d.paper_btn.text() == DEFAULT_PAPER.label
+    assert d.paper_btn.currentText() == DEFAULT_PAPER.label
     plan = d.plan()
     assert (plan.frames_per_strip, len(plan.pages)) == (6, 1)
 
@@ -107,7 +108,7 @@ def test_dragging_the_right_edge_widens_the_paper_about_its_center(dialog):
     assert width == pytest.approx(DEFAULT_PAPER.width + 40, abs=1.0)
     assert height == DEFAULT_PAPER.height
     assert d.plan().frames_per_strip == 7
-    assert d.paper_btn.text() == "Custom"
+    assert d.paper_btn.currentText() == "Custom"
 
 
 def test_a_drag_near_an_ilford_size_snaps_to_it(dialog):
@@ -165,12 +166,12 @@ def test_resolution_over_the_pixel_budget_steps_down(dialog):
     assert d.settings().dpi == 600
     d.paper_btn.setCurrentIndex(9)  # 40.6 × 50.8 cm
     assert d.settings().dpi == 300
-    assert not d.dpi_btn.choice_menu.actions()[2].isEnabled()
+    assert not d.dpi_btn.is_item_enabled(2)
 
 
 def test_a_paper_that_holds_no_frame_disables_export(dialog):
     d = dialog(n=4, film=SheetFormat.MEDIUM, frame_size="6×17")
-    assert not d.paper_btn.choice_menu.actions()[0].isEnabled()
+    assert not d.paper_btn.is_item_enabled(0)
     d._render()
     assert d.export_btn.isEnabled()
 
@@ -202,6 +203,16 @@ def test_roll_label_toggle_reaches_the_settings(dialog):
     d.label_btn.setChecked(False)
     assert d.settings().roll_label is False
     assert d.look().label == ""
+    assert not d.label_edit.isEnabled()
+
+
+def test_label_text_replaces_the_roll_label(dialog):
+    d = dialog()
+    assert d.label_edit.placeholderText() == "ROLL 1"
+    d.label_edit.setText("  Summer in Lisbon ")
+    assert d.look().label == "Summer in Lisbon"
+    d.label_edit.setText("")
+    assert d.look().label == "ROLL 1"
 
 
 def test_rejected_frames_start_left_out(dialog):
@@ -260,7 +271,7 @@ def test_edge_print_toggle_reaches_the_look_and_the_settings(dialog):
 
 def test_straight_proof_is_offered_only_when_it_can_be_made(dialog):
     d = dialog(proof=StraightProof(reason="Run Roll Analysis on this roll first."))
-    assert not d.print_btn.choice_menu.actions()[1].isEnabled()
+    assert not d.print_btn.is_item_enabled(1)
     assert "Roll Analysis" in d.proof_label.text()
 
 
@@ -294,18 +305,28 @@ def _scened(frames, scenes):
 
 def test_scene_order_needs_scenes(dialog):
     d = dialog(n=4)
-    assert not d.order_btn.choice_menu.actions()[1].isEnabled()
+    assert not d.order_btn.is_item_enabled(2)
+    assert dialog(n=4, settings=ContactSheetSettings(order="scene")).order_btn.currentIndex() == 0
+
+
+def test_date_order_follows_the_capture_time_and_keeps_roll_numbers(dialog):
+    frames = [replace(f, facts=FrameFacts(scan_size=f.facts.scan_size, birth_time=t)) for f, t in zip(_frames(3), (30, 10, 20))]
+    d = dialog(frames=frames)
+    assert d.order_btn.currentIndex() == 0 and d.numbers() == (0, 1, 2)
+    d.order_btn.setCurrentIndex(1)
+    assert d.numbers() == (1, 2, 0)
+    assert d.settings().order == "date"
 
 
 def test_scene_order_groups_frames_and_starts_each_scene_on_a_new_strip(dialog):
     frames = _scened(_frames(8), [2, 1, 1, 0, 2, 1, 0, 2])
     d = dialog(frames=frames)
-    d.order_btn.setCurrentIndex(1)
+    d.order_btn.setCurrentIndex(2)
     assert d.numbers() == (1, 2, 5, 0, 4, 7, 3, 6)
     assert d.breaks() == (3, 6)
     assert [(s.first, s.count) for s in d.plan().pages[0].strips] == [(0, 3), (3, 3), (6, 2)]
     assert [f.name for f in d.kept_frames()] == ["1.tif", "2.tif", "5.tif", "0.tif", "4.tif", "7.tif", "3.tif", "6.tif"]
-    assert d.settings().by_scene is True
+    assert d.settings().order == "scene"
     d.order_btn.setCurrentIndex(0)
     assert d.numbers() == tuple(range(8)) and d.breaks() == ()
 
@@ -323,7 +344,7 @@ def test_scene_order_proofs_each_scene_at_its_own_metering(dialog):
     )
     d.print_btn.setCurrentIndex(1)
     assert d.kept_frames()[0].config.process.locked_floors == (-2.0,) * 3
-    d.order_btn.setCurrentIndex(1)
+    d.order_btn.setCurrentIndex(2)
     assert d.kept_frames()[0].config.process.locked_floors == (-3.0,) * 3
     assert tiles.requests[-1] == scene_proofed
     assert "own metering" in d.proof_label.text()
@@ -334,7 +355,7 @@ def test_a_proof_unavailable_in_scene_order_falls_back_to_as_edited(dialog):
     roll_proof = tuple(replace(f, config=straight_proof_config(f.config, (-2.0,) * 3, (-0.5,) * 3)) for f in frames)
     d = dialog(frames=frames, proof=StraightProof(roll_proof, "", "roll"), scene_proof=StraightProof(reason="Run Scene Analysis first."))
     d.print_btn.setCurrentIndex(1)
-    d.order_btn.setCurrentIndex(1)
+    d.order_btn.setCurrentIndex(2)
     assert d.print_btn.currentIndex() == 0 and not d.straight_proof()
     assert "Scene Analysis" in d.proof_label.text()
 
@@ -366,11 +387,28 @@ def test_a_drag_measures_from_where_the_sheet_was_when_it_began(dialog):
     assert d.settings().paper_height == pytest.approx(DEFAULT_PAPER.height + 10, abs=1.0)
 
 
-def test_film_base_follows_white_paper_and_reaches_the_look_and_the_settings(dialog):
-    d = dialog()
-    assert not d.film_base_btn.isEnabled()  # nothing to print white until the paper is
-    d.white_btn.setChecked(True)
-    assert d.film_base_btn.isEnabled() and d.look().film_base
-    d.film_base_btn.setChecked(False)
-    assert not d.look().film_base
-    assert d.settings().film_base is False
+def test_film_edges_off_lays_upright_rows_and_grays_out_edge_print(dialog):
+    d = dialog(n=10)
+    assert d.film_edges_btn.isEnabled() and d.edge_btn.isEnabled()
+    assert d.plan().pages[0].strips
+
+    d.film_edges_btn.setChecked(False)
+    d._render()
+    page = d.plan().pages[0]
+    assert page.rows and not page.strips
+    assert not d.edge_btn.isEnabled()
+    assert d.settings().film_edges is False
+    assert "row" in d.summary_label.text()
+
+
+def test_film_edges_off_takes_each_frames_aspect_from_its_tile(dialog):
+    tiles = FakeTiles()
+    d = dialog(n=3, tiles=tiles, settings=ContactSheetSettings(film_edges=False))
+    assert d.aspects() == pytest.approx((1.5, 1.5, 1.5))  # from the scan size until a tile arrives
+    tiles.tile_ready.emit(1, 1, np.full((300, 200, 3), 90, np.uint8))
+    assert d.aspects()[1] == pytest.approx(200 / 300)
+
+    d.pick_btn.setChecked(True)
+    d._render()
+    windows = dict(d.canvas._frames)
+    assert windows[1].width() / windows[1].height() == pytest.approx(200 / 300)

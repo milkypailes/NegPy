@@ -98,7 +98,7 @@ def _panel():
 
 
 def _select_custom(panel):
-    combo = panel.geometry_sidebar.ratio_combo
+    combo = panel.autocrop_sidebar.ratio_combo
     combo.setCurrentIndex(combo.findData(CUSTOM_RATIO_ACTION))
 
 
@@ -119,4 +119,4 @@ def test_cancelling_custom_restores_the_stored_ratio(qapp, monkeypatch):
     _select_custom(panel)
 
     controller.set_crop_ratio.assert_not_called()
-    assert panel.geometry_sidebar.ratio_combo.currentData() == "Free"
+    assert panel.autocrop_sidebar.ratio_combo.currentData() == "Free"

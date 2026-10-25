@@ -18,11 +18,13 @@ from negpy.desktop.view.widgets.granular_settings_dialog import GranularSettings
 from negpy.domain.models import WorkspaceConfig
 from negpy.services.assets.presets import Presets, is_valid_preset_name
 
-_PRESET_EXCLUDED_SECTIONS = frozenset({"Crop", "Geometry", "Optics"})
+_PRESET_EXCLUDED_SECTIONS = frozenset({"Straighten"})
+# The Crop and Optics cards hold the roll's format and the scanning rig; the crop rectangle is one frame's.
+_PRESET_ROW_IDS = frozenset(r.id for _title, rows in CATALOG for r in rows) - {"geometry.crop_rect"}
 
 # "Replace edits" resets only the look sections. Per-frame geometry, frame metadata and
 # export prefs stay, and dust, heal and masks are not catalog rows at all.
-_REPLACE_KEPT_SECTIONS = frozenset({"Crop", "Geometry", "Optics", "Metadata", "Export"})
+_REPLACE_KEPT_SECTIONS = frozenset({"Crop", "Straighten", "Optics", "Metadata", "Export"})
 _LOOK_ROWS = tuple(r for title, rows in CATALOG if title not in _REPLACE_KEPT_SECTIONS for r in rows)
 
 
@@ -40,11 +42,11 @@ class PresetsSidebar(BaseSidebar):
 
         row = QHBoxLayout()
         self.apply_btn = self._labeled_action(
-            "fa5s.check", tr(" Apply"), tr("Apply the selected preset to the current image (or double-click a preset)")
+            "fa5s.check", tr("Apply"), tr("Apply the selected preset to the current image (or double-click a preset)")
         )
-        self.save_btn = self._labeled_action("fa5s.save", tr(" Save…"), tr("Pick which of the current settings to store as a new preset"))
+        self.save_btn = self._labeled_action("fa5s.save", tr("Save…"), tr("Pick which of the current settings to store as a new preset"))
 
-        self.edit_btn = self._icon_action("fa5s.pen", tr("Edit the selected preset — rename it or change which settings it stores"))
+        self.edit_btn = self._icon_action("fa5s.pen", tr("Edit the selected preset: rename it or change which settings it stores"))
         self.delete_btn = self._icon_action("fa5s.trash", tr("Delete the selected preset"))
 
         row.addWidget(self.apply_btn, stretch=1)
@@ -88,6 +90,7 @@ class PresetsSidebar(BaseSidebar):
             exclude_sections=_PRESET_EXCLUDED_SECTIONS,
             repo=self.controller.session.repo,
         )
+        dlg.limit_to_rows(_PRESET_ROW_IDS)
         dlg.setWindowTitle(tr("Apply Preset"))
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
@@ -112,6 +115,7 @@ class PresetsSidebar(BaseSidebar):
             exclude_sections=_PRESET_EXCLUDED_SECTIONS,
             repo=self.controller.session.repo,
         )
+        dlg.limit_to_rows(_PRESET_ROW_IDS)
         if dlg.exec() == QDialog.DialogCode.Accepted and self._name_is_usable(dlg.name()):
             Presets.save_preset(dlg.name().strip(), selected_flat_dict(self.state.config, dlg.selected()))
             self._refresh_presets(force=True)
@@ -124,6 +128,7 @@ class PresetsSidebar(BaseSidebar):
         dlg = GranularSettingsDialog(
             self, cfg, name, ask_name=True, exclude_sections=_PRESET_EXCLUDED_SECTIONS, repo=self.controller.session.repo
         )
+        dlg.limit_to_rows(_PRESET_ROW_IDS)
         dlg.setWindowTitle(tr("Edit Preset"))
         dlg.set_name(name)
         if dlg.exec() != QDialog.DialogCode.Accepted:
@@ -153,7 +158,7 @@ class PresetsSidebar(BaseSidebar):
         name = self._current_name()
         if not name:
             return
-        if confirm_delete_named(self, "Preset", name):
+        if confirm_delete_named(self, tr("Preset"), name):
             Presets.delete_preset(name)
             self._refresh_presets(force=True)
 

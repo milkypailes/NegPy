@@ -5,6 +5,7 @@ from a raw linear scan, before any inversion or normalization.
 
 from typing import Optional, Sequence
 
+import negpy_core
 import numpy as np
 
 from negpy.domain.types import ImageBuffer
@@ -191,14 +192,6 @@ def _downsample(img: ImageBuffer, max_dim: int) -> ImageBuffer:
     return img[::step, ::step]
 
 
-def _corr(a: np.ndarray, b: np.ndarray) -> float:
-    """Pearson correlation between two flattened channels."""
-    a = a.ravel() - float(a.mean())
-    b = b.ravel() - float(b.mean())
-    denom = float(np.sqrt(np.sum(a * a) * np.sum(b * b))) + 1e-12
-    return float(np.sum(a * b) / denom)
-
-
 def _has_purple_mask(r_v: float, g_v: float, b_v: float) -> bool:
     """True iff a single (r,g,b) triplet shows the purple-mask pattern (R≈B>>G)."""
     deficit = (r_v + b_v) / 2 - g_v
@@ -211,26 +204,25 @@ def detect_process_mode(raw: Optional[ImageBuffer]) -> ProcessMode:
     Classify a raw linear scan as C41, B&W or E-6.
     Falls back to C41 (the default) on ambiguous or invalid input.
     """
-    if raw is None or raw.ndim != 3 or raw.shape[2] < 3:
-        return ProcessMode.C41
+    return detect_process_and_source(raw)[0]
 
-    img = get_analysis_crop(raw[:, :, :3].astype(np.float32), _ANALYSIS_BUFFER)
-    img = _downsample(img, _MAX_ANALYSIS_DIM)
+
+def detect_source_color(raw: Optional[ImageBuffer]) -> bool:
+    """True when the scan is of color film: its channels decorrelate, or it carries an orange or purple mask."""
+    return detect_process_and_source(raw)[1]
+
+
+def detect_process_and_source(raw: Optional[ImageBuffer]) -> tuple[ProcessMode, bool]:
+    """(process mode, source is color film) from one pass of the scan stats; invalid input reads as C41."""
+    if raw is None or raw.ndim != 3 or raw.shape[2] < 3:
+        return ProcessMode.C41, True
+
+    img = _downsample(get_analysis_crop(raw[:, :, :3], _ANALYSIS_BUFFER), _MAX_ANALYSIS_DIM).astype(np.float32)
     img = np.clip(np.nan_to_num(img, nan=0.0, posinf=1.0, neginf=0.0), 0.0, 1.0)
     if img.size == 0:
-        return ProcessMode.C41
+        return ProcessMode.C41, True
 
-    r, g, b = img[:, :, 0], img[:, :, 1], img[:, :, 2]
-
-    # B&W: the channels stay near-perfectly correlated even with a color tint, while real
-    # color (C41, E-6) has varied hues and lower correlation.
-    min_corr = min(_corr(r, g), _corr(g, b), _corr(r, b))
-    if min_corr > _BW_CORR_THRESHOLD:
-        return ProcessMode.BW
-
-    r_mean, b_mean = float(np.mean(r)), float(np.mean(b))
-    r_p25, b_p25 = float(np.percentile(r, 25)), float(np.percentile(b, 25))
-    r_p98, g_p98, b_p98 = float(np.percentile(r, 98)), float(np.percentile(g, 98)), float(np.percentile(b, 98))
+    min_corr, (r_mean, b_mean, r_p25, b_p25, r_p98, g_p98, b_p98) = negpy_core.process_mode_stats(np.ascontiguousarray(img))
 
     # Orange mask (standard C41): R much greater than B. Scanners sometimes correct the mask
     # only in bright areas, so check across density levels.
@@ -239,12 +231,14 @@ def detect_process_mode(raw: Optional[ImageBuffer]) -> ProcessMode:
         (r_p25 + 1e-6) / (b_p25 + 1e-6),
         (r_p98 + 1e-6) / (b_p98 + 1e-6),
     )
-    if orange_score > _C41_ORANGE_THRESHOLD:
-        return ProcessMode.C41
-
     # Purple mask, as on Harman Phoenix: R about equal to B with G suppressed. Check at p98,
     # the clearest film areas, where the base color is most visible.
-    if _has_purple_mask(r_p98, g_p98, b_p98):
-        return ProcessMode.C41
+    masked = orange_score > _C41_ORANGE_THRESHOLD or _has_purple_mask(r_p98, g_p98, b_p98)
+    monochrome = min_corr > _BW_CORR_THRESHOLD
 
-    return ProcessMode.E6
+    # B&W: the channels stay near-perfectly correlated even with a color tint, while real
+    # color (C41, E-6) has varied hues and lower correlation. A gray scene on masked color
+    # film still reads B&W for the mode, but its source stays color.
+    if monochrome:
+        return ProcessMode.BW, masked
+    return (ProcessMode.C41 if masked else ProcessMode.E6), True

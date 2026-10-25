@@ -10,16 +10,18 @@ heal/masks, machine paths, derived caches) are simply not listed here.
 
 from __future__ import annotations
 
-from negpy.kernel.system.i18n import mark
+from negpy.kernel.system.i18n import mark, tr
 
-from dataclasses import replace
+from dataclasses import fields as dataclass_fields, replace
 from typing import Any, Callable, Iterable, Mapping, Optional
 
 from negpy.domain.models import WorkspaceConfig
+from negpy.features.exposure.papers import PAPER_PROFILES
 from negpy.features.geometry.models import with_auto_crop_field
 from negpy.features.metadata.capture import place_summary
 from negpy.features.metadata.models import GEAR_FIELDS, PROCESS_FIELDS, PUSH_PULL_LABELS, SCANNING_FIELDS
 from negpy.features.process.models import invalidate_local_bounds, with_film_fields
+from negpy.services.assets.flatfield import FlatFieldProfiles
 from negpy.services.assets.presets import preset_fields
 
 
@@ -54,13 +56,13 @@ class SettingRow:
 
 def _fmt_scalar(v) -> str:
     if isinstance(v, bool):
-        return "on" if v else "off"
+        return tr("On") if v else tr("Off")
     if v is None:
         return "—"
     if isinstance(v, float):
-        return f"{v:g}"
+        return f"{round(v, 4):g}"
     if isinstance(v, (tuple, list)):
-        return "set"
+        return tr("Set")
     return str(v)
 
 
@@ -76,6 +78,11 @@ def _format(row: SettingRow, values: tuple) -> str:
 
 def _row(label, section, *fields, channels="", fmt=None, sticky=False) -> SettingRow:
     return SettingRow(label, section, tuple(fields), channels, fmt, sticky)
+
+
+def _fmt_print_stock(values: tuple) -> str:
+    profile = PAPER_PROFILES.get(values[0])
+    return profile.label if profile else str(values[0])
 
 
 def _fmt_process(values: tuple) -> str:
@@ -99,9 +106,17 @@ def _fmt_gear(values: tuple) -> str:
     return " · ".join(p for p in parts if p) or "—"
 
 
+def _fmt_flatfield(values: tuple) -> str:
+    apply, profile_id = values
+    if not apply:
+        return _fmt_scalar(False)
+    profile = FlatFieldProfiles.get(profile_id) if profile_id else None
+    return profile.name if profile else _fmt_scalar(True)
+
+
 # fmt: off
 CATALOG: list[tuple[str, tuple[SettingRow, ...]]] = [
-    (mark("Film Mode"), (
+    (mark("Setup"), (
         _row(mark("Film Mode"), "process", "process_mode", sticky=True),
         _row(mark("Positive"), "process", "positive_source", sticky=True),
     )),
@@ -124,10 +139,9 @@ CATALOG: list[tuple[str, tuple[SettingRow, ...]]] = [
         # Strength, profile and the baked matrix copy atomically: strength alone would leave the
         # target on a stale or None matrix.
         _row(mark("Crosstalk"), "process", "crosstalk_strength", "crosstalk_profile", "crosstalk_matrix", fmt=lambda v: _fmt_scalar(v[0]), sticky=True),
-        _row(mark("Single-Shot Narrowband Calibration"), "process", "sensor_profile", "sensor_matrix", "sensor_unmix", fmt=lambda v: _fmt_scalar(v[0]), sticky=True),
+        _row(mark("Sensor Crosstalk Profile"), "process", "sensor_profile", "sensor_matrix", "sensor_unmix", fmt=lambda v: _fmt_scalar(v[0]), sticky=True),
         # Absent from BOUNDS_INPUT_FIELDS: it acts after inversion, so it never feeds the meters.
         _row(mark("Hue Trim"), "process", "hue_trim", sticky=True),
-        _row(mark("Cast Removal"), "exposure", "cast_removal_strength", sticky=True),
     )),
     (mark("Crop"), (
         _row(mark("Auto Crop"), "geometry", "crop_from_auto", sticky=True),
@@ -135,12 +149,12 @@ CATALOG: list[tuple[str, tuple[SettingRow, ...]]] = [
         _row(mark("Rebate Trim"), "geometry", "autocrop_rebate_trim", sticky=True),
         _row(mark("Crop Ratio"), "geometry", "autocrop_ratio", sticky=True),
         _row(mark("Crop Mode"), "geometry", "autocrop_mode", sticky=True),
-        _row(mark("Square Before Crop"), "geometry", "autocrop_square", sticky=True),
+        _row(mark("Square First"), "geometry", "autocrop_square", sticky=True),
         # Rect and key copy together: without the key a copied auto rect looks freshly
         # detected on the target.
         _row(mark("Crop"), "geometry", "crop_rect", "crop_detect_key", fmt=lambda v: _fmt_scalar(v[0])),
     )),
-    (mark("Geometry"), (
+    (mark("Straighten"), (
         _row(mark("Rotation"), "geometry", "rotation"),
         _row(mark("Fine Rotation"), "geometry", "fine_rotation"),
         _row(mark("Tilt"), "geometry", "converge_v"),
@@ -151,6 +165,7 @@ CATALOG: list[tuple[str, tuple[SettingRow, ...]]] = [
     (mark("Optics"), (
         _row(mark("Distortion Correction"), "geometry", "distortion_k1", "lens_distortion_from_metadata", sticky=True),
         _row(mark("Embedded CA"), "geometry", "lens_ca_from_metadata", sticky=True),
+        _row(mark("Flat Field"), "flatfield", "apply", "profile_id", fmt=_fmt_flatfield),
     )),
     (mark("Tone"), (
         _row(mark("Print Density"), "exposure", "density"),
@@ -163,8 +178,7 @@ CATALOG: list[tuple[str, tuple[SettingRow, ...]]] = [
         _row(mark("Highlights Grade"), "exposure", "highlight_grade"),
         _row(mark("Shadows Grade Trim"), "exposure", "shadow_grade_trim_red", "shadow_grade_trim_green", "shadow_grade_trim_blue", channels="RGB"),
         _row(mark("Highlights Grade Trim"), "exposure", "highlight_grade_trim_red", "highlight_grade_trim_green", "highlight_grade_trim_blue", channels="RGB"),
-        _row(mark("Contrast Mask"), "exposure", "contrast_mask"),
-        _row(mark("Mask Spacer"), "exposure", "mask_spacer"),
+        _row(mark("Contrast Mask"), "exposure", "contrast_mask_strength"),
         _row(mark("Diffusion"), "exposure", "diffusion"),
         _row(mark("Preflash"), "exposure", "preflash"),
         _row(mark("Auto Density"), "exposure", "auto_exposure", sticky=True),
@@ -203,7 +217,7 @@ CATALOG: list[tuple[str, tuple[SettingRow, ...]]] = [
         _row(mark("Curves Blue"), "exposure", *[f for i in range(8) for f in (f"curve_{i}_blue", f"curve_x_{i}_blue")]),
     )),
     (mark("Paper Response"), (
-        _row(mark("Print Stock"), "exposure", "paper_profile", sticky=True),
+        _row(mark("Print Stock"), "exposure", "paper_profile", fmt=_fmt_print_stock, sticky=True),
         _row(mark("Paper Black"), "exposure", "paper_black", sticky=True),
         _row(mark("Paper White"), "exposure", "paper_dmin", sticky=True),
         _row(mark("Snap"), "exposure", "midtone_gamma"),
@@ -226,6 +240,8 @@ CATALOG: list[tuple[str, tuple[SettingRow, ...]]] = [
         _row(mark("Yellow"), "exposure", "wb_yellow"),
         _row(mark("Shadows CMY"), "exposure", "shadow_cyan", "shadow_magenta", "shadow_yellow", channels="CMY"),
         _row(mark("Highlights CMY"), "exposure", "highlight_cyan", "highlight_magenta", "highlight_yellow", channels="CMY"),
+        _row(mark("Cast Removal"), "exposure", "cast_removal_strength", sticky=True),
+        _row(mark("Filter"), "exposure", "bw_filter"),
     )),
     (mark("Lab"), (
         _row(mark("Chroma"), "lab", "saturation", sticky=True),
@@ -285,7 +301,6 @@ CATALOG: list[tuple[str, tuple[SettingRow, ...]]] = [
         _row(mark("Optical Size"), "retouch", "dust_size"),
         _row(mark("IR Removal"), "retouch", "ir_dust_remove"),
         _row(mark("IR Threshold"), "retouch", "ir_threshold"),
-        _row(mark("IR Method"), "retouch", "ir_method"),
         _row(mark("IR Attenuation"), "retouch", "ir_attenuation"),
     )),
     (mark("Metadata"), (
@@ -401,8 +416,55 @@ def rows_for_section(section: str) -> list[SettingRow]:
     return [r for r in all_rows() if r.section == section]
 
 
+_LISTED = frozenset((r.section, f) for r in all_rows() for f in r.fields)
+# Written by a render, not by the user, so never a change of its own.
+_MEASURED = frozenset({("process", "local_floors"), ("process", "local_ceils"), ("process", "meter_key"), ("process", "source_color")})
+
+# The card a change lives on when no catalog row lists its field (a crop rectangle, a heal, a mask).
+_UNLISTED_CARD = {
+    "process": mark("Metering"),
+    "exposure": mark("Export"),
+    "flatfield": mark("Optics"),
+    "rgbscan": mark("Frame Assembly"),
+    "stitch": mark("Stitch"),
+    "hdr": mark("HDR"),
+    "geometry": mark("Crop"),
+    "local": mark("Dodge & Burn"),
+    "retouch": mark("Retouch"),
+    "metadata": mark("Metadata"),
+    "export": mark("Export"),
+}
+_UNLISTED_FIELD_CARD = {
+    "linear_raw": mark("Raw Decode"),
+    "demosaic_preview": mark("Raw Decode"),
+    "demosaic_export": mark("Raw Decode"),
+    "highlight_reconstruction": mark("Raw Decode"),
+    "crosstalk_process": mark("Calibration"),
+}
+
+
+def changed_settings(prev: WorkspaceConfig, config: WorkspaceConfig) -> list[tuple[str, str]]:
+    """(card, control) for each setting that differs between two configs, in catalog order. A
+    change no row lists names its card alone, with an empty control."""
+    changed = [
+        (title, row.label)
+        for title, rows in CATALOG
+        for row in rows
+        if any(getattr(getattr(prev, row.section), f) != getattr(getattr(config, row.section), f) for f in row.fields)
+    ]
+    for section in (f.name for f in dataclass_fields(config)):
+        before, after = getattr(prev, section), getattr(config, section)
+        if before == after:
+            continue
+        for f in dataclass_fields(after):
+            key = (section, f.name)
+            if key not in _LISTED and key not in _MEASURED and getattr(before, f.name) != getattr(after, f.name):
+                changed.append((_UNLISTED_FIELD_CARD.get(f.name) or _UNLISTED_CARD.get(section, section), ""))
+    return changed
+
+
 # Filtration, Tone and Paper Response split ExposureConfig for modified counts and scoped resets.
-# render_intent (flat-master output) and cast_removal_strength (the Calibration card's) are in none.
+# render_intent (flat-master output) is in none.
 COLOR_FIELDS = (
     "wb_cyan",
     "wb_magenta",
@@ -413,6 +475,8 @@ COLOR_FIELDS = (
     "highlight_cyan",
     "highlight_magenta",
     "highlight_yellow",
+    "cast_removal_strength",
+    "bw_filter",
 )
 
 GEOMETRY_FIELDS = (
@@ -423,9 +487,17 @@ GEOMETRY_FIELDS = (
     "converge_v",
     "converge_h",
     "crop_to_valid",
+)
+
+CROP_FIELDS = (
     "crop_rect",
     "crop_from_auto",
     "crop_detect_key",
+    "autocrop_mode",
+    "autocrop_offset",
+    "autocrop_rebate_trim",
+    "autocrop_ratio",
+    "autocrop_square",
 )
 
 TONE_FIELDS = (
@@ -447,8 +519,7 @@ TONE_FIELDS = (
     "highlight_grade_trim_blue",
     "auto_exposure",
     "auto_normalize_contrast",
-    "contrast_mask",
-    "mask_spacer",
+    "contrast_mask_strength",
     "diffusion",
     "preflash",
     "levels_in_low",
@@ -510,6 +581,7 @@ PAPER_FIELDS = (
 # card keyed by its own config section needs no tuple. Roll-tab cards drive roll defaults
 # instead, and Dodge & Burn has no catalog row: a mask means nothing on the next frame.
 FRAME_CARD_FIELDS: dict[str, tuple | None] = {
+    "autocrop": CROP_FIELDS,
     "geometry": GEOMETRY_FIELDS,
     "color": COLOR_FIELDS,
     "tone": TONE_FIELDS,

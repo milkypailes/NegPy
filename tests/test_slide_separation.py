@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 
 from negpy.domain.interfaces import PipelineContext
-from negpy.features.exposure.models import ExposureConfig
+from negpy.features.exposure.models import BwFilter, ExposureConfig
 from negpy.features.process.models import ProcessMode, cast_removal_for_mode
 from negpy.kernel.system.config import DEFAULT_WORKSPACE_CONFIG
 from negpy.services.rendering.engine import base_processor, exposure_processor
@@ -44,7 +44,7 @@ TRANSFER = (
 METERS = {"auto_exposure", "auto_normalize_contrast"}
 # The paper model's own controls; the transfer curve has no paper to apply them to.
 PRINT_ONLY = (
-    {"contrast_mask", "mask_spacer", "diffusion", "paper_dmin", "paper_black", "paper_profile", "preflash", "hold_black"}
+    {"contrast_mask_strength", "diffusion", "paper_dmin", "paper_black", "paper_profile", "preflash", "hold_black", "bw_filter"}
     | {n + t for n in ("grade",) for t in _TRIMS}
     | _with_trims("shadow_grade", "highlight_grade", "midtone_gamma")
 )
@@ -74,6 +74,8 @@ def _moved(field: str, value):
         return not value
     if field == "paper_profile":
         return "kodak_endura"
+    if field == "bw_filter":
+        return BwFilter.RED_25
     if field.startswith("curve_x_"):
         # Integer 0-255 positions: ±5 stays in range and off the end clamps.
         return value - 5.0 if value > 128 else value + 5.0
@@ -88,9 +90,9 @@ def _moved(field: str, value):
         return value - 25.0 if "high" in field else value + 25.0
     if "grade" in field:
         return value + 15.0
-    if field in ("toe_width", "shoulder_width", "mask_spacer"):
+    if field in ("toe_width", "shoulder_width"):
         return value + 1.5
-    if field in ("preflash", "diffusion"):
+    if field in ("preflash", "diffusion", "contrast_mask_strength"):
         return 0.8
     return value + 0.25
 

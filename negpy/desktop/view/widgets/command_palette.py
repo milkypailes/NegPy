@@ -58,7 +58,7 @@ SYNONYMS: dict[str, tuple[str, ...]] = {
     "sharpness": ("Sharpening",),
     "noise": ("Chroma Denoise",),
     "orange mask": ("Cast Removal",),
-    "invert": ("Film Mode",),
+    "invert": ("Setup",),
     "straighten": ("Fine Rotation",),
     "perspective": ("Tilt", "Swing"),
     "keystone": ("Tilt", "Swing"),
@@ -193,13 +193,14 @@ def open_entry(window, entry: Entry) -> None:
 
 
 class FindField(QWidget):
-    """The controls panel's title bar: a box that opens Find; its margin still drags the panel."""
+    """The controls panel's title bar: a box that opens Find, as wide as the tab strip and cards below
+    it; its top and bottom margins still drag the panel."""
 
     def __init__(self, open_palette: Callable[[], None]):
         super().__init__()
         self._open = open_palette
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(THEME.space_lg, THEME.space_sm, THEME.space_lg, THEME.space_sm)
+        layout.setContentsMargins(0, THEME.space_sm, 0, THEME.space_sm)
         self.box = QLineEdit()
         self.box.setReadOnly(True)
         self.box.setFocusPolicy(Qt.FocusPolicy.NoFocus)

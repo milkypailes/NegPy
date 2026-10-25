@@ -1,4 +1,7 @@
 from negpy.kernel.system.i18n import tr
+from negpy.kernel.system import timing
+from negpy.kernel.system.logging import get_logger
+from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from typing import List, Optional, Any, Union
@@ -8,6 +11,7 @@ import os
 import tempfile
 import threading
 
+import negpy_core
 import numpy as np
 from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
 from negpy.domain.models import (
@@ -31,16 +35,15 @@ from negpy.features.hdr.models import hdr_frame_paths
 from negpy.services.export.print import PrintService
 from negpy.services.export.templating import render_export_filename
 from negpy.services.export.contact_sheet import ContactSheetService
-from negpy.services.export.contact_sheet_layout import (
-    MM_PER_INCH,
-    ContactSheetSettings,
-    SheetFormat,
-    best_dpi,
-    film_geometry,
-    plan_sheets,
-)
+from negpy.services.export.contact_sheet_layout import MM_PER_INCH, ContactSheetSettings, best_dpi, plan_rows, plan_sheets
+from negpy.services.film_edge.geometry import SheetFormat, film_geometry
 from negpy.services.export.contact_sheet_roll import SheetFrame, SheetLook, tile_params, turns_for
 from negpy.services.export.encoders import encode_jpeg
+from negpy.kernel.system.paths import apply_umask_mode
+from negpy.kernel.system.memory import available_system_memory_bytes
+from negpy.services.rendering.prefetch_policy import MIN_RAM_RESERVE_BYTES
+
+logger = get_logger(__name__)
 
 
 def _protects_metadata(task: "ExportTask") -> bool:
@@ -115,6 +118,8 @@ class ContactSheetJob:
     numbers: tuple[int, ...] = ()
     # Frames that start a new strip.
     breaks: tuple[int, ...] = ()
+    # Each frame's upright print aspect, which lays out the rows when Film Edges is off.
+    aspects: tuple[float, ...] = ()
 
 
 def contact_sheet_paths(out_dir: str, count: int) -> list[str]:
@@ -179,12 +184,14 @@ def _looks_border_crushed(buffer, task: "ExportTask") -> bool:
     if task.params.geometry.crop_rect is not None:
         return False
     arr = buffer[:: max(1, buffer.shape[0] // 512), :: max(1, buffer.shape[1] // 512)]
-    arr = arr if arr.ndim == 2 else arr[..., :3].mean(axis=2)
+    arr = np.ascontiguousarray(arr, dtype=np.float32)
+    arr = arr if arr.ndim == 2 else negpy_core.mean_channels(np.ascontiguousarray(arr[..., :3]))
     h, w = arr.shape[:2]
     m = max(2, int(0.04 * min(h, w)))
-    ring = np.concatenate([arr[:m].ravel(), arr[-m:].ravel(), arr[:, :m].ravel(), arr[:, -m:].ravel()])
-    inner = arr[h // 4 : 3 * h // 4, w // 4 : 3 * w // 4]
-    return float(np.median(ring)) < 0.02 and float(np.median(inner)) < 0.12
+    if 2 * m >= min(h, w):
+        return False
+    ring, inner = negpy_core.ring_inner_medians(arr, m)
+    return float(ring) < 0.02 and float(inner) < 0.12
 
 
 def _companion_source_paths(task: "ExportTask") -> tuple:
@@ -270,6 +277,18 @@ def find_export_conflicts(tasks: List[ExportTask]) -> List[str]:
     return [path for task in tasks if os.path.exists(path := resolve_export_target_path(task))]
 
 
+# Each encode runs on one core; more than a few at once only multiplies the held renders.
+_ENCODE_WORKERS = max(1, min(3, (os.cpu_count() or 1) // 4))
+
+
+def encode_slots(nbytes: int, available: Optional[int]) -> int:
+    """Renders that may wait for or run an encode at once: each holds its buffer and about as much
+    again in encoded bytes, above the RAM reserve. Unknown RAM gives one."""
+    if available is None:
+        return 1
+    return max(1, min(_ENCODE_WORKERS, (available - MIN_RAM_RESERVE_BYTES) // max(1, 2 * nbytes)))
+
+
 class ExportWorker(QObject):
     """
     Background batch export orchestrator.
@@ -289,6 +308,7 @@ class ExportWorker(QObject):
         self._processor = ImageProcessor()
         self._cancel = threading.Event()
         self._written: set[str] = set()  # paths this batch wrote
+        self._names_lock = threading.Lock()  # finishers pick output names one at a time
 
     @pyqtSlot()
     def cancel(self) -> None:
@@ -302,14 +322,14 @@ class ExportWorker(QObject):
 
     @pyqtSlot(list)
     def run_batch(self, tasks: List[ExportTask]) -> None:
-        """Export the tasks pipelined: the next source prepares and the previous render encodes
-        while the current one renders, so at most two full-res buffers are held. A failed file
+        """Export the tasks pipelined: the next source prepares and earlier renders encode while
+        the current one renders. `encode_slots` bounds the renders held for encoding. A failed file
         never stops the batch, and every exit emits `finished` or `cancelled` to free the lane."""
         self._written = set()
         total = len(tasks)
-        finisher = ThreadPoolExecutor(max_workers=1)
+        finisher = ThreadPoolExecutor(max_workers=_ENCODE_WORKERS)
         prefetcher = ThreadPoolExecutor(max_workers=1)
-        pending: Optional[Future] = None
+        pending: deque[Future] = deque()
 
         def _drain(fut: Future) -> None:
             try:
@@ -386,15 +406,14 @@ class ExportWorker(QObject):
                         self.error.emit(status)
                         continue
 
-                    if pending is not None:
-                        _drain(pending)
-                    pending = finisher.submit(self._finish_task, task, buffer, status, embed_plan)
+                    while pending and len(pending) >= encode_slots(buffer.nbytes, available_system_memory_bytes()):
+                        _drain(pending.popleft())
+                    pending.append(finisher.submit(self._finish_task, task, buffer, status, embed_plan))
                 except Exception as e:
                     self.error.emit(tr("Export failed for {full_name}: {e}", full_name=full_name, e=e))
 
-            if pending is not None:
-                _drain(pending)
-                pending = None
+            while pending:
+                _drain(pending.popleft())
             if border_crushed:
                 self.warning.emit(
                     f"{border_crushed} of {len(tasks)} exports rendered almost black with no crop set: "
@@ -429,6 +448,12 @@ class ExportWorker(QObject):
     def _finish_task(self, task: ExportTask, buffer: np.ndarray, color_space: str, embed_plan: Optional[tuple]) -> Optional[str]:
         """Encode + metadata + atomic write for one rendered frame, on the finisher
         thread. Returns an error message, or None on success."""
+        with timing.collect() as times:
+            error = self._encode_and_write(task, buffer, color_space, embed_plan)
+        logger.info("export-timing encode %s | %s", timing.summary(times), task.file_info["name"])
+        return error
+
+    def _encode_and_write(self, task: ExportTask, buffer: np.ndarray, color_space: str, embed_plan: Optional[tuple]) -> Optional[str]:
         resolution = _export_resolution(task, buffer.shape)
         bits, status = self._processor.encode_export(
             buffer,
@@ -438,6 +463,7 @@ class ExportWorker(QObject):
             embed_plan=embed_plan,
             resolution=resolution,
         )
+        timing.lap("encode")
         if not bits:
             return status
 
@@ -451,6 +477,7 @@ class ExportWorker(QObject):
                 )
             else:
                 bits = embed_metadata(bits, task.metadata_config, task.source_exif, resolution=resolution)
+        timing.lap("metadata")
 
         out_dir, filename, ext = resolve_export_naming(task)
         os.makedirs(out_dir, exist_ok=True)
@@ -458,10 +485,11 @@ class ExportWorker(QObject):
 
         # Overwrite replaces files from before the batch, never another frame of it.
         counter = 2
-        while path in self._written or (not task.export_settings.overwrite and os.path.exists(path)):
-            path = os.path.join(out_dir, f"{filename}_{counter}.{ext}")
-            counter += 1
-        self._written.add(path)
+        with self._names_lock:
+            while path in self._written or (not task.export_settings.overwrite and os.path.exists(path)):
+                path = os.path.join(out_dir, f"{filename}_{counter}.{ext}")
+                counter += 1
+            self._written.add(path)
 
         if _export_target_is_a_source(path, task):
             return f"Export skipped for {task.file_info['name']}: it would overwrite the source file. Change the filename pattern or destination."
@@ -471,10 +499,12 @@ class ExportWorker(QObject):
             with tempfile.NamedTemporaryFile(dir=out_dir, delete=False, suffix=".part") as tmp:
                 tmp_path = tmp.name
                 tmp.write(bits)
+            apply_umask_mode(tmp_path)
             os.replace(tmp_path, path)
             # The write above stamps the filesystem dates with the export time; the EXIF
             # dates are already right. Tools that sort by file date read the former.
             sync_export_filesystem_dates(path, task.file_info["path"])
+            timing.lap("write")
         except Exception as write_err:
             if tmp_path is not None and os.path.exists(tmp_path):
                 os.unlink(tmp_path)
@@ -517,15 +547,24 @@ class ExportWorker(QObject):
         try:
             geometry = film_geometry(job.format, job.frame_size)
             settings = job.settings
-            plan = plan_sheets(settings.paper_width, settings.paper_height, geometry, len(job.frames), settings.roll_label, job.breaks)
+            if settings.film_edges:
+                plan = plan_sheets(settings.paper_width, settings.paper_height, geometry, len(job.frames), settings.roll_label, job.breaks)
+            else:
+                aspects = job.aspects or tuple(geometry.window_aspect for _ in job.frames)
+                plan = plan_rows(settings.paper_width, settings.paper_height, geometry, aspects, settings.roll_label, job.breaks)
             if not plan.pages:
                 self.error.emit(tr("Contact sheet: {reason}", reason=plan.reason))
                 self.finished.emit()
                 return
             dpi = best_dpi(settings.paper_width, settings.paper_height, settings.dpi)
             px_per_mm = dpi / MM_PER_INCH
-            window_long_px = int(math.ceil(max(geometry.frame_along, geometry.frame_across) * px_per_mm))
-            target_long_px = int(window_long_px * 1.5)
+            if settings.film_edges:
+                window_long_px = int(math.ceil(max(geometry.frame_along, geometry.frame_across) * px_per_mm))
+                target_long_px = int(window_long_px * 1.5)
+            else:
+                # A row frame takes the tile's own aspect, so the tile need only cover its longest side.
+                longest = max(max(f.width, f.height) for page in plan.pages for row in page.rows for f in row.frames)
+                target_long_px = int(math.ceil(longest * px_per_mm))
             paths = contact_sheet_paths(job.out_dir, len(plan.pages))
             os.makedirs(job.out_dir, exist_ok=True)
             icc = _srgb_icc_bytes()
@@ -535,7 +574,7 @@ class ExportWorker(QObject):
             for page_index, page in enumerate(plan.pages):
                 tiles: list[Optional[np.ndarray]] = [None] * len(job.frames)
                 turns = [0] * len(job.frames)
-                indices = [i for strip in page.strips for i in range(strip.first, strip.first + strip.count)]
+                indices = page.slots()
                 for n, index in enumerate(indices):
                     if self._cancel.is_set():
                         self.cancelled.emit()
@@ -591,6 +630,7 @@ class ExportWorker(QObject):
                 del sheet
 
             for part, path in zip(parts, paths):
+                apply_umask_mode(part)
                 os.replace(part, path)
             parts.clear()
             self.contact_sheet_written.emit(job.out_dir)

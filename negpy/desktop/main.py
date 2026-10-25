@@ -24,7 +24,9 @@ from negpy.services.assets.migrations.positive_auto import migrate_auto_meter_fo
 from negpy.services.assets.migrations.roll_fields import (
     migrate_auto_crop_roll_locks,
     migrate_baseline_card_split,
-    migrate_cast_removal_roll_locks,
+    migrate_cast_removal_to_frames,
+    migrate_crop_to_frames,
+    migrate_linear_raw_card_split,
     migrate_new_roll_field_locks,
     migrate_paper_card_split,
 )
@@ -33,7 +35,6 @@ from negpy.kernel.system.logging import get_logger, setup_logging
 from negpy.kernel.system.override import apply as apply_override
 from negpy.kernel.system.override import apply_stored as apply_stored_override
 from negpy.kernel.system.override import load_or_create as load_override
-from negpy.kernel.system.parallel import configure_cpu_parallel, parallel_enabled, resolve_cpu_parallel, set_parallel_enabled
 from negpy.kernel.system.paths import get_resource_path
 
 logger = get_logger(__name__)
@@ -64,11 +65,17 @@ def _filter_qt_messages(mode, context, message: str) -> None:
 
 class AppEventFilter(QObject):
     """The app-wide event rules, in one filter so each event crosses into Python once. Combo and
-    spin boxes never take the wheel, every tooltip wraps (Qt never wraps plain text), and an
-    icon-only button takes its tooltip's first clause as its accessible name."""
+    spin boxes never take the wheel, every tooltip wraps (Qt never wraps plain text), an
+    icon-only button takes its tooltip's first clause as its accessible name, and a macOS window
+    takes the theme's background (``mac_window``)."""
 
     def eventFilter(self, obj, event) -> bool:  # noqa: N802
         kind = event.type()
+        if kind == QEvent.Type.Show and isinstance(obj, QWidget):
+            from negpy.desktop.view.mac_window import paint_window_background
+
+            paint_window_background(obj)
+            return False
         if kind == QEvent.Type.Wheel and isinstance(obj, (QComboBox, QAbstractSpinBox)):
             event.ignore()
             return True
@@ -81,7 +88,7 @@ class AppEventFilter(QObject):
             elif tip and isinstance(obj, QAbstractButton) and not obj.text():
                 # The shortcut chips follow the text as a table; the name is the text before them.
                 plain = " ".join(html.unescape(re.sub(r"<[^>]+>", " ", tip.split("<table", 1)[0])).split())
-                obj.setAccessibleName(plain.split(" — ", 1)[0])
+                obj.setAccessibleName(re.split(r": | — ", plain, maxsplit=1)[0])
         return False
 
 
@@ -214,35 +221,6 @@ def _bootstrap_environment() -> None:
     GearProfiles.ensure_user_dir()
 
 
-def _offer_to_disable_cpu_parallel(repo, parent) -> None:
-    """The previous run had multi-core kernels on and did not exit cleanly. Say so.
-
-    Numba's workqueue threading layer terminates the process on concurrent entry, with no
-    Python exception to catch and nothing written to the log, so the app cannot report the
-    crash as it happens — only notice afterwards that the last run never finished. Without
-    this the setting is un-diagnosable: a user turns it on, hits an abort weeks later, and
-    reports a crash nobody can connect to it.
-    """
-    from PyQt6.QtWidgets import QMessageBox
-
-    box = QMessageBox(parent)
-    box.setIcon(QMessageBox.Icon.Warning)
-    box.setWindowTitle(tr("NegPy Closed Unexpectedly"))
-    box.setText(tr("The last session ended unexpectedly with multi-core CPU rendering turned on."))
-    box.setInformativeText(
-        tr(
-            "That setting is the most likely cause. Turning it off costs some speed on merges "
-            "and exports, and is the safe setting.\n\nTurn multi-core CPU rendering off?"
-        )
-    )
-    box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-    box.setDefaultButton(QMessageBox.StandardButton.Yes)
-    if box.exec() == QMessageBox.StandardButton.Yes:
-        repo.save_global_setting("cpu_parallel", False)
-        set_parallel_enabled(False)
-        logger.warning("CPU parallel kernels disabled after an unclean shutdown")
-
-
 def main() -> None:
     """
     Desktop entry point.
@@ -252,8 +230,6 @@ def main() -> None:
     _install_exception_hook()  # log unhandled slot exceptions to negpy.log instead of aborting
 
     try:
-        os.environ["NUMBA_THREADING_LAYER"] = "workqueue"
-
         apply_override(override_cfg, APP_CONFIG)
 
         try:
@@ -283,22 +259,10 @@ def main() -> None:
         apply_stored_override(override_cfg, APP_CONFIG, repo.get_global_setting)
 
         # Opt-in smaller-tile/no-pipelining export path: override.toml wins if set, else the
-        # saved Preferences checkbox, else off. Not a STORED_PERF_KEYS entry since apply_stored
+        # saved Preferences toggle, else off. Not a STORED_PERF_KEYS entry since apply_stored
         # skips bool values (see its docstring).
         if override_cfg.low_vram_export_tiling is None:
             APP_CONFIG.low_vram_export_tiling = bool(repo.get_global_setting("low_vram_export_tiling", False))
-
-        # Multi-core Numba kernels: override.toml, then the saved setting, then the platform
-        # default (off on macOS). Read before the flags below are overwritten.
-        prev_clean_exit = bool(repo.get_global_setting("clean_shutdown", True))
-        prev_run_parallel = bool(repo.get_global_setting("cpu_parallel_active", False))
-        stored_parallel = repo.get_global_setting("cpu_parallel", None)
-        configure_cpu_parallel(resolve_cpu_parallel(APP_CONFIG.cpu_parallel, None if stored_parallel is None else bool(stored_parallel)))
-        # Numba's workqueue layer aborts the process outright on concurrent entry, with no
-        # exception, no dialog and nothing in the log. A marker is the only way an abort can
-        # later be attributed to this setting rather than reported as a mystery.
-        repo.save_global_setting("clean_shutdown", False)
-        repo.save_global_setting("cpu_parallel_active", parallel_enabled())
 
         # Resolve flat-field gains by profile id from the on-disk store, which keeps the numpy
         # logic layer free of any storage dependency, then migrate any legacy DB-backed profiles
@@ -312,9 +276,11 @@ def main() -> None:
         migrate_legacy_slide_cast_removal(repo)
         migrate_baseline_card_split(repo)
         migrate_paper_card_split(repo)
+        migrate_linear_raw_card_split(repo)
         migrate_new_roll_field_locks(repo)
-        migrate_cast_removal_roll_locks(repo)
+        migrate_cast_removal_to_frames(repo)
         migrate_auto_crop_roll_locks(repo)
+        migrate_crop_to_frames(repo)
         migrate_stale_frame_bounds(repo)
 
         scale = float(repo.get_global_setting("ui_scale", 1.0) or 1.0)
@@ -339,21 +305,19 @@ def main() -> None:
             app.setWindowIcon(QIcon(icon_path))
 
         if os.path.exists(get_resource_path("negpy/desktop/view/styles/modern_dark.qss")):
-            from negpy.desktop.view.styles.templates import load_stylesheet
+            from negpy.desktop.view.styles.templates import load_stylesheet, themed_palette
 
             app.setStyleSheet(load_stylesheet())
+            app.setPalette(themed_palette(app.palette()))
 
         session_manager = DesktopSessionManager(repo)
         controller = AppController(session_manager)
 
         window = MainWindow(controller)
-        if prev_clean_exit is False and prev_run_parallel:
-            _offer_to_disable_cpu_parallel(repo, window)
         window.show()
 
         exit_code = app.exec()
         controller.cleanup()
-        repo.save_global_setting("clean_shutdown", True)
         # PyQt's at-exit cleanup walks sip's wrapper map while it deletes these, and the Python
         # code their destructors run (event filters, the proxy style) can reallocate the map.
         for widget in [w for w in app.topLevelWidgets() if w.parent() is None and sip.ispyowned(w)]:

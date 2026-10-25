@@ -4,7 +4,7 @@ from PyQt6.QtWidgets import QDialog, QHBoxLayout, QLabel, QPushButton, QVBoxLayo
 
 from negpy.desktop.view.styles.templates import pane_header_qss, pin_dialog_default
 from negpy.desktop.view.styles.theme import THEME
-from negpy.desktop.view.widgets.choice_button import SegmentedChoice
+from negpy.desktop.view.widgets.segmented_choice import SegmentedChoice
 from negpy.desktop.view.widgets.dialog_geometry import remember_dialog_geometry
 from negpy.kernel.system.i18n import tr
 

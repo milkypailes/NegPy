@@ -255,7 +255,8 @@ class TestAppController(unittest.TestCase):
 
         self.assertEqual(cleared, [(8.0, -6.0, {}, ToolMode.KEYSTONE_LINES)])
         self.mock_session_manager.update_config.assert_called_once()
-        self.assertTrue(self.mock_session_manager.update_config.call_args.kwargs["persist"])
+        reverts = [c for c in self.mock_session_manager.update_config.call_args_list if c.kwargs.get("persist")]
+        self.assertEqual(len(reverts), 1)  # one undo step
         self.controller.request_render.assert_called_once_with()
 
     def test_auto_skew_writes_absolute_rotation_and_measured_keystone(self):
@@ -277,7 +278,8 @@ class TestAppController(unittest.TestCase):
         self.assertAlmostEqual(result.fine_rotation, -1.25)
         self.assertAlmostEqual(result.converge_v, 0.8)
         self.assertAlmostEqual(result.converge_h, 2.5)  # unmeasured: kept
-        self.assertTrue(self.mock_session_manager.update_config.call_args.kwargs["persist"])
+        reverts = [c for c in self.mock_session_manager.update_config.call_args_list if c.kwargs.get("persist")]
+        self.assertEqual(len(reverts), 1)  # one undo step
         self.controller.request_render.assert_called_once_with()
 
     def test_auto_skew_status_names_only_what_the_fit_measured(self):
@@ -326,7 +328,7 @@ class TestAppController(unittest.TestCase):
 
         self.mock_session_manager.update_config.assert_not_called()
         self.controller.request_render.assert_not_called()
-        self.assertIn("no adjustment necessary", self.controller.set_status.call_args.args[0])
+        self.assertIn("already square", self.controller.set_status.call_args.args[0])
 
     def test_auto_skew_measures_the_flat_fielded_source(self):
         from negpy.features.geometry.skew import FrameSkew
@@ -830,6 +832,25 @@ class TestAppController(unittest.TestCase):
 
         self.assertEqual(tasks[-1].generation, self.controller._prefetch_gen)
 
+    def test_a_frame_without_the_source_fact_asks_the_decode_to_measure_it(self):
+        tasks = []
+        self.controller.preview_load_requested.connect(tasks.append)
+
+        self.controller.load_file("dummy.dng")
+
+        self.assertTrue(tasks[-1].detect_source)
+
+    def test_a_frame_with_the_source_fact_does_not_measure_it_again(self):
+        tasks = []
+        self.controller.preview_load_requested.connect(tasks.append)
+        state = self.controller.state
+        state.config = replace(state.config, process=replace(state.config.process, source_color=False))
+
+        self.controller.load_file("dummy.dng")
+
+        self.assertEqual(self.controller.state.config.process.source_color, False)
+        self.assertFalse(tasks[-1].detect_source)
+
     def test_lens_toggles_keep_the_displayed_texture_during_reload(self):
         from negpy.infrastructure.gpu.resources import GPUTexture
         from negpy.features.lens.models import LensCorrections
@@ -1036,6 +1057,28 @@ class TestAppController(unittest.TestCase):
 
         self.assertIsNotNone(task)
         self.assertEqual(task.protected_file_hashes, ("selected",))
+
+    def test_neighbor_prefetch_carries_the_config_for_its_base_read(self):
+        from negpy.domain.models import WorkspaceConfig
+
+        cfg = WorkspaceConfig()
+        self.controller.session.repo.load_file_settings.return_value = None
+        self.controller.session.config_for_asset = MagicMock(return_value=cfg)
+        self.controller.roll_film_base = MagicMock(return_value=None)
+        self.controller._half_slice_for_asset = MagicMock(return_value=None)
+        asset = {"path": "/tmp/neighbor.dng", "hash": "neighbor"}
+
+        task = self.controller._neighbor_prefetch_task(asset, generation=4, protected_file_hashes=())
+        self.assertIs(task.base_settings, cfg)
+
+        self.controller.roll_film_base.return_value = (-0.3, -0.3, -0.3)
+        task = self.controller._neighbor_prefetch_task(asset, generation=4, protected_file_hashes=())
+        self.assertIsNone(task.base_settings)
+
+        self.controller.roll_film_base.return_value = None
+        self.controller._half_slice_for_asset.return_value = (1, 0.5, None, 0.0, "x")
+        task = self.controller._neighbor_prefetch_task(asset, generation=4, protected_file_hashes=())
+        self.assertIsNone(task.base_settings)
 
     def test_second_neighbor_prefetch_protects_the_first_neighbor(self):
         state = self.controller.state
@@ -1279,9 +1322,7 @@ class TestAppController(unittest.TestCase):
         cfg, _kwargs = self.mock_session_manager.update_config.call_args
         self.assertEqual(cfg[0].geometry.distortion_k1, 0.02)
 
-    def test_setting_the_crop_ratio_locks_the_auto_crop_card(self):
-        """Ratio keeps its own entry point, for the manual-crop reshape, so it has to
-        lock the card by hand rather than through set_roll_default."""
+    def test_setting_the_crop_ratio_is_the_frames_own_edit(self):
         from negpy.services.assets import rolls
 
         self._wire_repo_store()
@@ -1294,7 +1335,7 @@ class TestAppController(unittest.TestCase):
         self.controller.set_crop_ratio("5:4")
 
         self.assertEqual(self.mock_session_manager.update_config.call_args[0][0].geometry.autocrop_ratio, "5:4")
-        self.assertEqual(rolls.frame_override_cards(self.controller.session.repo, roll_id, "h1"), {"autocrop"})
+        self.assertEqual(rolls.frame_override_cards(self.controller.session.repo, roll_id, "h1"), set())
 
     def _roll_with_one_frame(self):
         from negpy.services.assets import rolls
@@ -1308,7 +1349,7 @@ class TestAppController(unittest.TestCase):
         self.controller.request_render = MagicMock()
         return rolls, roll_id
 
-    def test_auto_crop_on_or_off_persists_and_locks_the_auto_crop_card(self):
+    def test_auto_crop_on_or_off_persists_on_the_frame_alone(self):
         rolls, roll_id = self._roll_with_one_frame()
 
         self.controller.apply_auto_crop()
@@ -1316,101 +1357,7 @@ class TestAppController(unittest.TestCase):
         args, kwargs = self.mock_session_manager.update_config.call_args
         self.assertTrue(kwargs["persist"])
         self.assertTrue(args[0].geometry.crop_from_auto)
-        self.assertEqual(rolls.frame_override_cards(self.controller.session.repo, roll_id, "h1"), {"auto_crop"})
-
-    def test_a_committed_hand_drawn_crop_releases_an_auto_crop_lock(self):
-        """The roll's Auto Crop never reaches a hand-drawn crop, so there is nothing to lock."""
-        rolls, roll_id = self._roll_with_one_frame()
-        repo = self.controller.session.repo
-        rolls.set_roll_defaults(repo, roll_id, crop_from_auto=True)
-        rolls.set_frame_override(repo, roll_id, "h1", "auto_crop", True)
-        state = self.mock_session_manager.state
-        state.active_tool = ToolMode.CROP_MANUAL
-        state.config = replace(state.config, geometry=replace(state.config.geometry, crop_rect=(0.1, 0.1, 0.9, 0.9), crop_from_auto=False))
-
-        self.controller.handle_crop_rect_changed(0.1, 0.1, 0.9, 0.9, persist=False)
-        self.assertIn("auto_crop", rolls.frame_override_cards(repo, roll_id, "h1"))
-
-        self.controller.handle_crop_rect_changed(0.1, 0.1, 0.9, 0.9, persist=True)
-        self.assertNotIn("auto_crop", rolls.frame_override_cards(repo, roll_id, "h1"))
-
-    def test_a_crop_push_from_a_hand_drawn_frame_keeps_the_rolls_auto_crop(self):
-        rolls, roll_id = self._roll_with_one_frame()
-        repo = self.controller.session.repo
-        rolls.set_roll_defaults(repo, roll_id, crop_from_auto=True)
-        self.controller.request_batch_auto_crop = MagicMock()
-        state = self.mock_session_manager.state
-        geometry = replace(state.config.geometry, crop_rect=(0.1, 0.1, 0.9, 0.9), crop_from_auto=False, autocrop_ratio="4:3")
-        state.config = replace(state.config, geometry=geometry)
-
-        self.controller._push_cards_to_roll(["autocrop", "auto_crop"])
-
-        defaults = rolls.roll_defaults(repo, roll_id)
-        self.assertTrue(defaults["crop_from_auto"])
-        self.assertEqual(defaults["autocrop_ratio"], "4:3")
-
-    def test_a_hand_drawn_crop_never_locks_auto_crop_and_an_old_lock_reads_unlocked(self):
-        rolls, roll_id = self._roll_with_one_frame()
-        repo = self.controller.session.repo
-        state = self.mock_session_manager.state
-        state.config = replace(state.config, geometry=replace(state.config.geometry, crop_rect=(0.1, 0.1, 0.9, 0.9), crop_from_auto=False))
-
-        self.controller.set_card_scope(("autocrop", "auto_crop"), "frame")
-        self.assertEqual(rolls.frame_override_cards(repo, roll_id, "h1"), {"autocrop"})
-
-        rolls.set_frame_override(repo, roll_id, "h1", "autocrop", False)
-        rolls.set_frame_override(repo, roll_id, "h1", "auto_crop", True)
-        self.assertEqual(self.controller.locked_roll_cards(), set())
-        self.controller.set_card_scope(("autocrop", "auto_crop"), "roll")
-        self.assertNotIn("crop_from_auto", rolls.roll_defaults(repo, roll_id))
-
-    def test_a_crop_push_only_shares_values(self):
-        rolls, roll_id = self._roll_with_one_frame()
-        self.controller.request_batch_auto_crop = MagicMock()
-        state = self.mock_session_manager.state
-        state.config = replace(state.config, geometry=replace(state.config.geometry, crop_from_auto=True))
-
-        self.controller._push_cards_to_roll(["auto_crop"])
-
-        self.assertTrue(rolls.roll_defaults(self.controller.session.repo, roll_id)["crop_from_auto"])
-        self.controller.request_batch_auto_crop.assert_not_called()
-
-    def test_with_both_crop_cards_locked_roll_pushes_both(self):
-        rolls, roll_id = self._roll_with_one_frame()
-        repo = self.controller.session.repo
-        rolls.set_roll_defaults(repo, roll_id, crop_from_auto=True, autocrop_ratio="3:2")
-        state = self.mock_session_manager.state
-        state.config = replace(state.config, geometry=replace(state.config.geometry, crop_from_auto=False, autocrop_ratio="4:3"))
-        self.controller.set_status = MagicMock()
-
-        self.controller._push_cards_to_roll(["autocrop", "auto_crop"])
-
-        defaults = rolls.roll_defaults(repo, roll_id)
-        self.assertEqual((defaults["autocrop_ratio"], defaults["crop_from_auto"]), ("4:3", False))
-        self.assertEqual(self.controller.set_status.call_args.args[0], "Applied to the roll: Crop shape, Auto Crop")
-
-    def test_reset_to_roll_auto_crop_arms_an_uncropped_frame_and_keeps_a_hand_drawn_one(self):
-        state = self.mock_session_manager.state
-        drawn = replace(state.config, geometry=replace(state.config.geometry, crop_rect=(0.1, 0.1, 0.9, 0.9), crop_from_auto=False))
-
-        armed = self.controller._with_roll_card(state.config, "auto_crop", {"crop_from_auto": True})
-        kept = self.controller._with_roll_card(drawn, "auto_crop", {"crop_from_auto": True})
-
-        self.assertTrue(armed.geometry.crop_from_auto)
-        self.assertIsNone(armed.geometry.crop_rect)
-        self.assertEqual(kept.geometry, drawn.geometry)
-
-    def test_an_old_auto_crop_lock_offers_no_reset_to_roll_on_a_hand_drawn_frame(self):
-        rolls, roll_id = self._roll_with_one_frame()
-        repo = self.controller.session.repo
-        rolls.set_roll_defaults(repo, roll_id, crop_from_auto=True)
-        rolls.set_frame_override(repo, roll_id, "h1", "auto_crop", True)
-        state = self.mock_session_manager.state
-        state.config = replace(state.config, geometry=replace(state.config.geometry, crop_rect=(0.1, 0.1, 0.9, 0.9), crop_from_auto=False))
-
-        self.assertEqual(self.controller.roll_revert_cards(["auto_crop"]), set())
-        self.assertEqual(self.controller.revert_frame_to_roll(), 0)
-        self.assertEqual(state.config.geometry.crop_rect, (0.1, 0.1, 0.9, 0.9))
+        self.assertEqual(rolls.frame_override_cards(self.controller.session.repo, roll_id, "h1"), set())
 
     def test_a_settled_auto_crop_edit_drops_the_frames_cached_bounds(self):
         """The crop feeds the meter, so a settled change to what auto crop looks for
@@ -1425,10 +1372,10 @@ class TestAppController(unittest.TestCase):
         state.current_file_hash = "h1"
         state.config = replace(state.config, process=replace(state.config.process, local_floors=(0.1, 0.1, 0.1)))
 
-        self.controller.set_roll_default("autocrop", persist=False, autocrop_offset=7)
+        self.controller.set_crop_settings(persist=False, autocrop_offset=7)
         self.assertEqual(self.mock_session_manager.update_config.call_args[0][0].process.local_floors, (0.1, 0.1, 0.1))
 
-        self.controller.set_roll_default("autocrop", autocrop_offset=9)
+        self.controller.set_crop_settings(autocrop_offset=9)
         self.assertEqual(self.mock_session_manager.update_config.call_args[0][0].process.local_floors, (0.0, 0.0, 0.0))
 
     def test_set_roll_default_mid_drag_never_locks(self):
@@ -1563,7 +1510,7 @@ class TestAppController(unittest.TestCase):
 
         self._wire_repo_store()
         roll_id = rolls.create_virtual_roll(self.controller.session.repo, "Portra", [])
-        for card in ("sensor", "autocrop"):
+        for card in ("sensor", "lens"):
             rolls.set_frame_override(self.controller.session.repo, roll_id, "h1", card, locked=True)
         state = self.mock_session_manager.state
         state.active_roll_id = roll_id
@@ -1575,7 +1522,7 @@ class TestAppController(unittest.TestCase):
 
         self.assertEqual(touched, 1)
         self.assertEqual(rolls.roll_defaults(self.controller.session.repo, roll_id)["hue_trim"], 2.5)
-        self.assertEqual(rolls.frame_override_cards(self.controller.session.repo, roll_id, "h1"), {"autocrop"})
+        self.assertEqual(rolls.frame_override_cards(self.controller.session.repo, roll_id, "h1"), {"lens"})
 
     def test_undo_apply_to_roll_restores_the_roll_and_the_lock(self):
         from negpy.services.assets import rolls
@@ -1610,14 +1557,14 @@ class TestAppController(unittest.TestCase):
         self._wire_repo_store()
         repo = self.controller.session.repo
         roll_id = rolls.create_virtual_roll(repo, "Portra", [])
-        rolls.set_frame_override(repo, roll_id, "h1", "autocrop", locked=True)
+        rolls.set_frame_override(repo, roll_id, "h1", "lens", locked=True)
         state = self.mock_session_manager.state
         state.active_roll_id = roll_id
         state.uploaded_files = [{"name": "a.dng", "path": "/a.dng", "hash": "h1"}]
         state.current_file_hash = "h1"
 
-        self.controller.apply_roll_card("autocrop")
-        self.assertTrue(self.controller.can_undo_roll_push(("autocrop",)))
+        self.controller.apply_roll_card("lens")
+        self.assertTrue(self.controller.can_undo_roll_push(("lens",)))
         self.assertFalse(self.controller.can_undo_roll_push(("sensor",)), "another card's push is not this card's undo")
         self.controller.undo_roll_push()
 
@@ -1643,45 +1590,6 @@ class TestAppController(unittest.TestCase):
         self.controller.undo_roll_push()
         self.assertEqual(rolls.roll_defaults(repo, roll_id), pushed)
 
-    def test_cast_removal_is_its_own_roll_card(self):
-        from negpy.services.assets import rolls
-
-        self._wire_repo_store()
-        roll_id = rolls.create_virtual_roll(self.controller.session.repo, "Portra", [])
-        state = self.mock_session_manager.state
-        state.active_roll_id = roll_id
-        state.uploaded_files = [{"name": "a.dng", "path": "/a.dng", "hash": "h1"}]
-        state.current_file_hash = "h1"
-
-        self.controller.set_roll_default("cast_removal", cast_removal_strength=0.3)
-
-        self.assertEqual(rolls.frame_override_cards(self.controller.session.repo, roll_id, "h1"), {"cast_removal"})
-        cfg, _kwargs = self.mock_session_manager.update_config.call_args
-        self.assertEqual(cfg[0].exposure.cast_removal_strength, 0.3)
-
-    def test_pushing_film_mode_carries_the_rolls_cast_removal(self):
-        """The roll's strength overlays after its mode, so a negative's default left in
-        place would reach every frame of a roll pushed to Slide."""
-        from negpy.features.process.models import ProcessMode
-        from negpy.services.assets import rolls
-
-        self._wire_repo_store()
-        repo = self.controller.session.repo
-        roll_id = rolls.create_virtual_roll(repo, "Ektachrome", [])
-        rolls.set_roll_defaults(repo, roll_id, process_mode=ProcessMode.C41, cast_removal_strength=1.0)
-        rolls.set_frame_override(repo, roll_id, "h1", "film", locked=True)
-        state = self.mock_session_manager.state
-        state.active_roll_id = roll_id
-        state.uploaded_files = [{"name": "a.dng", "path": "/a.dng", "hash": "h1"}]
-        state.current_file_hash = "h1"
-        state.config = replace(state.config, process=replace(state.config.process, process_mode=ProcessMode.E6))
-
-        self.controller.apply_roll_card("film")
-
-        defaults = rolls.roll_defaults(repo, roll_id)
-        self.assertEqual(defaults["process_mode"], ProcessMode.E6)
-        self.assertEqual(defaults["cast_removal_strength"], 0.0)
-
     def test_apply_roll_card_refreshes_the_thumbnails_of_frames_that_follow_the_roll(self):
         """A frame locked on the pushed card keeps its own value, so it is neither
         flagged stale nor re-rendered."""
@@ -1692,7 +1600,7 @@ class TestAppController(unittest.TestCase):
         roll_id = rolls.create_virtual_roll(repo, "Portra", [])
         rolls.set_frame_override(repo, roll_id, "h1", "sensor", locked=True)
         rolls.set_frame_override(repo, roll_id, "h3", "sensor", locked=True)
-        rolls.set_frame_override(repo, roll_id, "h4", "autocrop", locked=True)
+        rolls.set_frame_override(repo, roll_id, "h4", "lens", locked=True)
         state = self.mock_session_manager.state
         state.active_roll_id = roll_id
         state.uploaded_files = [{"name": f"{h}.dng", "path": f"/{h}.dng", "hash": h} for h in ("h1", "h2", "h3", "h4")]
@@ -2449,6 +2357,21 @@ class TestAppController(unittest.TestCase):
         mock_slot.assert_called_once_with()
         self.controller.request_render.assert_called_once_with()
 
+    def test_the_measured_source_fact_is_stored_and_keeps_the_saved_mode(self):
+        from negpy.features.process.models import ProcessMode
+
+        self.controller.request_render = MagicMock()
+        self.controller._requested_file_path = "dummy.dng"
+        state = self.controller.state
+        state.config = replace(state.config, process=replace(state.config.process, process_mode=ProcessMode.BW))
+        state.is_dirty = False
+
+        self.controller._on_preview_loaded("dummy.dng", object(), (10, 20), "", None, "", None, None, None, True)
+
+        self.assertIs(state.config.process.source_color, True)
+        self.assertEqual(state.config.process.process_mode, ProcessMode.BW)
+        self.assertTrue(state.is_dirty)
+
     def test_the_decode_orientation_reaches_the_render_for_the_flat_field(self):
         import numpy as np
 
@@ -2913,6 +2836,76 @@ class TestAppController(unittest.TestCase):
         saved_config = self.mock_session_manager.update_config.call_args.args[0]
         self.assertEqual(saved_config.geometry.crop_rect, (0.3, 0.25, 0.7, 0.55))
         self.controller.request_render.assert_called_once_with()
+
+    def _apply_session_updates(self):
+        def update(config, persist=False, render=True, record_history=True):
+            self.controller.state.config = config
+
+        self.mock_session_manager.update_config.side_effect = update
+        self.controller.request_render = MagicMock()
+        self.controller.state.current_file_hash = "h1"
+
+    def test_esc_puts_back_the_crop_the_tool_opened_with(self):
+        self._apply_session_updates()
+        geometry = replace(self.controller.state.config.geometry, crop_rect=(0.1, 0.1, 0.9, 0.9), crop_from_auto=True, fine_rotation=0.5)
+        self.controller.state.config = replace(self.controller.state.config, geometry=geometry)
+        self.controller.set_active_tool(ToolMode.CROP_MANUAL)
+        self.controller.handle_crop_rect_changed(0.2, 0.2, 0.6, 0.6, True)
+        self.controller.handle_crop_rotation_changed(1.5, True)
+        density = self.controller.state.config.exposure.density + 0.3
+        self.controller.state.config = replace(
+            self.controller.state.config, exposure=replace(self.controller.state.config.exposure, density=density)
+        )
+        self.mock_session_manager.update_config.reset_mock()
+
+        self.controller.revert_active_tool()
+
+        geo = self.controller.state.config.geometry
+        self.assertEqual((geo.crop_rect, geo.crop_from_auto, geo.fine_rotation), ((0.1, 0.1, 0.9, 0.9), True, 0.5))
+        self.assertEqual(self.controller.state.config.exposure.density, density)  # an edit outside the tool stays
+        self.assertEqual(self.controller.state.active_tool, ToolMode.NONE)
+        reverts = [c for c in self.mock_session_manager.update_config.call_args_list if c.kwargs.get("persist")]
+        self.assertEqual(len(reverts), 1)  # one undo step
+
+    def test_done_keeps_the_crop(self):
+        self._apply_session_updates()
+        self.controller.set_active_tool(ToolMode.CROP_MANUAL)
+        self.controller.handle_crop_rect_changed(0.2, 0.2, 0.6, 0.6, True)
+
+        self.controller.cancel_active_tool()
+
+        self.assertEqual(self.controller.state.config.geometry.crop_rect, (0.2, 0.2, 0.6, 0.6))
+
+    def test_esc_with_no_change_writes_nothing(self):
+        self._apply_session_updates()
+        self.controller.set_active_tool(ToolMode.CROP_MANUAL)
+        self.mock_session_manager.update_config.reset_mock()
+
+        self.controller.revert_active_tool()
+
+        self.mock_session_manager.update_config.assert_not_called()
+        self.assertEqual(self.controller.state.active_tool, ToolMode.NONE)
+
+    def test_esc_puts_back_the_analysis_region(self):
+        self._apply_session_updates()
+        self.controller.set_active_tool(ToolMode.ANALYSIS_DRAW)
+        self.controller.handle_analysis_rect_changed(0.2, 0.2, 0.6, 0.6, True)
+
+        self.controller.revert_active_tool()
+
+        self.assertIsNone(self.controller.state.config.process.analysis_rect)
+        self.assertEqual(self.controller.state.active_tool, ToolMode.NONE)
+
+    def test_esc_on_another_frame_puts_nothing_back(self):
+        self._apply_session_updates()
+        self.controller.set_active_tool(ToolMode.CROP_MANUAL)
+        self.controller.handle_crop_rect_changed(0.2, 0.2, 0.6, 0.6, True)
+        self.controller.state.current_file_hash = "h2"
+
+        self.controller.revert_active_tool()
+
+        self.assertEqual(self.controller.state.config.geometry.crop_rect, (0.2, 0.2, 0.6, 0.6))
+        self.assertEqual(self.controller.state.active_tool, ToolMode.NONE)
 
     def test_handle_crop_rect_changed_noop_when_tool_inactive(self):
         geometry = replace(self.controller.state.config.geometry, crop_rect=None)
@@ -4000,6 +3993,128 @@ class TestPresetExportSelected(unittest.TestCase):
 
         self.assertEqual(fired, [True])
 
+    def test_detect_scenes_measures_frames_outside_scenes_without_asking(self):
+        emitted = []
+        self.controller.normalization_requested.connect(emitted.append)
+        with (
+            patch.object(rolls, "scene_by_hash", return_value={"h2": (1, "s1", "Beach")}),
+            patch.object(self.controller, "_confirm_normalization") as mock_confirm,
+            patch.object(self.controller, "_waits_for_auto_crop", return_value=False),
+        ):
+            self.mock_session_manager.state.active_roll_id = "roll-1"
+            self.controller.request_detect_scenes()
+
+        mock_confirm.assert_not_called()
+        self.assertTrue(emitted[0].detect)
+        self.assertEqual([f.file_info["hash"] for f in emitted[0].frames], ["h1", "h3"])
+
+    def test_detect_scenes_reads_the_frames_in_scan_order_whatever_the_sort(self):
+        """Scan order counts in detection, so a Scene or Date sort must not reorder the frames."""
+        emitted = []
+        self.controller.normalization_requested.connect(emitted.append)
+        self.visible_indices = [2, 1, 0]
+        with (
+            patch.object(rolls, "scene_by_hash", return_value={}),
+            patch.object(self.controller, "_waits_for_auto_crop", return_value=False),
+        ):
+            self.mock_session_manager.state.active_roll_id = "roll-1"
+            self.controller.request_detect_scenes()
+
+        self.assertEqual([f.file_info["name"] for f in emitted[0].frames], ["IMG_0001.cr2", "IMG_0002.cr2", "scan.tif"])
+
+    def test_detected_groups_become_found_scenes_with_free_names(self):
+        self.mock_session_manager.state.active_roll_id = "roll-1"
+        fired = []
+        self.controller.scenes_detected.connect(lambda: fired.append(True))
+        with (
+            patch.object(rolls, "roll_scenes", return_value=[("s1", {"name": "Scene 1"})]),
+            patch.object(rolls, "create_scene") as mock_create,
+        ):
+            self.controller._on_scenes_detected([["h1", "h3"], ["h2"]])
+
+        self.assertEqual(
+            self.mock_session_manager.state.found_scenes,
+            [{"roll": "roll-1", "name": "Scene 2", "hashes": ["h1", "h3"]}, {"roll": "roll-1", "name": "Scene 3", "hashes": ["h2"]}],
+        )
+        mock_create.assert_not_called()
+        self.mock_session_manager.refresh_scene_marks.assert_called_once()
+        self.assertEqual(fired, [True])
+
+    def test_accepting_a_found_scene_groups_it_and_analyzes_it_at_once(self):
+        state = self.mock_session_manager.state
+        state.active_roll_id = "roll-1"
+        state.found_scenes = [
+            {"roll": "roll-1", "name": "Scene 2", "hashes": ["h1", "h3"]},
+            {"roll": "roll-1", "name": "Scene 3", "hashes": ["h2"]},
+        ]
+        emitted = []
+        self.controller.normalization_requested.connect(emitted.append)
+        with (
+            patch.object(rolls, "create_scene", return_value="s2") as mock_create,
+            patch.object(rolls, "scene_by_hash", return_value={"h1": (2, "s2", "Pool"), "h3": (2, "s2", "Pool")}),
+            patch.object(self.controller, "_confirm_normalization") as mock_confirm,
+        ):
+            self.controller.accept_found_scenes({0: "Pool"})
+
+        mock_create.assert_called_once_with(self.mock_session_manager.repo, "roll-1", "Pool", ["h1", "h3"])
+        self.assertEqual([s["name"] for s in state.found_scenes], ["Scene 3"])
+        mock_confirm.assert_not_called()
+        self.assertEqual(self.controller._normalization_scope, "s2")
+        self.assertEqual([f.file_info["hash"] for f in emitted[0].frames], ["h1", "h3"])
+
+    def test_adding_frames_to_a_found_scene_moves_them_out_of_their_old_one(self):
+        state = self.mock_session_manager.state
+        state.found_scenes = [
+            {"roll": "roll-1", "name": "Scene 2", "hashes": ["h1", "h2"]},
+            {"roll": "roll-1", "name": "Scene 3", "hashes": ["h3"]},
+        ]
+        state.selected_indices = [1, 2]
+
+        self.controller.add_to_found_scene(1)
+
+        self.assertEqual([sorted(s["hashes"]) for s in state.found_scenes], [["h1"], ["h2", "h3"]])
+        self.mock_session_manager.refresh_scene_marks.assert_called_once()
+
+    def test_a_found_scene_left_empty_drops_out(self):
+        state = self.mock_session_manager.state
+        state.found_scenes = [
+            {"roll": "roll-1", "name": "Scene 2", "hashes": ["h1"]},
+            {"roll": "roll-1", "name": "Scene 3", "hashes": ["h3"]},
+        ]
+        state.selected_indices = [0]
+
+        self.controller.add_to_found_scene(1)
+
+        self.assertEqual([(s["name"], sorted(s["hashes"])) for s in state.found_scenes], [("Scene 3", ["h1", "h3"])])
+
+    def test_removing_frames_from_found_scenes_leaves_them_with_the_roll(self):
+        state = self.mock_session_manager.state
+        state.found_scenes = [
+            {"roll": "roll-1", "name": "Scene 2", "hashes": ["h1", "h2"]},
+            {"roll": "roll-1", "name": "Scene 3", "hashes": ["h3"]},
+        ]
+        state.selected_indices = [1, 2]
+
+        with patch.object(rolls, "remove_from_scenes") as mock_remove:
+            self.controller.remove_from_found_scene()
+
+        self.assertEqual(state.found_scenes, [{"roll": "roll-1", "name": "Scene 2", "hashes": ["h1"]}])
+        mock_remove.assert_not_called()
+
+    def test_discarding_found_scenes_forgets_them(self):
+        state = self.mock_session_manager.state
+        state.found_scenes = [
+            {"roll": "roll-1", "name": "Scene 2", "hashes": ["h1"]},
+            {"roll": "roll-1", "name": "Scene 3", "hashes": ["h2"]},
+        ]
+
+        with patch.object(rolls, "create_scene") as mock_create:
+            self.controller.discard_found_scenes([1])
+
+        self.assertEqual([s["name"] for s in state.found_scenes], ["Scene 2"])
+        mock_create.assert_not_called()
+        self.mock_session_manager.refresh_scene_marks.assert_called_once()
+
     def test_apply_normalization_roll_is_a_noop_for_an_unanalyzed_roll(self):
         with patch.object(rolls, "roll_normalization", return_value=None):
             self.controller.apply_normalization_roll("roll-1")
@@ -4638,6 +4753,7 @@ class TestDiscoveryProgressPopup(unittest.TestCase):
         req.white_mode = False
         req.rgb_mode = True
         req.as_roll = False
+        req.channels = ("R", "G", "B")
         self.controller._last_capture_req = req
 
         first_paths = ["/roll/frame1_R.dng", "/roll/frame1_G.dng", "/roll/frame1_B.dng"]
@@ -4743,7 +4859,9 @@ class TestBatchAnalysisFiltering(unittest.TestCase):
         self.mock_session_manager.state = AppState()
         self.mock_session_manager.repo = MagicMock()
         self.mock_session_manager.repo.load_file_settings.return_value = None
-        self.mock_session_manager.config_for_asset.side_effect = lambda f: self.mock_session_manager.repo.load_file_settings(f["hash"])
+        self.mock_session_manager.config_for_asset.side_effect = lambda f: (
+            self.mock_session_manager.repo.load_file_settings(f["hash"]) or WorkspaceConfig()
+        )
 
         self.mock_session_manager.state.uploaded_files = [
             {"name": "IMG_0001.cr2", "path": "/tmp/IMG_0001.cr2", "hash": "h1"},
@@ -5647,6 +5765,39 @@ class TestFlatFieldPeek(unittest.TestCase):
         self._select(None)
         self.controller.toggle_flatfield_peek(force=True)
         self.assertFalse(self.controller.state.flatfield_peek)
+
+    def test_a_missing_profile_says_so_like_no_profile(self):
+        from dataclasses import replace
+
+        from negpy.features.flatfield.models import FlatFieldConfig
+        from negpy.services.assets.flatfield import FlatFieldProfiles
+
+        state = self.controller.state
+        state.config = replace(state.config, flatfield=FlatFieldConfig(apply=True, profile_id="deleted"))
+        self.controller.set_status = MagicMock()
+        with patch.object(FlatFieldProfiles, "get", return_value=None):
+            self.controller.toggle_flatfield_peek(force=True)
+        self.assertFalse(state.flatfield_peek)
+        self.assertIn("Choose a Flat Field profile", self.controller.set_status.call_args.args[0])
+
+    def test_deleting_the_frames_own_profile_gives_it_the_last_chosen_one(self):
+        from dataclasses import replace
+
+        from negpy.features.flatfield.models import FlatFieldConfig
+        from negpy.services.assets.flatfield import FlatFieldProfile, FlatFieldProfiles
+
+        state = self.controller.state
+        state.config = replace(state.config, flatfield=FlatFieldConfig(apply=True, profile_id="ff-120"))
+        self.mock_session_manager.repo.get_global_setting.side_effect = lambda key, default=None: (
+            "ff-35" if key == "flatfield_active_profile" else default
+        )
+        self.controller.set_roll_default = MagicMock()
+        with (
+            patch.object(FlatFieldProfiles, "delete"),
+            patch.object(FlatFieldProfiles, "get", return_value=FlatFieldProfile("ff-35", "35mm", 0.0, "")),
+        ):
+            self.controller.delete_flatfield_profile("ff-120")
+        self.controller.set_roll_default.assert_called_once_with("flatfield", profile_id="ff-35")
 
     def test_the_peeks_are_mutually_exclusive(self):
         self._select(self._stored())

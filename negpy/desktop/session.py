@@ -48,6 +48,7 @@ from negpy.services.assets.flatfield import FlatFieldProfiles
 from negpy.services.assets import rolls
 from negpy.services.assets import semantic_model
 from negpy.services.assets.rolls import unforked_hash
+from negpy.services.assets.migrations.roll_fields import with_frame_seed
 from negpy.services.assets.search import facts_for, match, parse_query
 from negpy.services.assets.sidecar import load_or_promote, read_sidecar
 from negpy.services.assets.thumbnails import asset_thumbnail_key
@@ -76,6 +77,8 @@ class ToolMode(Enum):
 # These tools' renders carry crop_preview_full, which skips the crop, the border and the filed carrier.
 # Film Base shows the whole scan too: the rebate it reads lies outside the crop.
 UNCROPPED_PREVIEW_TOOLS = frozenset({ToolMode.CROP_MANUAL, ToolMode.ANALYSIS_DRAW, ToolMode.KEYSTONE_LINES, ToolMode.FILM_BASE})
+# Esc puts back what these changed since they opened: each adjusts one thing as often as it likes.
+REVERTIBLE_TOOLS = frozenset({ToolMode.CROP_MANUAL, ToolMode.ANALYSIS_DRAW})
 
 # Zone Overlay looks, by stored key and menu label.
 ZONE_STYLES = {"false_color": tr("Color"), "zone_map": tr("Grayscale"), "grid": tr("Grid")}
@@ -120,6 +123,8 @@ class AppState:
     source_exif: Dict[str, Any] = field(default_factory=dict)  # file_hash -> piexif dict
     selected_file_idx: int = -1
     selected_indices: List[int] = field(default_factory=list)
+    # Detect Scenes' groups waiting for Accept or Discard: {"roll", "name", "hashes"} each, never saved.
+    found_scenes: List[Dict[str, Any]] = field(default_factory=list)
     # The roll (negpy.services.assets.rolls) the loaded frames came from, if any -- a
     # plain Add Files pick or a clear leaves this None. Files appended while it is set
     # join that roll's membership so reopening it later still shows them.
@@ -205,21 +210,18 @@ class AppState:
     # High Quality / Full Resoluiton Preview Toggle
     hq_preview: bool = False
 
-    # Process-mode autodetect on file load (opt-in)
-    autodetect_enabled: bool = False
-
-    # Canvas background color swatch index (0=Black, 1=Dark Gray, 2=Mid Gray)
-    canvas_bg_index: int = 0
+    # Canvas background color swatch index (0=Black, 1=Dark Gray, 2=Mid Gray, 3=White, 4=Light Gray)
+    canvas_bg_index: int = 2
+    # Render the thumbnails of frames a bulk edit wrote without opening them; off marks them stale
+    auto_thumbnail_refresh: bool = False
     # Preferences > Accessibility, a key into styles.color_vision.PALETTES
     color_vision: str = "standard"
-
-    # When False, fit-to-window reserves space for the floating toolbar so the image never
-    # sits behind it. When True (default), the image fills the canvas and the toolbar overlaps.
-    immersive_canvas: bool = True
 
     # When True, switching to a different image keeps the current zoom level
     # instead of resetting to fit-to-window.
     sticky_zoom: bool = False
+    # After a mouse edit, a toast shows the control's keyboard shortcut (view/shortcut_hints.py).
+    shortcut_hints: bool = True
 
     # Master switch for the Persistent Settings overlay on a freshly opened file with no
     # saved edit. Off, a new file gets bare WorkspaceConfig() defaults for every catalog
@@ -317,9 +319,6 @@ class AppState:
     # Dirty flag: True when explicit persist=True edits have been made since last file open/switch
     is_dirty: bool = False
 
-    # True when the active file has no saved config yet (gates process-mode autodetect)
-    current_file_is_new: bool = False
-
     # True while the before/after split shows the un-graded auto baseline beside the edit
     compare_mode: bool = False
     # The stashed baseline frame painted left of the divider: display buffer, its content
@@ -331,6 +330,10 @@ class AppState:
     compare_split: float = 0.5
     # True while the compare key is held: the whole picture shows the baseline.
     compare_hold: bool = False
+    # A history step or work print the split compares against instead of the default
+    # conversion, and its badge text. Held as a config: a later edit can delete the step.
+    compare_reference: Optional[Any] = None
+    compare_reference_label: str = ""
 
     # Export presets (globally managed, not per-file)
     export_presets: List[ExportPreset] = field(default_factory=list)
@@ -440,15 +443,15 @@ def composite_summary(asset: Dict[str, Any]) -> str:
     """One tooltip line naming what a frame is built from. Empty for a plain frame."""
     kind = composite_kind(asset)
     if kind == "stitch":
-        return f"Stitched composite of {count_of(len(asset['stitch_paths']) + 1, 'frame')}"
+        return tr("Stitched composite of {value}", value=count_of(len(asset["stitch_paths"]) + 1, "frame"))
     if kind == "hdr":
-        return f"HDR merge of {count_of(len(hdr_frame_paths(asset)), 'exposure')}"
+        return tr("HDR merge of {value}", value=count_of(len(hdr_frame_paths(asset)), "exposure"))
     if kind == "rgb":
         return tr("Trichrome triplet")
     if kind == "half":
-        return f"Half-frame split ({int(asset['half'])} of 2)"
+        return tr("Half-frame split ({value} of 2)", value=int(asset["half"]))
     if kind == "diptych":
-        return tr("Diptych — both halves, each with its own edit")
+        return tr("Diptych: both halves, each with its own edit")
     return ""
 
 
@@ -476,9 +479,11 @@ class AssetListModel(QAbstractListModel):
         # from `uploaded_files`, so `_apply_reindex` can look up an old row's file even after a
         # row was removed from (or inserted into) that list before it runs.
         self._sorted_keys: list[tuple] = []
+        self._thumbnail_rows: Optional[dict[str, list[int]]] = None
         self._rebuild_indices()
 
     def _rebuild_indices(self) -> None:
+        self._thumbnail_rows = None
         files = self._state.uploaded_files
         indices = list(range(len(files)))
 
@@ -577,12 +582,18 @@ class AssetListModel(QAbstractListModel):
         return self._filter_text
 
     def set_sort_order(self, order: str) -> None:
+        if order not in ("name", "date", "scene"):
+            order = "name"
         self._sort_order = order
         self._apply_reindex()
 
     @property
     def has_scenes(self) -> bool:
-        return any(f.get("scene") for f in self._state.uploaded_files)
+        return any(f.get("scene") or f.get("found_scene") for f in self._state.uploaded_files)
+
+    @property
+    def has_found_scenes(self) -> bool:
+        return any(f.get("found_scene") for f in self._state.uploaded_files)
 
     @property
     def effective_sort_order(self) -> str:
@@ -594,7 +605,7 @@ class AssetListModel(QAbstractListModel):
 
     def _scene_rank(self, file_info: dict) -> tuple:
         """Scene sort's outer key. Frames in no scene come last in either direction."""
-        scene = file_info.get("scene")
+        scene = file_info.get("scene") or file_info.get("found_scene")
         if not scene:
             return (1, 0)
         return (0, -scene[0] if self._sort_descending else scene[0])
@@ -607,7 +618,7 @@ class AssetListModel(QAbstractListModel):
         files = self._state.uploaded_files
         runs: list[tuple[Optional[int], int, int]] = []
         for row, i in enumerate(self._sorted_indices):
-            scene = files[i].get("scene")
+            scene = files[i].get("scene") or files[i].get("found_scene")
             ordinal = scene[0] if scene else None
             if runs and runs[-1][0] == ordinal:
                 runs[-1] = (ordinal, runs[-1][1], row)
@@ -692,9 +703,9 @@ class AssetListModel(QAbstractListModel):
             if summary:
                 lines.append(summary)
             if file_info.get("scene"):
-                lines.append(f"Scene: {file_info['scene'][2]}")
+                lines.append(tr("Scene: {name}", name=file_info["scene"][2]))
             if asset_thumbnail_key(file_info) in self._state.stale_thumbnails:
-                lines.append(tr("Thumbnail predates a settings change; open the frame to refresh it."))
+                lines.append(tr("Thumbnail predates a settings change; open the frame or use Update Thumbnails to refresh it."))
             return "\n".join(lines)
 
         if role == Qt.ItemDataRole.UserRole:
@@ -707,11 +718,25 @@ class AssetListModel(QAbstractListModel):
 
     def refresh_thumbnails(self, keys: Collection[str]) -> None:
         """Repaints the rows showing *keys*. A thumbnail never moves a row, so no reindex."""
+        for row in sorted(row for key in set(keys) for row in self.rows_showing(key)):
+            index = self.index(row, 0)
+            self.dataChanged.emit(index, index)
+
+    def rows_showing(self, key: str) -> list[int]:
+        """The display rows whose thumbnail is *key*. A reindex rebuilds the map, as one follows a frame's new
+        hash; a found row that no longer shows *key* rebuilds it too."""
         files = self._state.uploaded_files
-        for row, i in enumerate(self._sorted_indices):
-            if i < len(files) and asset_thumbnail_key(files[i]) in keys:
-                index = self.index(row, 0)
-                self.dataChanged.emit(index, index)
+        rows = self._thumbnail_rows.get(key) if self._thumbnail_rows is not None else None
+        if self._thumbnail_rows is None or (
+            rows
+            and any(self._sorted_indices[row] >= len(files) or asset_thumbnail_key(files[self._sorted_indices[row]]) != key for row in rows)
+        ):
+            self._thumbnail_rows = {}
+            for row, i in enumerate(self._sorted_indices):
+                if i < len(files):
+                    self._thumbnail_rows.setdefault(asset_thumbnail_key(files[i]), []).append(row)
+            rows = self._thumbnail_rows.get(key)
+        return rows or []
 
 
 def _source_effective_bounds(process) -> Optional[tuple]:
@@ -851,6 +876,8 @@ class DesktopSessionManager(QObject):
     settings_pasted = pyqtSignal()
     # A view that reads styles.color_vision repaints on this.
     color_vision_changed = pyqtSignal()
+    auto_thumbnail_refresh_changed = pyqtSignal(bool)
+    canvas_bg_changed = pyqtSignal()
     settings_synced = pyqtSignal(str)  # Bulk "Apply to selected" done — carries a status message
     frames_edited_offscreen = pyqtSignal(list)  # hashes whose saved edits changed without a render
     file_selected = pyqtSignal(str)  # Emits file path when active file changes
@@ -868,6 +895,7 @@ class DesktopSessionManager(QObject):
         super().__init__()
         self.repo = repo
         self.state = AppState()
+        self._preview_history: Optional[Tuple[str, WorkspaceConfig]] = None
         self._search_facts: Optional[Dict[str, Dict[str, Any]]] = None
         self.asset_model = AssetListModel(self.state, self.search_facts)
         # Both signals already fire from every mutation that can change a frame's
@@ -898,13 +926,10 @@ class DesktopSessionManager(QObject):
         if APP_CONFIG.force_hq_preview is not None:
             self.state.hq_preview = APP_CONFIG.force_hq_preview
 
-        saved_autodetect = self.repo.get_global_setting("autodetect_enabled")
-        if saved_autodetect is not None:
-            self.state.autodetect_enabled = bool(saved_autodetect)
-
         saved_bg = self.repo.get_global_setting("canvas_bg_index")
         if saved_bg is not None:
             self.state.canvas_bg_index = int(saved_bg)
+        self.state.auto_thumbnail_refresh = bool(self.repo.get_global_setting("auto_thumbnail_refresh", False))
         self.state.color_vision = str(self.repo.get_global_setting("color_vision", "standard") or "standard")
         self.state.zone_hover_highlight = bool(self.repo.get_global_setting("zone_hover_highlight", True))
         self.state.cursor_probe = bool(self.repo.get_global_setting("cursor_probe", False))
@@ -912,13 +937,12 @@ class DesktopSessionManager(QObject):
         self.state.zones_style = style if style in ZONE_STYLES else "false_color"
         self.state.canvas_info_level = int(self.repo.get_global_setting("canvas_info_level", 1) or 0) % 3
 
-        saved_immersive = self.repo.get_global_setting("immersive_canvas")
-        if saved_immersive is not None:
-            self.state.immersive_canvas = bool(saved_immersive)
-
         saved_sticky_zoom = self.repo.get_global_setting("sticky_zoom")
         if saved_sticky_zoom is not None:
             self.state.sticky_zoom = bool(saved_sticky_zoom)
+        saved_hints = self.repo.get_global_setting("shortcut_hints")
+        if saved_hints is not None:
+            self.state.shortcut_hints = bool(saved_hints)
 
         saved_sticky_enabled = self.repo.get_global_setting("sticky_settings_enabled")
         if saved_sticky_enabled is not None:
@@ -1064,26 +1088,17 @@ class DesktopSessionManager(QObject):
             self.repo.save_global_setting("hq_preview", enabled)
             self.state_changed.emit()
 
-    def set_autodetect_enabled(self, enabled: bool) -> None:
-        """Updates and persists the process-mode autodetect preference."""
-        if self.state.autodetect_enabled != enabled:
-            self.state.autodetect_enabled = enabled
-            self.repo.save_global_setting("autodetect_enabled", enabled)
-            self.state_changed.emit()
-
-    def set_immersive_canvas(self, enabled: bool) -> None:
-        """Updates and persists the immersive canvas preference."""
-        if self.state.immersive_canvas != enabled:
-            self.state.immersive_canvas = enabled
-            self.repo.save_global_setting("immersive_canvas", enabled)
-            self.state_changed.emit()
-
     def set_sticky_zoom(self, enabled: bool) -> None:
         """Updates and persists whether zoom carries over between images."""
         if self.state.sticky_zoom != enabled:
             self.state.sticky_zoom = enabled
             self.repo.save_global_setting("sticky_zoom", enabled)
             self.state_changed.emit()
+
+    def set_shortcut_hints(self, enabled: bool) -> None:
+        if self.state.shortcut_hints != enabled:
+            self.state.shortcut_hints = enabled
+            self.repo.save_global_setting("shortcut_hints", enabled)
 
     def set_sticky_settings_enabled(self, enabled: bool) -> None:
         """Updates and persists whether Persistent Settings applies to a fresh file."""
@@ -1110,6 +1125,13 @@ class DesktopSessionManager(QObject):
         if self.state.canvas_bg_index != index:
             self.state.canvas_bg_index = index
             self.repo.save_global_setting("canvas_bg_index", index)
+            self.canvas_bg_changed.emit()
+
+    def set_auto_thumbnail_refresh(self, on: bool) -> None:
+        if self.state.auto_thumbnail_refresh != on:
+            self.state.auto_thumbnail_refresh = on
+            self.repo.save_global_setting("auto_thumbnail_refresh", on)
+            self.auto_thumbnail_refresh_changed.emit(on)
 
     def set_color_vision(self, key: str) -> None:
         if self.state.color_vision != key:
@@ -1173,7 +1195,7 @@ class DesktopSessionManager(QObject):
           gets bare WorkspaceConfig() defaults for every catalog field.
 
         The carries below are hard-coded because they are not plain config-value copies:
-        the rig-global flat-field profile, the Kelvin roll-locks, the export fields with no
+        the last chosen flat-field profile, the Kelvin roll-locks, the export fields with no
         catalog row, and the scan-setup preferences. They apply regardless of
         `sticky_settings_enabled`, which only gates the catalog-row overlay above.
         """
@@ -1186,17 +1208,14 @@ class DesktopSessionManager(QObject):
             if remainder:
                 config = replace(config, export=replace(config.export, **remainder))
 
-        # The flat-field profile is rig-global, so the active one always overrides the
-        # per-file id. New files default to enabled when a profile is active, and saved
-        # files keep their toggle.
         active_ff = self.repo.get_global_setting("flatfield_active_profile")
-        ff_prof = FlatFieldProfiles.get(active_ff) if active_ff else None
-        ff_id = ff_prof.id if ff_prof else ""
-        config = replace(config, flatfield=replace(config.flatfield, profile_id=ff_id))
-        # Distortion left the profile for the per-image geometry; adopt a legacy rig value
-        # once, on frames that carry none of their own.
-        if config.geometry.distortion_k1 == 0.0 and ff_prof is not None and ff_prof.k1 != 0.0:
-            config = replace(config, geometry=replace(config.geometry, distortion_k1=ff_prof.k1))
+        ff_id = active_ff if active_ff and FlatFieldProfiles.get(active_ff) is not None else ""
+        config = self._with_known_flatfield_profile(config, ff_id)
+        # Distortion left the profile for the per-image geometry; adopt a legacy value once,
+        # from the frame's own profile, on frames that carry none of their own.
+        own_ff = FlatFieldProfiles.get(config.flatfield.profile_id) if config.flatfield.profile_id else None
+        if config.geometry.distortion_k1 == 0.0 and own_ff is not None and own_ff.k1 != 0.0:
+            config = replace(config, geometry=replace(config.geometry, distortion_k1=own_ff.k1))
 
         if only_global:
             rows = load_sticky_rows(self.repo)
@@ -1229,9 +1248,21 @@ class DesktopSessionManager(QObject):
         if only_global:
             return config
 
-        config = replace(config, flatfield=replace(config.flatfield, apply=bool(ff_id)))
+        # On with the last chosen profile, unless the user carries the Flat Field row itself.
+        if sticky_cfg is not None and any(r.section == "flatfield" for r in rows):
+            config = self._with_known_flatfield_profile(config, ff_id)
+        else:
+            config = replace(config, flatfield=replace(config.flatfield, profile_id=ff_id, apply=bool(ff_id)))
 
         return self._with_scan_setup(config)
+
+    @staticmethod
+    def _with_known_flatfield_profile(config: WorkspaceConfig, fallback_id: str) -> WorkspaceConfig:
+        """A frame keeps its own flat-field profile, because lights and film formats each need one.
+        A profile this machine does not have counts as none and takes *fallback_id*, the last chosen."""
+        if config.flatfield.profile_id and FlatFieldProfiles.get(config.flatfield.profile_id) is not None:
+            return config
+        return replace(config, flatfield=replace(config.flatfield, profile_id=fallback_id))
 
     def _empty_session_config(self) -> WorkspaceConfig:
         """The config with no frame loaded: what the next fresh frame gets. Any persisted
@@ -1322,7 +1353,7 @@ class DesktopSessionManager(QObject):
         config = resolve_asset_hdr_seed(config, asset)
         return resolve_asset_hdr(resolve_asset_stitch(resolve_asset_rgbscan(config, asset), asset), asset)
 
-    def _overlay_roll_defaults(self, config: WorkspaceConfig, asset: dict) -> WorkspaceConfig:
+    def _overlay_roll_defaults(self, config: WorkspaceConfig, asset: dict, fresh: bool = False) -> WorkspaceConfig:
         """Roll-wide film, rig and scanning facts win over this frame's own saved
         value, on every card it has not locked away from the roll within this
         roll. Applied before the asset-identity overlays below, so a composite's own
@@ -1331,10 +1362,13 @@ class DesktopSessionManager(QObject):
 
         Keyed on the unforked hash: a lock is about this physical frame's relationship
         to the roll, and must survive forking or unforking its edit identity.
+        A *fresh* frame, one with no saved edit, also takes the roll's frame seed.
         """
         roll_id = rolls.frame_roll(self.repo, self.state.active_roll_id, asset)
         if roll_id is None:
             return config
+        if fresh and (seed := rolls.frame_seed(self.repo, roll_id)):
+            config = with_frame_seed(config, seed)
         file_hash = unforked_hash(asset["hash"])
         config = rolls.resolve_roll_config(self.repo, roll_id, file_hash, config)
         return rolls.resolve_roll_baseline(self.repo, roll_id, file_hash, config)
@@ -1352,11 +1386,11 @@ class DesktopSessionManager(QObject):
         asset = self.state.uploaded_files[idx]
         config = self._apply_sticky_settings(saved, only_global=True)
         self.update_config(resolve_asset_hdr(resolve_asset_stitch(resolve_asset_rgbscan(config, asset), asset), asset), persist=True)
-        self._relock_diverged_cards()
+        self.relock_diverged_cards()
         return True
 
-    def _hydrate_asset_config(self, asset: dict) -> tuple[WorkspaceConfig, bool]:
-        """Build an asset's effective config and report whether it had saved edits."""
+    def _hydrate_asset_config(self, asset: dict) -> WorkspaceConfig:
+        """Build an asset's effective config."""
         saved_config = load_or_promote(
             self.repo,
             asset["hash"],
@@ -1369,14 +1403,14 @@ class DesktopSessionManager(QObject):
             # A saved edit keeps its own process mode and shadow lift, which are the user's
             # now, so only the wiring overlays apply.
             config = self._overlay_roll_defaults(self._apply_sticky_settings(saved_config, only_global=True), asset)
-            return resolve_asset_hdr(resolve_asset_stitch(resolve_asset_rgbscan(config, asset), asset), asset), False
+            return resolve_asset_hdr(resolve_asset_stitch(resolve_asset_rgbscan(config, asset), asset), asset)
         # Sticky settings include the global process mode, which a composite must not take over
         # the mode of the frames it was built from. _asset_defaults applies after.
         #
         # Not a bare WorkspaceConfig(): only this config holds the shipped autocrop fields, and the
         # print/transfer curves are an identity at it (transfer_grade_ref, test_transparency_transfer.py).
-        config = self._overlay_roll_defaults(self._apply_sticky_settings(DEFAULT_WORKSPACE_CONFIG, only_global=False), asset)
-        return self._asset_defaults(config, asset), True
+        config = self._overlay_roll_defaults(self._apply_sticky_settings(DEFAULT_WORKSPACE_CONFIG, only_global=False), asset, fresh=True)
+        return self._asset_defaults(config, asset)
 
     def config_for_asset(self, asset: dict) -> WorkspaceConfig:
         """Return an asset's hydrated config without changing the active session state.
@@ -1385,8 +1419,7 @@ class DesktopSessionManager(QObject):
         global overlays. Fresh assets start from clean defaults plus sticky workflow
         preferences. RGB-scan paths always come from the asset itself.
         """
-        config, _ = self._hydrate_asset_config(asset)
-        return config
+        return self._hydrate_asset_config(asset)
 
     def stored_process_mode(self, asset: dict) -> str:
         """The film process already decided for an asset, or "" when nothing has decided.
@@ -1417,6 +1450,7 @@ class DesktopSessionManager(QObject):
         if 0 <= index < len(self.state.uploaded_files):
             # Save current before switching, but only if user actually made explicit edits
             if self.state.current_file_hash:
+                self._commit_preview()
                 if self._config_dirty:
                     self.repo.save_file_settings(
                         self.state.current_file_hash, self.state.config, file_path=self.state.current_file_path or ""
@@ -1447,7 +1481,7 @@ class DesktopSessionManager(QObject):
             self.state.undo_index = self.repo.get_max_history_index(file_info["hash"])
             self.state.max_history_index = self.state.undo_index
 
-            self.state.config, self.state.current_file_is_new = self._hydrate_asset_config(file_info)
+            self.state.config = self._hydrate_asset_config(file_info)
 
             self.file_selected.emit(file_info["path"])
             self.state_changed.emit()
@@ -1493,19 +1527,32 @@ class DesktopSessionManager(QObject):
             self.select_file(advance_to)
 
     def _stamp_scenes(self) -> None:
-        by_hash = rolls.scene_by_hash(self.repo, self.state.active_roll_id)
+        """Marks each loaded frame with its scene, ``(ordinal, scene_id, name)``, or its found scene,
+        ``(ordinal, index, name)`` numbered on from the scenes. Found scenes of another roll drop."""
+        roll_id = self.state.active_roll_id
+        by_hash = rolls.scene_by_hash(self.repo, roll_id)
+        self.state.found_scenes = [s for s in self.state.found_scenes if s["roll"] == roll_id]
+        first = len(rolls.roll_scenes(self.repo, roll_id)) + 1
+        found = {h: (first + k, k, s["name"]) for k, s in enumerate(self.state.found_scenes) for h in s["hashes"]}
         for f in self.state.uploaded_files:
-            hit = by_hash.get(unforked_hash(f["hash"]))
-            if hit:
-                f["scene"] = hit
-            else:
-                f.pop("scene", None)
+            for key, hit in (("scene", by_hash.get(unforked_hash(f["hash"]))), ("found_scene", found.get(f["hash"]))):
+                if hit:
+                    f[key] = hit
+                else:
+                    f.pop(key, None)
 
     def refresh_scene_marks(self) -> None:
         """Re-reads the active roll's scenes onto the loaded frames after a scene edit."""
         self._stamp_scenes()
         self.asset_model.refresh()
         self.files_changed.emit()
+
+    def selection_is_open_frame(self) -> bool:
+        """True when an action targets the open frame alone: nothing is selected, or the open
+        frame is the whole selection. A Light Table click selects a frame without opening it,
+        so a single selected frame can be another one."""
+        selected = self.state.selected_indices
+        return not selected or list(selected) == [self.state.selected_file_idx]
 
     def _scope_indices(self, scope: str) -> List[int]:
         """Frames a scoped apply targets: "roll" (every visible frame) or "selection".
@@ -1568,12 +1615,11 @@ class DesktopSessionManager(QObject):
             count += 1
 
         if count:
-            n = len(rows) + int(luma) + int(color)
-            noun = "setting" if n == 1 else "settings"
+            settings = count_of(len(rows) + int(luma) + int(color), "setting")
             if scope == "roll":
-                msg = f"{n} {noun} synced to whole roll ({count} frames)"
+                msg = tr("{value} synced to the whole roll ({value1})", value=settings, value1=count_of(count, "frame"))
             else:
-                msg = f"{n} {noun} synced to {count} frame{'s' if count != 1 else ''}"
+                msg = tr("{value} synced to {value1}", value=settings, value1=count_of(count, "frame"))
             self.settings_synced.emit(msg)
             self.settings_saved.emit()
             self.frames_edited_offscreen.emit(changed_hashes)
@@ -1607,7 +1653,7 @@ class DesktopSessionManager(QObject):
             if idx == self.state.selected_file_idx:
                 overlaid = apply_selected_fields(source, self.state.config, rows)
                 self.update_config(finish(overlaid) if finish else overlaid, persist=True, render=False)
-                self._relock_diverged_cards()
+                self.relock_diverged_cards()
                 count += 1
                 continue
             target_hash = self.state.uploaded_files[idx]["hash"]
@@ -1623,7 +1669,7 @@ class DesktopSessionManager(QObject):
 
         if count:
             n = len(rows) + int(finish is not None)
-            noun = "setting" if n == 1 else "settings"
+            noun = plural(n, "setting")
             self.settings_synced.emit(
                 tr(
                     "{label}: {n} {noun} to {count} {frame_word}",
@@ -1726,7 +1772,7 @@ class DesktopSessionManager(QObject):
         rest of a multi-selection. `active_included` only affects the status message's
         count, since the active frame is always excluded from this method's own loop.
         Returns the thumbnail keys touched, so the caller can invalidate them."""
-        if len(self.state.selected_indices) <= 1:
+        if self.selection_is_open_frame():
             return []
 
         touched_keys = []
@@ -1761,7 +1807,7 @@ class DesktopSessionManager(QObject):
     def flip_selected_frames(self, horizontal: bool, active_included: bool = True) -> List[str]:
         """Mirrors every OTHER selected frame by its own current geometry. See
         rotate_selected_frames — same active/other split, same reasoning."""
-        if len(self.state.selected_indices) <= 1:
+        if self.selection_is_open_frame():
             return []
 
         touched_keys = []
@@ -1821,10 +1867,18 @@ class DesktopSessionManager(QObject):
         """
         Updates global config and optionally saves to disk.
         """
-        # A step identical to the live config renders as a dead row in the History panel and
-        # costs a redo branch. Reloading the same work print, resetting an already-default panel
-        # and pasting identical settings all land here.
-        if persist and record_history and config == self.state.config:
+        history_requested = record_history
+        before = self.state.config
+        if self._preview_history is not None:
+            if self._preview_history[0] == self.state.current_file_hash:
+                before = self._preview_history[1]
+            else:
+                self._preview_history = None
+
+        # Each edit keeps its undo baseline from before the first preview.
+        if not persist and record_history and self.state.current_file_hash:
+            self._preview_history = None if config == before else (self.state.current_file_hash, before)
+        if persist and record_history and config == before:
             record_history = False
 
         stepped = False
@@ -1832,7 +1886,7 @@ class DesktopSessionManager(QObject):
             # If editing after an undo, drop the now-orphaned future branch
             if self.state.undo_index < self.state.max_history_index:
                 self.repo.truncate_history_above(self.state.current_file_hash, self.state.undo_index)
-            self.repo.save_history_step(self.state.current_file_hash, self.state.undo_index, self.state.config)
+            self.repo.save_history_step(self.state.current_file_hash, self.state.undo_index, before)
             self.state.undo_index += 1
             self.state.max_history_index = self.state.undo_index
 
@@ -1842,6 +1896,8 @@ class DesktopSessionManager(QObject):
             stepped = True
 
         self.state.config = config
+        if persist and history_requested:
+            self._preview_history = None
 
         # After the assignment: the step above is the *previous* config, and a handler that
         # reads state.config (the canvas HUD) must see the new one.
@@ -1857,6 +1913,10 @@ class DesktopSessionManager(QObject):
 
         if render:
             self.state_changed.emit()
+
+    def _commit_preview(self) -> None:
+        if self._preview_history is not None:
+            self.update_config(self.state.config, persist=True, render=False)
 
     def persist_active_batch_config(self, config: WorkspaceConfig) -> None:
         """Persist the active frame's Auto-crop all frames result before it goes live in memory,
@@ -1889,10 +1949,10 @@ class DesktopSessionManager(QObject):
             # Written without a render; the filmstrip flags the cell until one lands.
             self.state.stale_thumbnails.add(asset_thumbnail_key(asset))
 
-    def _relock_diverged_cards(self) -> None:
+    def relock_diverged_cards(self) -> None:
         """Lock each roll card on which the restored config differs from the roll's: history, a work
         print and a paste restore no locks, and an unlocked card takes the roll's values on load.
-        Never unlocks, except Auto Crop on a hand-drawn frame (rolls.holds_own_crop)."""
+        Never unlocks."""
         idx = self.state.selected_file_idx
         if not self.state.current_file_hash or not (0 <= idx < len(self.state.uploaded_files)):
             return
@@ -1907,14 +1967,11 @@ class DesktopSessionManager(QObject):
         locked = rolls.frame_override_cards(self.repo, roll_id, base)
         for card_key, (section, names) in rolls.ROLL_DEFAULT_FIELDS.items():
             values = getattr(config, section)
-            if rolls.holds_own_crop(card_key, config):
-                if card_key in locked:
-                    rolls.set_frame_override(self.repo, roll_id, base, card_key, False)
-                continue
             if card_key not in locked and any(n in defaults and not rolls.same_value(getattr(values, n), defaults[n]) for n in names):
                 rolls.set_frame_override(self.repo, roll_id, base, card_key, True)
 
     def undo(self) -> None:
+        self._commit_preview()
         if self.state.undo_index > 0 and self.state.current_file_hash:
             if self.state.undo_index == self.state.max_history_index:
                 self.repo.save_history_step(self.state.current_file_hash, self.state.undo_index, self.state.config)
@@ -1924,18 +1981,19 @@ class DesktopSessionManager(QObject):
             if prev_config:
                 self.state.config = prev_config
                 self._config_dirty = True
-                self._relock_diverged_cards()
+                self.relock_diverged_cards()
                 self.state_changed.emit()
                 self.history_changed.emit()
 
     def redo(self) -> None:
+        self._commit_preview()
         if self.state.undo_index < self.state.max_history_index and self.state.current_file_hash:
             self.state.undo_index += 1
             next_config = self.repo.load_history_step(self.state.current_file_hash, self.state.undo_index)
             if next_config:
                 self.state.config = next_config
                 self._config_dirty = True
-                self._relock_diverged_cards()
+                self.relock_diverged_cards()
                 self.state_changed.emit()
                 self.history_changed.emit()
 
@@ -1980,7 +2038,7 @@ class DesktopSessionManager(QObject):
             if not self.work_print_apply_metadata():
                 config = replace(config, metadata=self.state.config.metadata)
             self.update_config(config, persist=True)
-            self._relock_diverged_cards()
+            self.relock_diverged_cards()
 
     def rename_work_print(self, name: str, new_name: str, replace_existing: bool = False) -> None:
         if not (self.state.current_file_hash and new_name) or new_name == name:
@@ -2002,6 +2060,7 @@ class DesktopSessionManager(QObject):
         """Load an arbitrary history step (random-access undo/redo)."""
         if not self.state.current_file_hash:
             return
+        self._commit_preview()
         if index == self.state.undo_index or not (0 <= index <= self.state.max_history_index):
             return
 
@@ -2015,7 +2074,7 @@ class DesktopSessionManager(QObject):
         self.state.undo_index = index
         self.state.config = config
         self._config_dirty = True
-        self._relock_diverged_cards()
+        self.relock_diverged_cards()
         self.state_changed.emit()
         self.history_changed.emit()
 
@@ -2028,7 +2087,7 @@ class DesktopSessionManager(QObject):
             roll_id = rolls.frame_roll(self.repo, self.state.active_roll_id, asset)
             if roll_id is not None:
                 rolls.clear_frame_overrides(self.repo, roll_id, unforked_hash(asset["hash"]))
-            config = self._overlay_roll_defaults(config, asset)
+            config = self._overlay_roll_defaults(config, asset, fresh=True)
         return self._mode_aware_reset_defaults(self._asset_defaults(config, asset))
 
     @staticmethod
@@ -2103,7 +2162,11 @@ class DesktopSessionManager(QObject):
     def copy_settings(self, include_bounds: bool = False) -> None:
         import copy
 
-        cfg = copy.deepcopy(self.state.config)
+        selected = self.state.selected_indices
+        source = self.state.config
+        if len(selected) == 1 and not self.selection_is_open_frame():
+            source = self.config_for_asset(self.state.uploaded_files[selected[0]])
+        cfg = copy.deepcopy(source)
         if not include_bounds:
             cfg = replace(
                 cfg,
@@ -2129,7 +2192,7 @@ class DesktopSessionManager(QObject):
 
     def apply_pasted_fields(self, rows, include_bounds: bool = True) -> None:
         """Overlay the picked clipboard settings onto the active frame, or onto each selected frame.
-        The per-frame bounds come along when the clipboard holds them and their row is ticked,
+        The per-frame bounds come along when the clipboard holds them and their row is on,
         written after the rows because a pasted bounds-input field invalidates them."""
         rows = list(rows)
         clip = self.state.clipboard
@@ -2150,7 +2213,7 @@ class DesktopSessionManager(QObject):
                 ),
             )
 
-        if len(self._scope_indices("selection")) > 1:
+        if not self.selection_is_open_frame() and self._scope_indices("selection"):
             self.apply_preset_fields(clip, rows, "selection", finish=with_bounds if bounds else None, label=tr("Pasted"))
             self.state_changed.emit()
             return
@@ -2158,7 +2221,7 @@ class DesktopSessionManager(QObject):
         if bounds:
             merged = with_bounds(merged)
         self.update_config(merged, persist=True)
-        self._relock_diverged_cards()
+        self.relock_diverged_cards()
         self.settings_pasted.emit()
 
     def persist_hidden_masks(self) -> None:
@@ -2369,6 +2432,7 @@ class DesktopSessionManager(QObject):
         self.state.selected_indices = []
         self.state.current_file_path = None
         self.state.current_file_hash = None
+        self._preview_history = None
         self.state.preview_raw = None
         self.state.preview_ir = None
         self.state.preview_detect = None

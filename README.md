@@ -5,16 +5,26 @@
   [![Release](https://img.shields.io/github/v/release/marcinz606/NegPy)](https://github.com/marcinz606/NegPy/releases)
   [![Downloads](https://img.shields.io/github/downloads/marcinz606/NegPy/total)](https://github.com/marcinz606/NegPy/releases)
   [![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
-  [![Python](https://img.shields.io/badge/python-3.13%2B-blue)](pyproject.toml)
-  [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+
   [![Platform](https://img.shields.io/badge/platform-linux%20%7C%20macos%20%7C%20windows-lightgrey)](#getting-started)
+  [![Film](https://img.shields.io/badge/film-C41%20%7C%20B%26W%20%7C%20E6-red?logo=googlephotos&logoColor=white)](docs/PIPELINE.md)
+  [![Languages](https://img.shields.io/badge/languages-EN%20%7C%20日本語%20%7C%20한국어%20%7C%20中文-informational)](docs/USER_GUIDE.md)
+
+  [![Python](https://img.shields.io/badge/python-3.13%2B-blue)](pyproject.toml)
+  [![Rust](https://img.shields.io/badge/rust-negpy__core-orange?logo=rust)](negpy_core)
+  [![GPU](https://img.shields.io/badge/GPU-WebGPU-005A9C)](docs/PIPELINE.md)
+  [![Qt](https://img.shields.io/badge/UI-PyQt6-41CD52?logo=qt&logoColor=white)](https://www.riverbankcomputing.com/software/pyqt/)
+  [![uv](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/uv/main/assets/badge/v0.json)](https://github.com/astral-sh/uv)
+  [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+
+  [![Stars](https://img.shields.io/github/stars/marcinz606/NegPy?style=flat&logo=github)](https://github.com/marcinz606/NegPy/stargazers)
   [![Contributors](https://img.shields.io/github/contributors/marcinz606/NegPy)](https://github.com/marcinz606/NegPy/graphs/contributors)
   [![Discord](https://img.shields.io/badge/discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/JySNzUWgwy)
 </div>
 
-NegPy turns scans of film negatives and slides into finished pictures. I wrote it because I wanted a tool made for film scans that does more than invert them. It models film and photographic paper, and adds the conveniences of a lab scanner. It is written in Python and runs on Linux, macOS and Windows.
+NegPy turns scans of film negatives and slides into finished pictures. I wrote it because I wanted a tool made for film scans that does more than invert them. It models film and photographic paper, and adds the conveniences of a lab scanner. It runs on Linux, macOS and Windows. 
 
-![NegPy main window](docs/media/0650.webp)
+![NegPy main window](docs/media/0660.webp)
 
 The [User Guide](docs/USER_GUIDE.md) covers every panel and control (the ⓘ on each panel opens it in the app). [PIPELINE.md](docs/PIPELINE.md) explains the math.
 
@@ -30,7 +40,7 @@ The desktop interface and panel guides support English, Simplified Chinese (简�
 * The print is built in density space on an H&D curve (toe, straight section, shoulder) and graded in ISO-R points like darkroom paper.
 * Auto Density and Auto Grade meter each frame to adjustable targets.
 * Paper profiles from Ilford, Kodak, Foma and Fuji datasheets.
-* Color negative, B&W and slide modes. Slides open as captured, with optional normalization for faded film and HDR merging of bracketed exposures.
+* Color negative, B&W and slide modes. Slides open as captured, with optional Auto Density and Auto Grade for faded film and HDR merging of bracketed exposures.
 
 ### Rolls
 
@@ -49,11 +59,11 @@ The desktop interface and panel guides support English, Simplified Chinese (简�
 ### Editing
 
 * Dodge and burn with polygon, oval and card-edge masks, each with its own strength, feather, contrast grade and tone limit.
-* Dust, hair and scratch removal: automatic, from the IR channel (NegPy or OpenICE method), or painted, keeping the film grain.
+* Dust, hair and scratch removal: automatic, from the IR channel or painted, keeping the film grain.
 * Darkroom tools: test strips, ring-around, step wedge, zone overlay, spot densitometer and zone placement.
 * Contrast mask, tilt and swing, edge burn, filed carrier and print mats.
 * Lith, cyanotype and toners for B&W.
-* GPU rendering (Vulkan, Metal or DX12) with a CPU fallback that gives the same result.
+* GPU rendering through wgpu (Vulkan, Metal or DX12), and a multi-core CPU path in Rust that gives the same result.
 
 ### Output
 
@@ -71,11 +81,9 @@ The desktop interface and panel guides support English, Simplified Chinese (简�
 
 ## Getting started
 
-Download the build for your OS from the [Releases page](https://github.com/marcinz606/NegPy/releases). NegPy then updates itself from an Update Available notice.
+The recommended way is to run NegPy from source: you get each fix as soon as it is on `main`, and your system shows no warning for an unsigned app. [CONTRIBUTING.md](CONTRIBUTING.md#development-setup) has the steps: install `uv` and `rustup`, then run `make install` and `make run`.
 
-To build from source, see [CONTRIBUTING.md](CONTRIBUTING.md).
-
-The builds are not signed, so expect a warning on first run.
+You can also download the build for your OS from the [Releases page](https://github.com/marcinz606/NegPy/releases). When a new version is out, a dot shows on the ⋯ menu, and **Update to vX.Y.Z…** in its Help menu installs it. The builds are not signed, so expect a warning on first run.
 
 ### Linux
 

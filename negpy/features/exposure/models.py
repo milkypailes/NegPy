@@ -18,6 +18,22 @@ class RenderIntent(StrEnum):
     FLAT = "flat"
 
 
+class BwFilter(StrEnum):
+    """A contrast filter on the camera lens, for a B&W print from a color negative (Wratten numbers)."""
+
+    NONE = "none"
+    YELLOW_8 = "yellow_8"
+    DEEP_YELLOW_15 = "deep_yellow_15"
+    ORANGE_21 = "orange_21"
+    RED_25 = "red_25"
+    YELLOW_GREEN_11 = "yellow_green_11"
+    GREEN_58 = "green_58"
+
+    @classmethod
+    def _missing_(cls, value: object) -> "BwFilter":
+        return cls.NONE
+
+
 @dataclass(frozen=True)
 class ExposureConfig:
     """
@@ -46,11 +62,9 @@ class ExposureConfig:
     highlight_density: float = 0.0
     # A shadow lift fades to nothing at paper black, so the black point barely moves.
     hold_black: bool = False
-    # Unsharp mask gamma: positive sandwiches a blurred positive and reduces contrast,
-    # negative a blurred negative and increases it. [-0.5, 0.5]; 0 = no mask.
-    contrast_mask: float = 0.0
-    # The mask's spacer: the scale above which tones are masked. [2.0, 6.0] %.
-    mask_spacer: float = 4.0
+    # Tone mask: lifts large dark areas and holds back large bright ones, more the farther they sit
+    # from mid-gray (contrast_mask_coeffs). [0, 1]; 0 = off.
+    contrast_mask_strength: float = 0.0
     # A diffuser under the enlarger lens: the paper sees the light mixed with a blurred copy,
     # so shadows bleed into highlights. [0, 1]; 0 = off; fixed spread (DIFFUSION_SPREAD).
     diffusion: float = 0.0
@@ -109,6 +123,7 @@ class ExposureConfig:
     # logic.separation_damping_gain). Inert at dye_separation 1.0: it only
     # redistributes that slider's push.
     separation_damping: float = 0.0
+    bw_filter: BwFilter = BwFilter.NONE
     # Display-referred levels (see levels.py), the last pipeline step: the Global
     # master first, then one curve per channel. In/out bounds are 0-255 ints,
     # gamma 0.1-10.0 at 1.0. Identity by default, so an untouched edit renders
@@ -215,6 +230,7 @@ class ExposureConfig:
         # Legacy: cast_removal was a bool toggle; MIGRATIONS renames the key, coerce its value.
         if isinstance(self.cast_removal_strength, bool):
             object.__setattr__(self, "cast_removal_strength", 1.0 if self.cast_removal_strength else 0.0)
+        object.__setattr__(self, "bw_filter", BwFilter(self.bw_filter))
 
 
 EXPOSURE_CONSTANTS: Dict[str, Any] = {
@@ -222,10 +238,13 @@ EXPOSURE_CONSTANTS: Dict[str, Any] = {
     "cmy_max_density": 0.2,
     # Scales the density slider's effect on the exposure pivot.
     "density_multiplier": 0.2,
-    # Density the reference tone (assumed_anchor) prints at.
+    # Density the reference tone (assumed_anchor) prints at. The paper S-curve, the zone
+    # weights and the regional CMY split centre on it.
+    "reference_print_density": 0.75,
+    # Auto Density: density the metered anchor prints at (Print Density Target).
     "anchor_target_density": 0.75,
     # Zone Density (ΔD) weights: mid-sparing sigmoids centred in the three-quarter/
-    # quarter tones (offsets from anchor_target_density), so midtones get neither
+    # quarter tones (offsets from reference_print_density), so midtones get neither
     # offset. Mirrored as literals in exposure.wgsl: change both together.
     "zone_density_sharpness": 4.0,
     "zone_density_shadow_offset": 0.75,
