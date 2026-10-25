@@ -53,6 +53,26 @@ class TestDesktopSessionSync(unittest.TestCase):
         # A scoped apply reads the visible set, which a real load always builds.
         self.session.asset_model.refresh()
 
+    def test_found_scenes_mark_their_frames_after_the_scenes_and_drop_with_their_roll(self):
+        from negpy.services.assets import rolls
+
+        self.session.state.active_roll_id = "roll-1"
+        self.session.state.found_scenes = [{"roll": "roll-1", "name": "Scene 2", "hashes": ["hash2"]}]
+        with (
+            patch.object(rolls, "scene_by_hash", return_value={"hash1": (1, "s1", "Beach")}),
+            patch.object(rolls, "roll_scenes", return_value=[("s1", {"name": "Beach"})]),
+        ):
+            self.session.refresh_scene_marks()
+            first, second = self.session.state.uploaded_files
+            self.assertEqual((first.get("scene"), first.get("found_scene")), ((1, "s1", "Beach"), None))
+            self.assertEqual((second.get("scene"), second.get("found_scene")), (None, (2, 0, "Scene 2")))
+
+            self.session.state.active_roll_id = "roll-2"
+            self.session.refresh_scene_marks()
+
+        self.assertEqual(self.session.state.found_scenes, [])
+        self.assertNotIn("found_scene", self.session.state.uploaded_files[1])
+
     def test_a_color_vision_choice_is_saved_and_announced(self):
         heard = []
         self.session.color_vision_changed.connect(lambda: heard.append(1))
@@ -61,6 +81,14 @@ class TestDesktopSessionSync(unittest.TestCase):
         self.assertEqual(self.session.state.color_vision, "tritan")
         self.mock_repo.save_global_setting.assert_called_once_with("color_vision", "tritan")
         self.assertEqual(heard, [1])
+
+    def test_automatic_thumbnail_updates_are_saved_and_announced(self):
+        heard = []
+        self.session.auto_thumbnail_refresh_changed.connect(heard.append)
+        self.session.set_auto_thumbnail_refresh(True)
+        self.session.set_auto_thumbnail_refresh(True)
+        self.mock_repo.save_global_setting.assert_called_once_with("auto_thumbnail_refresh", True)
+        self.assertEqual(heard, [True])
 
     def test_update_selection(self):
         self.session.update_selection([0, 1])
@@ -189,8 +217,9 @@ class TestDesktopSessionSync(unittest.TestCase):
         self.assertTrue(config.process.linear_raw)
 
     def test_config_for_asset_applies_roll_defaults_outside_the_process_config(self):
-        """Auto Crop, Lens Correction and Flat Field are roll cards on other config
-        sections; a roll's own flat-field profile outranks the rig-global one."""
+        """Lens Correction and Flat Field are roll cards on other config sections; a roll's
+        own flat-field profile outranks the rig-global one. A crop value an older roll
+        stored never reaches the frame."""
         rolls_store = {
             "r1": {
                 "kind": "virtual",
@@ -206,30 +235,10 @@ class TestDesktopSessionSync(unittest.TestCase):
         with patch("negpy.desktop.session.load_or_promote", return_value=None):
             config = self.session.config_for_asset(asset)
 
-        self.assertEqual(config.geometry.autocrop_rebate_trim, 0.5)
+        self.assertEqual(config.geometry.autocrop_rebate_trim, 1.0)
         self.assertEqual(config.geometry.distortion_k1, 0.02)
         self.assertEqual(config.flatfield.profile_id, "roll-ff")
         self.assertTrue(config.flatfield.apply)
-
-    def test_config_for_asset_keeps_a_frames_own_auto_crop_when_that_card_is_locked(self):
-        rolls_store = {
-            "r1": {
-                "kind": "virtual",
-                "name": "Portra",
-                "defaults": {"autocrop_rebate_trim": 0.5, "distortion_k1": 0.02},
-                "frame_overrides": {"a-hash": ["autocrop"]},
-            }
-        }
-        globals_ = {"rolls_by_id": rolls_store}
-        self.mock_repo.get_global_setting.side_effect = lambda key, default=None: globals_.get(key, default)
-        self.session.state.active_roll_id = "r1"
-        asset = {"name": "a.dng", "path": "/roll/a.dng", "hash": "a-hash"}
-
-        with patch("negpy.desktop.session.load_or_promote", return_value=None):
-            config = self.session.config_for_asset(asset)
-
-        self.assertEqual(config.geometry.autocrop_rebate_trim, 1.0)
-        self.assertEqual(config.geometry.distortion_k1, 0.02)
 
     def test_config_for_asset_ignores_roll_defaults_when_the_file_belongs_to_no_roll(self):
         rolls_store = {"r1": {"kind": "virtual", "name": "Portra", "defaults": {"linear_raw": True}}}
@@ -282,7 +291,7 @@ class TestDesktopSessionSync(unittest.TestCase):
                 "kind": "virtual",
                 "name": "Portra",
                 "defaults": {"linear_raw": True},
-                "frame_overrides": {"a-hash": ["sensor"]},
+                "frame_overrides": {"a-hash": ["demosaic"]},
             }
         }
         globals_ = {"rolls_by_id": rolls_store}
@@ -296,6 +305,44 @@ class TestDesktopSessionSync(unittest.TestCase):
 
         self.assertFalse(config.process.linear_raw)
 
+    def test_config_for_asset_keeps_a_locked_frames_own_flatfield_profile(self):
+        """Frame 2 pinned Profile A. Frame 3 then made Profile B the roll and the rig
+        default. Opening frame 2 again must still show Profile A."""
+        saved_a = replace(
+            WorkspaceConfig(),
+            flatfield=replace(WorkspaceConfig().flatfield, apply=True, profile_id="profile-a"),
+        )
+        saved_following = replace(
+            WorkspaceConfig(),
+            flatfield=replace(WorkspaceConfig().flatfield, apply=True, profile_id="profile-a"),
+        )
+        rolls_store = {
+            "r1": {
+                "kind": "virtual",
+                "name": "Portra",
+                "defaults": {"profile_id": "profile-b", "apply": True},
+                "frame_overrides": {"frame-2": ["flatfield"]},
+            }
+        }
+        globals_ = {"rolls_by_id": rolls_store, "flatfield_active_profile": "profile-b"}
+        self.mock_repo.get_global_setting.side_effect = lambda key, default=None: globals_.get(key, default)
+        self.session.state.active_roll_id = "r1"
+        pinned = {"name": "frame2.dng", "path": "/roll/frame2.dng", "hash": "frame-2"}
+        following = {"name": "frame3.dng", "path": "/roll/frame3.dng", "hash": "frame-3"}
+        prof = SimpleNamespace(id="profile-b", k1=0.0)
+
+        with (
+            patch("negpy.desktop.session.load_or_promote", side_effect=[saved_a, saved_following]),
+            patch("negpy.desktop.session.FlatFieldProfiles.get", return_value=prof),
+        ):
+            pinned_config = self.session.config_for_asset(pinned)
+            following_config = self.session.config_for_asset(following)
+
+        self.assertEqual(pinned_config.flatfield.profile_id, "profile-a")
+        self.assertTrue(pinned_config.flatfield.apply)
+        self.assertEqual(following_config.flatfield.profile_id, "profile-b")
+        self.assertTrue(following_config.flatfield.apply)
+
     def test_config_for_asset_reads_roll_state_by_the_unforked_hash(self):
         """A lock (or a roll default's frame_overrides entry) is about this physical
         frame, not its current edit identity -- a forked asset's suffixed hash must
@@ -307,7 +354,7 @@ class TestDesktopSessionSync(unittest.TestCase):
                 "kind": "virtual",
                 "name": "Portra",
                 "defaults": {"linear_raw": True},
-                "frame_overrides": {"a-hash": ["sensor"]},
+                "frame_overrides": {"a-hash": ["demosaic"]},
             }
         }
         globals_ = {"rolls_by_id": rolls_store}
@@ -323,16 +370,6 @@ class TestDesktopSessionSync(unittest.TestCase):
         # sensor (Calibration) is locked for a-hash, so linear_raw keeps its own value
         # even though the asset is currently showing its forked edit identity.
         self.assertFalse(config.process.linear_raw)
-
-    def test_set_autodetect_enabled_persists(self):
-        self.assertFalse(self.session.state.autodetect_enabled)
-        self.session.set_autodetect_enabled(True)
-        self.assertTrue(self.session.state.autodetect_enabled)
-        self.mock_repo.save_global_setting.assert_called_with("autodetect_enabled", True)
-
-    def test_set_autodetect_enabled_noop_when_unchanged(self):
-        self.session.set_autodetect_enabled(False)
-        self.mock_repo.save_global_setting.assert_not_called()
 
     def test_set_sticky_zoom_persists(self):
         self.assertFalse(self.session.state.sticky_zoom)
@@ -353,6 +390,12 @@ class TestDesktopSessionSync(unittest.TestCase):
     def test_set_invert_zoom_scroll_noop_when_unchanged(self):
         self.session.set_invert_zoom_scroll(False)
         self.mock_repo.save_global_setting.assert_not_called()
+
+    def test_shortcut_hints_start_on_and_persist_when_turned_off(self):
+        self.assertTrue(self.session.state.shortcut_hints)
+        self.session.set_shortcut_hints(False)
+        self.assertFalse(self.session.state.shortcut_hints)
+        self.mock_repo.save_global_setting.assert_called_with("shortcut_hints", False)
 
     def test_persist_writes_sticky_settings_in_one_batch(self):
         self.session.select_file(0)
@@ -536,6 +579,63 @@ class TestDesktopSessionSync(unittest.TestCase):
 
         self.assertEqual(seeded.geometry.distortion_k1, -0.05)
         self.assertEqual(kept.geometry.distortion_k1, 0.012)
+
+    def _flatfield_after_load(self, config, only_global, carried_rows=(), sticky=None):
+        settings = {"flatfield_active_profile": "ff-35", "sticky_config": sticky or {}, "sticky_rows": list(carried_rows)}
+        self.mock_repo.get_global_setting.side_effect = lambda key, default=None: settings.get(key, default)
+        with patch("negpy.desktop.session.FlatFieldProfiles.get", return_value=SimpleNamespace(id="ff-35", k1=0.0)):
+            ff = self.session._apply_sticky_settings(config, only_global=only_global).flatfield
+        return ff.profile_id, ff.apply
+
+    @staticmethod
+    def _with_flatfield(profile_id: str, apply: bool) -> WorkspaceConfig:
+        base = WorkspaceConfig()
+        return replace(base, flatfield=replace(base.flatfield, profile_id=profile_id, apply=apply))
+
+    def test_a_saved_frame_keeps_its_own_flat_field_profile(self):
+        self.assertEqual(self._flatfield_after_load(self._with_flatfield("ff-120", True), only_global=True), ("ff-120", True))
+
+    def test_a_saved_frame_without_a_profile_takes_the_last_chosen_one(self):
+        self.assertEqual(self._flatfield_after_load(self._with_flatfield("", False), only_global=True), ("ff-35", False))
+
+    def test_a_new_file_takes_the_last_chosen_flat_field_profile(self):
+        self.assertEqual(self._flatfield_after_load(WorkspaceConfig(), only_global=False), ("ff-35", True))
+
+    def test_a_carried_flat_field_row_wins_on_a_new_file(self):
+        carried = self._flatfield_after_load(
+            WorkspaceConfig(), only_global=False, carried_rows=["flatfield.apply"], sticky={"apply": True, "profile_id": "ff-120"}
+        )
+        self.assertEqual(carried, ("ff-120", True))
+
+    def _load_with_profiles(self, config, only_global, profiles, carried_rows=(), sticky=None):
+        """Load *config* while this machine holds *profiles* (id -> k1) and ff-35 is the last chosen."""
+        settings = {"flatfield_active_profile": "ff-35", "sticky_config": sticky or {}, "sticky_rows": list(carried_rows)}
+        self.mock_repo.get_global_setting.side_effect = lambda key, default=None: settings.get(key, default)
+        get = lambda pid: SimpleNamespace(id=pid, k1=profiles[pid]) if pid in profiles else None  # noqa: E731
+        with patch("negpy.desktop.session.FlatFieldProfiles.get", side_effect=get):
+            return self.session._apply_sticky_settings(config, only_global=only_global)
+
+    def test_a_profile_this_machine_lacks_takes_the_last_chosen_one(self):
+        loaded = self._load_with_profiles(self._with_flatfield("from-elsewhere", True), True, {"ff-35": 0.0})
+        self.assertEqual((loaded.flatfield.profile_id, loaded.flatfield.apply), ("ff-35", True))
+
+    def test_a_carried_flat_field_row_with_a_missing_profile_takes_the_last_chosen_one(self):
+        loaded = self._load_with_profiles(
+            WorkspaceConfig(), False, {"ff-35": 0.0}, carried_rows=["flatfield.apply"], sticky={"apply": True, "profile_id": "deleted"}
+        )
+        self.assertEqual((loaded.flatfield.profile_id, loaded.flatfield.apply), ("ff-35", True))
+
+    def test_legacy_k1_comes_from_the_frames_own_profile(self):
+        profiles = {"ff-35": -0.05, "ff-120": 0.0}
+        own_120 = self._load_with_profiles(self._with_flatfield("ff-120", True), True, profiles)
+        own_35 = self._load_with_profiles(self._with_flatfield("ff-35", True), True, profiles)
+        self.assertEqual(own_120.geometry.distortion_k1, 0.0)
+        self.assertEqual(own_35.geometry.distortion_k1, -0.05)
+
+    def test_no_chosen_flat_field_profile_leaves_a_new_file_uncorrected(self):
+        self.mock_repo.get_global_setting.side_effect = lambda key, default=None: default
+        ff = self.session._apply_sticky_settings(WorkspaceConfig(), only_global=False).flatfield
+        self.assertEqual((ff.profile_id, ff.apply), ("", False))
 
     def test_paper_black_carries_to_new_files(self):
         """Sticky must carry an explicit value over the file's base."""
@@ -991,6 +1091,30 @@ class TestDesktopSessionSync(unittest.TestCase):
         saved = {c.args[0]: c.args[1] for c in self.mock_repo.save_file_settings.call_args_list}
         self.assertEqual(saved["hash2"].exposure.density, 2.2)
 
+    def test_a_paste_onto_one_selected_frame_that_is_not_open_leaves_the_open_one(self):
+        self.session.state.selected_file_idx = 0
+        self.session.state.current_file_hash = "hash1"
+        self.session.state.config = WorkspaceConfig()
+        self.session.state.clipboard = replace(WorkspaceConfig(), exposure=replace(WorkspaceConfig().exposure, density=2.2))
+        self.mock_repo.load_file_settings.return_value = WorkspaceConfig()
+        self.session.update_selection([1])
+
+        self.session.apply_pasted_fields([_row("Print Density")])
+
+        self.assertEqual(self.session.state.config.exposure.density, WorkspaceConfig().exposure.density)
+        saved = {c.args[0]: c.args[1] for c in self.mock_repo.save_file_settings.call_args_list}
+        self.assertEqual(saved["hash2"].exposure.density, 2.2)
+
+    def test_copy_takes_one_selected_frame_that_is_not_open(self):
+        self.session.state.selected_file_idx = 0
+        self.session.state.config = WorkspaceConfig()
+        self.mock_repo.load_file_settings.return_value = WorkspaceConfig(geometry=GeometryConfig(rotation=3))
+        self.session.update_selection([1])
+
+        self.session.copy_settings()
+
+        self.assertEqual(self.session.state.clipboard.geometry.rotation, 3)
+
     def test_a_card_copy_holds_its_rows_and_a_whole_copy_clears_them(self):
         self.session.state.current_file_hash = "hash1"
         rows = [_row("Print Density")]
@@ -1296,6 +1420,22 @@ class TestDesktopSessionSync(unittest.TestCase):
 
         self.assertEqual(touched, ["hash2-v3", "hash3-v3"])
         self.assertEqual(messages, ["Rotated 2 frames"])
+
+    def test_rotate_selected_frames_turns_one_selected_frame_that_is_not_open(self):
+        self.session.state.selected_file_idx = 0
+        self.mock_repo.load_file_settings.return_value = WorkspaceConfig(geometry=GeometryConfig(rotation=0))
+        self.session.update_selection([1])
+
+        touched = self.session.rotate_selected_frames(1, active_included=False)
+
+        self.assertEqual(touched, ["hash2-v3"])
+        self.assertEqual(self.mock_repo.save_file_settings.call_args.args[0], "hash2")
+
+    def test_the_open_frame_is_the_target_only_when_it_is_the_whole_selection(self):
+        self.session.state.selected_file_idx = 0
+        for selection, open_frame in (([], True), ([0], True), ([1], False), ([0, 1], False)):
+            self.session.state.selected_indices = selection
+            self.assertEqual(self.session.selection_is_open_frame(), open_frame, selection)
 
     def test_rotate_selected_frames_noop_on_single_selection(self):
         self.session.state.selected_file_idx = 0
@@ -1671,6 +1811,23 @@ class TestAssetListModelSceneSort(unittest.TestCase):
         self.model.set_filter("[bcd]", regex=True)
         self.assertEqual(self._names(), ["c.nef", "b.nef", "d.nef"])
         self.assertEqual(self.model.scene_runs(), [(1, 0, 0), (2, 1, 2)])
+
+    def test_found_scenes_follow_the_scenes_as_blocks(self):
+        self.state.uploaded_files[0]["found_scene"] = (3, 0, "Scene 3")
+        self.state.uploaded_files.append({"name": "f.nef", "path": "/r/f.nef", "hash": "h6", "found_scene": (3, 0, "Scene 3")})
+        self.model.refresh()
+
+        self.assertEqual(self._names(), ["c.nef", "e.nef", "b.nef", "d.nef", "a.nef", "f.nef"])
+        self.assertEqual(self.model.scene_runs(), [(1, 0, 1), (2, 2, 3), (3, 4, 5)])
+
+    def test_found_scenes_alone_sort_by_scene(self):
+        for f in self.state.uploaded_files:
+            f.pop("scene", None)
+        self.state.uploaded_files[3]["found_scene"] = (1, 0, "Scene 1")
+        self.model.refresh()
+
+        self.assertEqual(self.model.effective_sort_order, "scene")
+        self.assertEqual(self._names()[0], "d.nef")
 
     def test_no_blocks_under_other_orders_or_a_semantic_query(self):
         import numpy as np
@@ -2310,7 +2467,7 @@ class ResetKeepsScanSetup(unittest.TestCase):
         roll_id = rolls.create_virtual_roll(self.repo, "Pakon", [f["path"] for f in self.session.state.uploaded_files])
         rolls.set_roll_defaults(self.repo, roll_id, linear_raw=True)
         for h in ("hash1", "hash2"):
-            rolls.set_frame_override(self.repo, roll_id, h, "sensor", locked=True)
+            rolls.set_frame_override(self.repo, roll_id, h, "demosaic", locked=True)
         self.repo.save_global_settings({"last_linear_raw": False})
         self.session.state.active_roll_id = roll_id
         return roll_id
@@ -2346,7 +2503,7 @@ class ResetKeepsScanSetup(unittest.TestCase):
         self.session.undo()
 
         self.assertFalse(self.session.state.config.process.linear_raw)
-        self.assertIn("sensor", rolls.frame_override_cards(self.repo, roll_id, "hash1"))
+        self.assertIn("demosaic", rolls.frame_override_cards(self.repo, roll_id, "hash1"))
         self.session.repo.save_file_settings("hash1", self.session.state.config, file_path=self.session.state.uploaded_files[0]["path"])
         self.assertFalse(self.session.config_for_asset(self.session.state.uploaded_files[0]).process.linear_raw)
 
@@ -2380,7 +2537,7 @@ class ResetKeepsScanSetup(unittest.TestCase):
         self.session.jump_to_step(self.session.state.undo_index - 1)
 
         self.assertFalse(self.session.state.config.process.linear_raw)
-        self.assertIn("sensor", rolls.frame_override_cards(self.repo, roll_id, "hash1"))
+        self.assertIn("demosaic", rolls.frame_override_cards(self.repo, roll_id, "hash1"))
 
     def test_loading_a_work_print_locks_a_card_that_differs_from_the_roll(self):
         from negpy.services.assets import rolls
@@ -2390,7 +2547,7 @@ class ResetKeepsScanSetup(unittest.TestCase):
         self.session.load_work_print("own")
 
         self.assertFalse(self.session.state.config.process.linear_raw)
-        self.assertIn("sensor", rolls.frame_override_cards(self.repo, roll_id, "hash1"))
+        self.assertIn("demosaic", rolls.frame_override_cards(self.repo, roll_id, "hash1"))
 
     def test_loading_a_sidecar_replaces_the_edit_as_one_undo_step(self):
         import tempfile
@@ -2411,7 +2568,7 @@ class ResetKeepsScanSetup(unittest.TestCase):
 
         self.assertEqual(self.session.state.config.exposure.density, 0.77)
         self.assertEqual(self.repo.load_file_settings("hash1").exposure.density, 0.77)
-        self.assertIn("sensor", rolls.frame_override_cards(self.repo, roll_id, "hash1"))
+        self.assertIn("demosaic", rolls.frame_override_cards(self.repo, roll_id, "hash1"))
         self.assertEqual(self.session.state.undo_index, before + 1)
 
     def test_a_paste_locks_a_card_that_differs_from_the_roll(self):

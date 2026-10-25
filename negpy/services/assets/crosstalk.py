@@ -3,6 +3,7 @@ from enum import StrEnum
 from typing import List, Optional
 
 from negpy.kernel.system.config import APP_CONFIG
+from negpy.kernel.system.i18n import mark
 from negpy.kernel.system.paths import get_resource_path
 from negpy.services.assets.naming import escape_toml_string, slugify
 from negpy.services.assets.toml_cache import load_toml_cached
@@ -24,11 +25,11 @@ class CrosstalkType(StrEnum):
 
 #: Dropdown group order and headings; the trailing entry is the catch-all.
 GROUP_ORDER: tuple[tuple[CrosstalkType, str], ...] = (
-    (CrosstalkType.BUILTIN, "Built-in"),
-    (CrosstalkType.MEASURED, "Measured"),
-    (CrosstalkType.TUNED, "Tuned on a rig"),
-    (CrosstalkType.SPECSHEET, "From spec sheets (approx)"),
-    (CrosstalkType.OTHER, "Other"),
+    (CrosstalkType.BUILTIN, mark("Built-in")),
+    (CrosstalkType.MEASURED, mark("Measured")),
+    (CrosstalkType.TUNED, mark("Tuned on a rig")),
+    (CrosstalkType.SPECSHEET, mark("From spec sheets (approx)")),
+    (CrosstalkType.OTHER, mark("Other")),
 )
 
 
@@ -47,9 +48,11 @@ class CrosstalkProfiles:
     def _scan_dir(directory: str) -> dict:
         """Maps display-name -> flat 9-float matrix for valid .toml files in a directory."""
         result: dict = {}
-        if not os.path.isdir(directory):
+        try:
+            names = os.listdir(directory)
+        except OSError:  # absent, or a user folder the OS blocks: no profiles there
             return result
-        for fname in os.listdir(directory):
+        for fname in names:
             if not fname.endswith(".toml"):
                 continue
             path = os.path.join(directory, fname)
@@ -117,9 +120,11 @@ class CrosstalkProfiles:
         """display-name -> type for every valid profile; bundled wins, like _scan."""
         types: dict = {}
         for directory in (APP_CONFIG.crosstalk_dir, get_resource_path("crosstalk")):
-            if not os.path.isdir(directory):
+            try:
+                names = os.listdir(directory)
+            except OSError:
                 continue
-            for fname in os.listdir(directory):
+            for fname in names:
                 if not fname.endswith(".toml"):
                     continue
                 path = os.path.join(directory, fname)
@@ -142,9 +147,11 @@ class CrosstalkProfiles:
 
         out: dict = {}
         for directory in (APP_CONFIG.crosstalk_dir, get_resource_path("crosstalk")):
-            if not os.path.isdir(directory):
+            try:
+                names = os.listdir(directory)
+            except OSError:
                 continue
-            for fname in os.listdir(directory):
+            for fname in names:
                 if not fname.endswith(".toml"):
                     continue
                 data = load_toml_cached(os.path.join(directory, fname))

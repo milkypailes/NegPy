@@ -1,6 +1,6 @@
 # Custom Crosstalk Matrices
 
-The **Crosstalk** control in the Calibration sidebar unmixes the color channels. NegPy ships
+The **Crosstalk** control in the Calibration card (Roll tab) unmixes the color channels. NegPy ships
 one built-in matrix (**Generic C41**). You can add your own, calibrated for your film *and
 your scanning setup*, without code.
 
@@ -53,8 +53,8 @@ the camera in the linear capture. **Hue Trim** rotates hue for an odd light spec
 > - They model the **dyes only**. That is the full correction only when the capture reads
 >   each dye band cleanly: a **Narrowband Scanner** (a Coolscan's mono sensor reads one LED
 >   at a time, fully clean; a Pakon's trilinear array comes close, with slight residual
->   bleed), a **Trichrome** capture, or a Single-Shot Narrowband rig with
->   **Single-Shot Narrowband Calibration** applied. A broadband light and a Bayer sensor
+>   bleed), a **Trichrome** capture, or a Single Exposure rig with
+>   **Sensor Crosstalk Profile** applied. A broadband light and a Bayer sensor
 >   add mixing that a dyes-only matrix cannot model.
 > - Consumer datasheets usually publish one *aggregate* midscale-neutral curve, not
 >   separate C/M/Y curves. For the Kodak films, Kodak's Vision3 dye curves are fitted to
@@ -142,7 +142,7 @@ presets stay reproducible if you later move or delete the file.
 ## Using it
 
 1. Put your `.toml` into `<Documents>/NegPy/crosstalk/`.
-2. Open the **Calibration** sidebar and find the **crosstalk dropdown** under CROSSTALK. New
+2. Open the **Calibration** card on the Roll tab and find the **crosstalk dropdown** under CROSSTALK. New
    files show the next time the panel syncs, for example when you switch photos. If yours
    does not show, restart.
 3. Pick your profile and raise **Strength** above 0.
@@ -177,7 +177,7 @@ The **sliders icon** beside the dropdown opens the **matrix editor**:
 - Each channel (**Red**, **Green**, **Blue**) has two sliders, **From** each other channel,
   from −1 to 1, and the preview updates live. Row normalization makes the diagonal
   redundant, so only the six mixing terms are editable. The **Preview Strength** slider
-  controls only this preview. The sidebar **Strength** slider applies the matrix.
+  controls only this preview. The card's **Strength** slider applies the matrix.
 - **Make Editable Copy** clones the selected locked matrix into an editable profile.
 - **Save** writes the profile as a `.toml` into `<Documents>/NegPy/crosstalk/`, so it shows
   in the dropdown.
@@ -207,7 +207,7 @@ chroma difference, with lightness left out because the print curve sets it. Gree
 amber within 5, red beyond. Moving a dot clears them.
 
 A matrix measured on one stock under one light describes that pair only. The sensor unmix runs
-before Crosstalk, so the fit measures only what the frame's sensor profile leaves; measure again
+before Crosstalk, so the fit measures only what the frame's sensor crosstalk profile leaves; measure again
 if you change that profile.
 
 ## Contributing a matrix

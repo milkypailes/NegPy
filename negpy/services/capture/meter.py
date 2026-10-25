@@ -1,6 +1,6 @@
 """Exposure meter for a white-light or camera-only scan: one RAW probe sets the shutter.
 A negative places its clear base (read in the rebate) at the target, since it becomes the print's black point. A positive,
-or a capture with no rebate, places its brightest highlights. The medium is the preset's, else the import classifier's.
+or a negative with no rebate the probe reads unclipped, places its brightest highlights: a negative's thin end. The medium is the preset's, else the import classifier's.
 """
 
 from __future__ import annotations
@@ -8,7 +8,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 
-import cv2
+import negpy_core
 import numpy as np
 
 from negpy.features.geometry.logic import (
@@ -28,6 +28,8 @@ from negpy.services.capture.calibration import (
     true_seconds,
 )
 
+#: Saturated pixels at this share of the picture are film, not light through a gap.
+_BLOWN_SHARE = 0.02
 #: A clipped region reads as a floor, so the probe steps down this far and meters again.
 CLIPPED_STEP_STOPS = -2.0
 #: Long edge of the probe's peak map, the RAW zebras' resolution.
@@ -59,12 +61,19 @@ class MeterReading:
     # The probe's picture at thumbnail size and its full shape, to check the preview frames it.
     thumb: np.ndarray | None = field(default=None, compare=False, repr=False)
     shape: tuple[int, int] | None = None
+    # The rebate ring read as light or as a clipped base, so the picture alone set the exposure.
+    ring_saturated: bool = False
+
+
+def gray_of(rgb: np.ndarray) -> np.ndarray:
+    """`rgb.mean(axis=2)` as float32 for an integer or float32 frame."""
+    return negpy_core.mean_channels(np.ascontiguousarray(rgb[..., :3], dtype=np.float32))
 
 
 def ranked_thumb(gray: np.ndarray) -> np.ndarray:
     """A picture at thumbnail size as zero-mean, unit-variance ranks: two thumbnails' mean product
     is their rank correlation, which no monotonic tone curve and no exposure change can move."""
-    small = cv2.resize(np.ascontiguousarray(gray, dtype=np.float32), _THUMB, interpolation=cv2.INTER_AREA).ravel()
+    small = negpy_core.resize_area(np.ascontiguousarray(gray, dtype=np.float32), _THUMB).ravel()
     ranks = np.argsort(np.argsort(small)).astype(np.float32)
     ranks -= ranks.mean()
     return ranks / max(float(ranks.std()), 1e-6)
@@ -80,19 +89,16 @@ def framing_mismatch(reading: MeterReading, preview: np.ndarray) -> str | None:
     vh, vw = preview.shape[:2]
     if abs((pw / ph) / (vw / vh) - 1.0) > ASPECT_TOLERANCE:
         return f"the preview is {vw}:{vh} and the RAW {pw}:{ph}"
-    if float(np.mean(ranked_thumb(preview.mean(axis=2)) * reading.thumb)) < SAME_FRAMING:
+    if float(np.mean(ranked_thumb(gray_of(preview)) * reading.thumb)) < SAME_FRAMING:
         return "the preview does not frame the RAW the same way"
     return None
 
 
-def _peak_map(brightest: np.ndarray) -> np.ndarray:
-    """Max-pool to a long edge of PEAK_MAP_EDGE. The frame is zero-padded to whole blocks, so
-    every pixel lands in a block and the edge blocks keep their own clips."""
-    h, w = brightest.shape
-    f = max(1, math.ceil(max(h, w) / PEAK_MAP_EDGE))
-    padded = np.pad(brightest, ((0, -h % f), (0, -w % f)))
-    hh, ww = padded.shape
-    return np.ascontiguousarray(padded.reshape(hh // f, f, ww // f, f).max(axis=(1, 3)))
+def _peak_map(linear: np.ndarray) -> np.ndarray:
+    """The brightest channel max-pooled to a long edge of PEAK_MAP_EDGE. The frame is zero-padded
+    to whole blocks, so every pixel lands in a block and the edge blocks keep their own clips."""
+    h, w = linear.shape[:2]
+    return negpy_core.peak_map(np.ascontiguousarray(linear, dtype=np.float32), max(1, math.ceil(max(h, w) / PEAK_MAP_EDGE)))
 
 
 def raw_clip_mask(reading: MeterReading) -> np.ndarray | None:
@@ -113,11 +119,16 @@ def shutter_at_most(seconds: float, candidates: tuple[str, ...]) -> str | None:
     return None
 
 
-def meter_frame(img: np.ndarray, shutter: str, candidates: tuple[str, ...] = (), medium: str | None = None) -> MeterReading:
+def meter_frame(
+    img: np.ndarray, shutter: str, candidates: tuple[str, ...] = (), medium: str | None = None, wb: list | None = None
+) -> MeterReading:
     """Meter one decoded linear probe (`HxWx3`, counts to `CLIP_CEILING`) shot at `shutter`.
-    `medium` is "negative" or "positive" from the preset, or None for the classifier's call."""
+    `medium` is "negative" or "positive" from the preset, or None for the classifier's call.
+    `wb` is the as-shot white balance the import applies to a white-light frame: the target
+    holds after its gain, while the clip test reads the sensor itself."""
     candidates = tuple(candidates) or SHUTTER_CANDIDATES
-    linear = np.clip(img.astype(np.float32) / CLIP_CEILING, 0.0, 1.0)
+    gain = np.asarray(wb, np.float32) / min(wb) if wb else np.ones(3, np.float32)
+    linear = negpy_core.normalized(np.ascontiguousarray(img), float(CLIP_CEILING))
     if medium is None:
         medium = "positive" if detect_process_mode(linear) == ProcessMode.E6 else "negative"
     det, scale = _normalize_detection_input(linear, AUTOCROP_DETECT_RES)
@@ -128,24 +139,29 @@ def meter_frame(img: np.ndarray, shutter: str, candidates: tuple[str, ...] = (),
     # The picture at the probe's own resolution: a highlight narrower than a detection pixel
     # is averaged away at detection size, and it still clips.
     ly1, ly2, lx1, lx2 = _scale_roi(gate, scale, linear.shape[0], linear.shape[1])
-    picture = linear[ly1:ly2, lx1:lx2].reshape(-1, 3)
-    frame_brightest = np.max(linear, axis=2)
-    brightest = frame_brightest[ly1:ly2, lx1:lx2]
-    clipped_fraction = float(np.mean(brightest >= _SATURATION))
+    clipped_fraction, blown, thin = negpy_core.meter_picture(linear, (ly1, ly2, lx1, lx2), _SATURATION, _BLOWN_SHARE)
+    thinnest = np.array(thin, dtype=np.float32)  # the picture's thin end, per channel
 
     ring = det[rebate_mask(det.shape[:2], film_roi, gate)]
+    # Only unclipped ring pixels are film: a gap, a sprocket hole and a clipped base all saturate.
+    film_ring = ring[ring.max(axis=1) < _SATURATION] if ring.size else ring
+    ring_saturated = medium == "negative" and bool(ring.size) and film_ring.shape[0] < 0.5 * ring.shape[0]
     # A negative's base is its thinnest film, so a ring darker than the picture is picture.
-    if medium == "negative" and ring.size and np.median(ring.mean(axis=1)) > np.median(picture_det.mean(axis=1)):
+    base_visible = (
+        medium == "negative"
+        and not ring_saturated
+        and bool(film_ring.size)
+        and np.median(film_ring.mean(axis=1)) > np.median(picture_det.mean(axis=1))
+    )
+    if base_visible:
         region = "base"
-        levels = np.median(ring, axis=0)
-        clipped = float(levels.max()) >= _SATURATION
+        # A ring that is half holder reads under the base, so the base never sets a level under the thin end.
+        levels = np.maximum(np.median(film_ring, axis=0), thinnest)
     else:
         region = "highlights"
-        levels = np.percentile(picture, 99.9, axis=0)
-        # A saturated p99.9 is a lower bound, not a level: step down and meter again, so repeated
-        # probes converge on the same shutter whichever side of saturation a few pixels sit.
-        clipped = float(levels.max()) >= _SATURATION
-    measured = float(levels.max()) * CLIP_CEILING
+        levels = thinnest
+    clipped = blown or float(levels.max()) >= _SATURATION
+    measured = float((levels * gain).max()) * CLIP_CEILING
 
     probe_seconds = true_seconds(shutter, candidates)
     needed = CLIPPED_STEP_STOPS if clipped else float(np.log2(TARGET_FRACTION * CLIP_CEILING / max(measured, 1.0)))
@@ -154,7 +170,9 @@ def meter_frame(img: np.ndarray, shutter: str, candidates: tuple[str, ...] = (),
         # The step down passes the fastest rung, which is still a step down: take it and meter again.
         recommended = candidates[0]
     stops = float(np.log2(true_seconds(recommended, candidates) / probe_seconds)) if recommended else needed
-    peaks = _peak_map(frame_brightest)
-    thumb = ranked_thumb(np.mean(linear, axis=2))
+    peaks = _peak_map(linear)
+    thumb = ranked_thumb(gray_of(linear))
     shape = (int(linear.shape[0]), int(linear.shape[1]))
-    return MeterReading(medium, region, measured, clipped, clipped_fraction, shutter, recommended, stops, peaks, thumb, shape)
+    return MeterReading(
+        medium, region, measured, clipped, clipped_fraction, shutter, recommended, stops, peaks, thumb, shape, ring_saturated=ring_saturated
+    )

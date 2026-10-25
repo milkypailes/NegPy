@@ -1,5 +1,6 @@
 from typing import Any, Dict, Optional
 
+import negpy_core
 import numpy as np
 
 from negpy.domain.interfaces import PipelineContext
@@ -10,6 +11,7 @@ from negpy.features.exposure.logic import (
     apply_characteristic_curve,
     apply_flat_curve,
     cast_solve_inputs,
+    contrast_mask_coeffs,
     contrast_mask_ev,
     effective_midtone_gamma,
     filtration_offsets,
@@ -23,8 +25,9 @@ from negpy.features.exposure.logic import (
     shadow_hold_offset,
     per_channel_curve_params,
 )
-from negpy.features.exposure.models import EXPOSURE_CONSTANTS, ExposureConfig, RenderIntent
-from negpy.features.exposure.papers import effective_paper_profile
+from negpy.features.exposure.bw_filter import BW_FILTER_WEIGHTS, collapse_matrix
+from negpy.features.exposure.models import EXPOSURE_CONSTANTS, BwFilter, ExposureConfig, RenderIntent
+from negpy.features.exposure.papers import effective_paper_profile, resolve_flat_matrix
 from negpy.features.exposure.placement import limited_mask_params
 from negpy.features.exposure.normalization import (
     LogNegativeBounds,
@@ -62,10 +65,9 @@ class NormalizationProcessor:
         self.config = config
 
     def process(self, image: ImageBuffer, context: PipelineContext) -> ImageBuffer:
-        epsilon = 1e-6
         # No upper clamp, mirroring normalization.wgsl, which clamps only the low side. Values
         # above 1.0 occur only with flat-field gain and must match the GPU.
-        img_log = np.log10(np.clip(np.nan_to_num(image, nan=epsilon, posinf=1.0, neginf=epsilon), epsilon, None))
+        img_log = negpy_core.log_density_open(np.ascontiguousarray(image, dtype=np.float32))
         # Shared prefilter, once for all five meters, with the ROI and buffer applied here. A
         # freehand analysis_rect overrides the crop ROI and centered buffer for the metered region.
         an_roi, an_buffer = resolve_analysis_region(
@@ -152,7 +154,9 @@ class NormalizationProcessor:
         res = normalize_log_image(img_log, bounds)
 
         # Neutral axis for the two-point Cast Removal gray balance. Colour only: B&W
-        # collapses to one density and has no channels to balance.
+        # collapses to one density and has no channels to balance. Published as None there,
+        # as the GPU does, so a merged metrics dict drops the last colour render's axis.
+        context.metrics["neutral_axis_refs"] = None
         if context.process_mode != ProcessMode.BW:
             own = measure_neutral_axis_from_log(prefiltered, pre_trim_bounds, None, 0.0)
             pooled = pooled_neutral_axis(self.config)
@@ -190,9 +194,11 @@ class PhotometricProcessor:
         self,
         config: ExposureConfig,
         local_config: Optional[LocalAdjustmentsConfig] = None,
+        bw_weights: tuple[float, float, float] = BW_FILTER_WEIGHTS[BwFilter.NONE],
     ):
         self.config = config
         self.local_config = local_config
+        self.bw_weights = bw_weights
 
     def _build_local_maps(self, image: ImageBuffer, context: PipelineContext) -> Optional[np.ndarray]:
         if self.local_config is None or not self.local_config.masks:
@@ -227,6 +233,7 @@ class PhotometricProcessor:
             context.metrics.get("neutral_axis_refs"),
             self.config.cast_removal_strength,
         )
+        mg = effective_midtone_gamma(paper, self.config.midtone_gamma)
         slopes, pivots, curvatures = per_channel_curve_params(
             self.config.grade,
             self.config.density,
@@ -240,19 +247,27 @@ class PhotometricProcessor:
             neutral_axis_norm=neutral_axis_norm,
             grade_trims=(self.config.grade_trim_red, self.config.grade_trim_green, self.config.grade_trim_blue),
             shadow_point=context.metrics.get("shadow_point"),
+            midtone_gamma=mg,
         )
         context.metrics["print_slopes"] = slopes
         hl_point = context.metrics.get("highlight_point")
         hl_auto = (
             highlight_hold_offset(
-                slopes[1], pivots[1], hl_point, d_min=d_min, paper=paper, preflash=self.config.preflash, grade=self.config.grade
+                slopes[1],
+                pivots[1],
+                hl_point,
+                d_min=d_min,
+                paper=paper,
+                preflash=self.config.preflash,
+                grade=self.config.grade,
+                midtone_gamma=mg,
             )
             if self.config.auto_normalize_contrast and hl_point is not None
             else 0.0
         )
         sh_point = context.metrics.get("shadow_point")
         sh_auto = (
-            shadow_hold_offset(slopes[1], pivots[1], sh_point, d_min=d_min, paper=paper)
+            shadow_hold_offset(slopes[1], pivots[1], sh_point, d_min=d_min, paper=paper, midtone_gamma=mg)
             if self.config.auto_normalize_contrast and sh_point is not None
             else 0.0
         )
@@ -292,29 +307,37 @@ class PhotometricProcessor:
         )
 
         if context.process_mode == ProcessMode.BW:
-            # Panchromatic response: collapse to a single density BEFORE the curve, so the curve
-            # shapes one channel instead of mixing three.
-            lum = get_luminance(image)
-            image = np.stack([lum, lum, lum], axis=-1)
+            # Collapse to a single density BEFORE the curve, so the curve shapes one channel
+            # instead of mixing three.
+            image = negpy_core.matmul_3x3(np.ascontiguousarray(image, dtype=np.float32), collapse_matrix(self.bw_weights))
 
         local_maps = self._build_local_maps(image, context)
-        ev_map = None if local_maps is None else np.ascontiguousarray(local_maps[:, :, 0])
+        if local_maps is not None:
+            local_maps = np.ascontiguousarray(local_maps, dtype=np.float32)
+        ev_map = None if local_maps is None else negpy_core.extract_channel(local_maps, 0)
         # The mask is a print-exposure input like a dodge, so it rides the same map.
+        mask_coeffs = contrast_mask_coeffs(
+            self.config.contrast_mask_strength,
+            context.metrics.get("contrast_mask_centre", 0.5),
+            slopes,
+            pivots,
+            cmy_offsets,
+            lum_range or 0.0,
+        )
         mask_ev = contrast_mask_ev(
             context.metrics.get("contrast_mask_plane"),
-            self.config.contrast_mask,
-            lum_range if lum_range else 1.0,
+            mask_coeffs,
             image.shape[:2],
             context.metrics.get("contrast_mask_roi"),
         )
         if mask_ev is not None:
-            ev_map = mask_ev if ev_map is None else np.ascontiguousarray(ev_map + mask_ev)
+            ev_map = mask_ev if ev_map is None else negpy_core.add(ev_map, mask_ev)
         grade_map = None
-        if local_maps is not None and local_maps[:, :, 1].any():
-            grade_map = local_grade_factor_map(np.ascontiguousarray(local_maps[:, :, 1]), self.config.grade)
+        if local_maps is not None and negpy_core.channel_any(local_maps, 1):
+            grade_map = local_grade_factor_map(negpy_core.extract_channel(local_maps, 1), self.config.grade)
         flash_map = None
-        if local_maps is not None and local_maps[:, :, 2].any():
-            flash_map = np.ascontiguousarray(local_maps[:, :, 2])
+        if local_maps is not None and negpy_core.channel_any(local_maps, 2):
+            flash_map = negpy_core.extract_channel(local_maps, 2)
         diff_kw: Dict[str, Any] = {}
         diff_plane = context.metrics.get("diffusion_plane")
         if self.config.diffusion > 0.0 and diff_plane is not None:
@@ -376,7 +399,7 @@ class PhotometricProcessor:
             highlight_density=self.config.highlight_density + hl_auto,
             shadow_grade_deltas=sg_deltas,
             highlight_grade_deltas=hg_deltas,
-            # B&W collapses to luminance before this call, with all channels equal, so the matrix is
+            # B&W collapses to one density before this call, with all channels equal, so the matrix is
             # already a no-op there. Skip it explicitly anyway to avoid the wasted per-pixel 3x3
             # multiply.
             dye_separation=1.0 if context.process_mode == ProcessMode.BW else self.config.dye_separation,
@@ -396,9 +419,7 @@ class PhotometricProcessor:
         )
 
         if context.process_mode == ProcessMode.BW:
-            res = get_luminance(img_pos)
-            res = np.stack([res, res, res], axis=-1)
-            return res
+            return negpy_core.gray_to_rgb(get_luminance(img_pos))
 
         return img_pos
 
@@ -411,7 +432,7 @@ class PhotometricProcessor:
 
         Manual global white balance (the WB picker / CMY global) is still honoured
         because it is an explicit, per-roll-consistent user choice, not automatic
-        grading.
+        grading. So is a color print stock, as its density 3×3 (resolve_flat_matrix).
         """
         gain, lift = flat_curve_params()
 
@@ -423,13 +444,12 @@ class PhotometricProcessor:
         is_bw = context.process_mode == ProcessMode.BW
 
         if is_bw:
-            lum = get_luminance(image)
-            image = np.stack([lum, lum, lum], axis=-1)
+            image = negpy_core.matmul_3x3(np.ascontiguousarray(image, dtype=np.float32), collapse_matrix(self.bw_weights))
 
-        img_pos = apply_flat_curve(image, gain, lift, cmy_offsets=cmy_offsets)
+        stock_matrix = None if is_bw else resolve_flat_matrix(effective_paper_profile(self.config.paper_profile, context.process_mode))
+        img_pos = apply_flat_curve(image, gain, lift, cmy_offsets=cmy_offsets, stock_matrix=stock_matrix)
 
         if is_bw:
-            res = get_luminance(img_pos)
-            return np.stack([res, res, res], axis=-1)
+            return negpy_core.gray_to_rgb(get_luminance(img_pos))
 
         return img_pos

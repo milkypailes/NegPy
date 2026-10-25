@@ -47,7 +47,7 @@ def _band_frame(fill: list[tuple[float, float, float]]) -> tuple[np.ndarray, np.
 
 def test_the_largest_flat_group_is_the_base():
     """A flat sliver of bare light, brighter than the rebate, is the smaller group."""
-    from negpy.features.exposure.normalization import _base_blocks
+    from negpy_core import base_blocks as _base_blocks
 
     det, band = _band_frame([(0.84, 0.002, 0.30), (0.47, 0.004, 0.70)])
 
@@ -58,7 +58,7 @@ def test_the_largest_flat_group_is_the_base():
 
 
 def test_clipped_light_is_never_the_base():
-    from negpy.features.exposure.normalization import _base_blocks
+    from negpy_core import base_blocks as _base_blocks
 
     det, band = _band_frame([(0.995, 0.001, 0.70), (0.60, 0.004, 0.30)])  # holes at sensor white
 
@@ -69,7 +69,7 @@ def test_clipped_light_is_never_the_base():
 
 
 def test_a_band_with_no_flat_film_reads_nothing():
-    from negpy.features.exposure.normalization import _base_blocks
+    from negpy_core import base_blocks as _base_blocks
 
     det, band = _band_frame([(0.5, 0.2, 1.0)])  # texture everywhere, no flat block
 
@@ -132,12 +132,12 @@ def test_a_process_change_reuses_the_base(monkeypatch):
     """The base depends on the source and its geometry only, so a Crosstalk drag pays nothing."""
     from dataclasses import replace
 
-    from negpy.services.rendering import engine as engine_module
+    from negpy.services.rendering import base_read
     from negpy.services.rendering.engine import DarkroomEngine
 
     calls: list[int] = []
-    real = engine_module.measure_base_log
-    monkeypatch.setattr(engine_module, "measure_base_log", lambda image: calls.append(1) or real(image))
+    real = base_read.measure_base_log
+    monkeypatch.setattr(base_read, "measure_base_log", lambda image: calls.append(1) or real(image))
     img, cfg = _negative(), WorkspaceConfig()
     engine = DarkroomEngine()
     first = PipelineContext(scale_factor=1.0, original_size=(900, 600), process_mode=ProcessMode.C41)
@@ -161,22 +161,22 @@ def test_the_negative_row_carries_the_densities_on_hover():
     rows = negative_statistics(1.26, 0.5, 0.0, 0.0, density_above_base=(0.22, 0.71, 1.42), base_source="read")
 
     assert rows[0].name == "Negative"
-    assert rows[0].value == "1.26 · normal"
-    assert rows[0].detail.startswith("Above the clear base read from the rebate: Dmax 1.42 · Dmed 0.71 · Dmin 0.22")
+    assert rows[0].value == "Δ1.26"
+    assert rows[0].detail.startswith("Normal negative. Above the clear base read from the rebate: Dmax 1.42 · Dmed 0.71 · Dmin 0.22")
     assert "Film Base tool pins it" in rows[0].detail
 
 
 def test_a_picked_base_is_named_as_such_without_the_reader_caveat():
     rows = negative_statistics(1.26, 0.5, 0.0, 0.0, density_above_base=(0.22, 0.71, 1.42), base_source="picked")
 
-    assert rows[0].detail.startswith("Above the film base set on the roll: Dmax 1.42")
+    assert "Above the film base set on the roll: Dmax 1.42" in rows[0].detail
     assert "Film Base tool pins it" not in rows[0].detail
 
 
 def test_a_scan_with_no_base_says_so():
     rows = negative_statistics(1.26, 0.5, 0.0, 0.0, density_above_base=None)
 
-    assert rows[0].detail.startswith("Dmax, Dmed and Dmin need the roll's film base.")
+    assert "Dmax, Dmed and Dmin need the roll's film base." in rows[0].detail
 
 
 def test_the_hover_shows_the_detail_under_the_fixed_text(qapp):
@@ -186,7 +186,7 @@ def test_the_hover_shows_the_detail_under_the_fixed_text(qapp):
     widget.update_stats([StatRow("Negative", "1.26 · normal", detail="Above the clear base: Dmax 1.42 · Dmed 0.71 · Dmin 0.22.")])
 
     tip = widget._values[0].toolTip()
-    assert tip.index("development character") < tip.index("Dmax 1.42")
+    assert tip.index("How contrasty the negative is") < tip.index("Dmax 1.42")
 
 
 def test_both_engines_record_the_same_densities():

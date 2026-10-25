@@ -13,7 +13,6 @@ from PyQt6.QtGui import QFont, QFontMetrics
 from PyQt6.QtWidgets import (
     QDialog,
     QHBoxLayout,
-    QLabel,
     QLineEdit,
     QProgressBar,
     QPushButton,
@@ -22,23 +21,27 @@ from PyQt6.QtWidgets import (
 
 from negpy.desktop.view.sidebar.live_view_window import SettingStepper
 from negpy.desktop.view.sidebar.roi_image import RoiImageLabel
-from negpy.desktop.view.styles.templates import hint_label, labeled_action, labeled_toggle
+from negpy.desktop.view.styles.templates import field_row, hint_label, labeled_action, labeled_toggle, pin_dialog_default
 from negpy.desktop.view.styles.theme import THEME
-from negpy.desktop.view.widgets.choice_button import ChoiceButton
+from negpy.desktop.view.widgets.step_combo import StepCombo
 from negpy.desktop.view.widgets.dialog_geometry import remember_dialog_geometry
 from negpy.desktop.view.widgets.floating_panel import float_over_app
 
 # The index is the preset's `single_capture` flag.
-CAPTURE_MODES = (("", tr("Triplet")), ("", tr("Single Capture")))
+CAPTURE_MODES = (tr("Trichrome"), tr("Single Exposure"))
 CAPTURE_MODE_TOOLTIP = tr(
-    "Triplet takes one exposure per LED and merges them. Single Capture takes one exposure with red, green and blue lit together."
+    "Trichrome merges one exposure per LED, and Single Exposure takes one exposure with red, green and blue lit together."
 )
 
 
-SENSOR_PROFILE_TOOLTIP = tr(
-    "Also save a sensor profile under the preset's name, measured from the same exposures. "
-    "A roll scanned with the preset takes the profile. Single Capture only."
+# The patch is small, so any clear base serves; a holder that hides the rebate still shows the leader.
+_GUIDE = tr(
+    "Click a patch of clear film base: the gap between frames, the leader or a blank frame. Name the stock, then "
+    "Calibrate & Save. The shutter is solved here, so set the ISO and aperture you scan with."
 )
+_SENSOR_PROFILE_OFF_TOOLTIP = tr("Single Exposure only: a Trichrome triplet reads each LED alone and has no sensor mixing to unmix.")
+
+SENSOR_PROFILE_TOOLTIP = tr("Single Exposure only: also save a sensor crosstalk profile for this preset, from the same exposures.")
 
 
 def _reserve_checked_width(btn: QPushButton) -> None:
@@ -65,23 +68,22 @@ class CalibrationWindow(QDialog):
         self.resize(820, 680)
         layout = QVBoxLayout(self)
 
-        name_row = QHBoxLayout()
-        name_row.addWidget(QLabel(tr("Film stock")))
         self.name_edit = QLineEdit()
         self.name_edit.setPlaceholderText(tr("e.g. Portra 400"))
-        name_row.addWidget(self.name_edit, 1)
+        self.name_edit.setToolTip(tr("The name of the film stock, which is also the name of the new preset."))
+        name_row = field_row(tr("Film stock"), self.name_edit)
         self._running = False
-        self.capture_btn = ChoiceButton(CAPTURE_MODES, CAPTURE_MODE_TOOLTIP)
+        self.capture_btn = StepCombo.of(CAPTURE_MODES, CAPTURE_MODE_TOOLTIP)
         name_row.addWidget(self.capture_btn)
-        self._sensor_profile_wanted = True  # the operator's pick, kept while Triplet shows the toggle off
-        self.sensor_profile_btn = labeled_toggle("fa5s.vials", tr(" Create Sensor Profile"), True, SENSOR_PROFILE_TOOLTIP)
+        self._sensor_profile_wanted = True  # the operator's pick, kept while Trichrome shows the toggle off
+        self.sensor_profile_btn = labeled_toggle("fa5s.vials", tr("Create Sensor Crosstalk Profile"), True, SENSOR_PROFILE_TOOLTIP)
         _reserve_checked_width(self.sensor_profile_btn)
         self.sensor_profile_btn.clicked.connect(self._on_sensor_profile_clicked)
-        self.capture_btn.currentChanged.connect(lambda _i: self._sync_sensor_profile())
+        self.capture_btn.currentIndexChanged.connect(lambda _i: self._sync_sensor_profile())
         name_row.addWidget(self.sensor_profile_btn)
         self._sync_sensor_profile()
         self.calibrate_btn = labeled_action(
-            "fa5s.crosshairs", tr(" Calibrate && Save"), tr("Meter the clicked film base and save the result as this preset")
+            "fa5s.crosshairs", tr("Calibrate && Save"), tr("Meter the clicked film base and save the result as this preset"), primary=True
         )
         name_row.addWidget(self.calibrate_btn)
         layout.addLayout(name_row)
@@ -97,21 +99,21 @@ class CalibrationWindow(QDialog):
         self.iso_stepper = SettingStepper()
         self.aperture_stepper = SettingStepper()
         for tag_text, stepper, tip in (
-            ("ISO", self.iso_stepper, tr("ISO — use what you will scan with")),
+            ("ISO", self.iso_stepper, tr("ISO: use the one you will scan with")),
             (tr("Aperture"), self.aperture_stepper, tr("Aperture (needs an electronically controlled lens)")),
         ):
             tag = hint_label(tag_text)
             tag.setAlignment(Qt.AlignmentFlag.AlignHCenter)
             stepper.setToolTip(tip)
             col = QVBoxLayout()
-            col.setSpacing(2)
+            col.setSpacing(THEME.space_xs)
             col.addWidget(tag)
             col.addWidget(stepper)
             settings_row.addLayout(col, 1)
         layout.addLayout(settings_row)
 
         self.consistency_hint = hint_label(
-            tr("Set the ISO and aperture you'll scan with. Changing either afterwards throws off every scan made with this preset."),
+            tr("Set the ISO and aperture that you scan with. A later change to either one makes every scan from this preset wrong."),
             "warning",
         )
         layout.addWidget(self.consistency_hint)
@@ -121,11 +123,12 @@ class CalibrationWindow(QDialog):
         self.progress.setVisible(False)
         layout.addWidget(self.progress)
 
-        self.status = hint_label(tr("Click the clear film base (crosshair), name the stock, then Calibrate & Save"))
+        self.status = hint_label(_GUIDE)
         layout.addWidget(self.status)
 
         self._running = False
         self.calibrate_btn.clicked.connect(self._emit_calibrate)
+        pin_dialog_default(self.calibrate_btn, scope=self)
         remember_dialog_geometry(self, repo, "scanlight_calibration")
 
     def _emit_calibrate(self) -> None:
@@ -138,14 +141,15 @@ class CalibrationWindow(QDialog):
         single = self.capture_btn.currentIndex() == 1
         self.sensor_profile_btn.setChecked(single and self._sensor_profile_wanted)
         self.sensor_profile_btn.setEnabled(single and not self._running)
+        self.sensor_profile_btn.setToolTip(SENSOR_PROFILE_TOOLTIP if single else _SENSOR_PROFILE_OFF_TOOLTIP)
 
     def wants_sensor_profile(self) -> bool:
-        """Whether a finished run saves a sensor profile with the preset."""
+        """Whether a finished run saves a sensor crosstalk profile with the preset."""
         return self.capture_btn.currentIndex() == 1 and self._sensor_profile_wanted
 
     def set_inputs_locked(self, locked: bool) -> None:
         """Freeze the calibration inputs while a run is in progress: film-stock name, capture mode,
-        Create Sensor Profile toggle, base ROI (a click must not move the patch being metered) and the
+        Create Sensor Crosstalk Profile toggle, base ROI (a click must not move the patch being metered) and the
         base ISO/aperture. Re-enabled at any terminal outcome so a failed run can be retried."""
         self._running = locked
         self.name_edit.setEnabled(not locked)
@@ -172,7 +176,7 @@ class CalibrationWindow(QDialog):
         self.image.clear_frame()
         self.image.set_loading(True)
         self.progress.setVisible(False)
-        self.set_status(tr("Click the clear film base (crosshair), name the stock, then Calibrate & Save"))
+        self.set_status(_GUIDE)
         self.show()
         self.raise_()
 

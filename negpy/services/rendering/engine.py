@@ -19,6 +19,7 @@ from negpy.features.exposure.processor import (
     NormalizationProcessor,
     PhotometricProcessor,
 )
+from negpy.features.exposure.bw_filter import collapse_weights, plane_weights, printed_exposure
 from negpy.features.exposure.logic import expand_mask_plane
 from negpy.features.exposure.normalization import (
     contrast_mask_plane,
@@ -27,11 +28,9 @@ from negpy.features.exposure.normalization import (
     base_scan_density,
     effective_crosstalk_matrix,
     geometry_kwargs,
-    measure_base_log,
     normalized_roi,
 )
 from negpy.features.process.hue import apply_hue_trim
-from negpy.features.process.models import ProcessMode
 from negpy.features.process.path import RenderPath, render_path
 from negpy.features.transparency.processor import TransferProcessor, TransparencyBaseProcessor
 from negpy.features.exposure.papers import effective_paper_profile
@@ -44,6 +43,8 @@ from negpy.features.lab.processor import PhotoLabProcessor
 from negpy.features.finish.processor import FinishProcessor, rebate_tone
 from negpy.kernel.system.config import APP_CONFIG, render_scale_factor
 from negpy.services.view.coordinate_mapping import CoordinateMapping
+from negpy.kernel.system import timing
+from negpy.services.rendering.base_read import base_log_for
 
 logger = get_logger(__name__)
 
@@ -58,7 +59,9 @@ def base_processor(settings: WorkspaceConfig) -> Any:
 def exposure_processor(settings: WorkspaceConfig) -> Any:
     """The exposure stage's curve: the print or a slide's transfer, or the Flat master on either base."""
     if settings.exposure.render_intent == RenderIntent.FLAT or render_path(settings.process) is RenderPath.PRINT:
-        return PhotometricProcessor(settings.exposure, settings.local)
+        return PhotometricProcessor(
+            printed_exposure(settings.process, settings.exposure), settings.local, collapse_weights(settings.process, settings.exposure)
+        )
     return TransferProcessor(settings.exposure, settings.process.positive_source)
 
 
@@ -125,14 +128,13 @@ class DarkroomEngine:
 
     def _source_base_log(self, img_in: ImageBuffer, ctx: PipelineContext) -> Optional[tuple]:
         """The clear base in raw log: the roll's picked one (the Film Base tool) wins, else the
-        rebate read, measured once per source before geometry."""
+        source's rebate read, which `run_pipeline` takes before the defect repairs."""
         picked = ctx.metrics.get("film_base")
         if picked is not None:
             return tuple(picked)
-        if not self.cache.base_measured:
-            self.cache.base_log = measure_base_log(img_in)
-            self.cache.base_measured = True
-        return self.cache.base_log
+        if "source_base_log" in ctx.metrics:
+            return ctx.metrics["source_base_log"]
+        return base_log_for(self.cache.source_hash, img_in)
 
     def process(
         self,
@@ -246,6 +248,7 @@ class DarkroomEngine:
             exposure_models.TARGETS_REVISION,
         )
         current_img, pipeline_changed = self._run_stage(current_img, base_key, "base", run_base, context, pipeline_changed)
+        timing.lap("geometry/normalize")
         # Outside the cached stage: a drag renders without readback, so a cache entry it made holds no base.
         if context.cache_stages and context.readback_metrics:
             context.metrics["film_base_density"] = (
@@ -259,26 +262,35 @@ class DarkroomEngine:
         # Built from the source and keyed on base, so the GPU calls the same helper and the slider re-runs only exposure.
         # Pre-trim bounds, as on the GPU: White/Black Point trims are a look, not the source.
         mask_bounds = context.metrics.get("pre_trim_bounds", context.metrics.get("final_bounds"))
-        if settings.exposure.contrast_mask != 0.0 and mask_bounds is not None:
+        # Print curve only, as Diffusion: the transfer curve and the Flat master take no plane.
+        if (
+            settings.exposure.contrast_mask_strength > 0.0
+            and mask_bounds is not None
+            and render_path(settings.process) is RenderPath.PRINT
+            and settings.exposure.render_intent != RenderIntent.FLAT
+        ):
             mask_roi = context.active_roi
-            mask_key = (source_hash, calculate_config_hash(base_key), mask_roi, current_img.shape[:2], settings.exposure.mask_spacer)
+            bw_weights = plane_weights(settings.process, settings.exposure)
+            mask_key = (source_hash, calculate_config_hash(base_key), mask_roi, current_img.shape[:2], bw_weights)
             if self._mask_plane is None or self._mask_plane[0] != mask_key:
                 plane, centre = contrast_mask_plane(
                     img,
                     mask_bounds,
                     effective_crosstalk_matrix(settings.process, settings.process.process_mode),
                     roi_norm=normalized_roi(mask_roi, current_img.shape[:2]),
-                    spacer=settings.exposure.mask_spacer,
+                    bw_weights=bw_weights,
                     **geometry_kwargs(settings.geometry, distortion_k1),
                 )
                 # Expanded here, not in the exposure stage: the slider re-runs that stage,
-                # and only the scalar moves with it.
+                # and only the coefficients move with it.
                 expanded = expand_mask_plane(plane, current_img.shape[:2], mask_roi)
                 self._mask_plane = None if expanded is None else (mask_key, expanded, centre)
             if self._mask_plane is not None:
                 context.metrics["contrast_mask_plane"] = self._mask_plane[1]
                 context.metrics["contrast_mask_centre"] = self._mask_plane[2]
                 context.metrics["contrast_mask_roi"] = None
+
+        timing.lap("contrast mask")
 
         # Same recipe as the mask plane, in the print's own normalization, so the kernel mixes it with the pixel as light.
         # Print curve only: the transfer curve and the Flat master take no plane.
@@ -290,13 +302,13 @@ class DarkroomEngine:
             and settings.exposure.render_intent != RenderIntent.FLAT
         ):
             diff_roi = context.active_roi
-            panchromatic = settings.process.process_mode == ProcessMode.BW
+            diff_weights = plane_weights(settings.process, settings.exposure)
             diff_key = (
                 source_hash,
                 calculate_config_hash(base_key),
                 diff_roi,
                 current_img.shape[:2],
-                panchromatic,
+                diff_weights,
             )
             # A None plane (an unmetered frame) is cached under its key like any other.
             cached = self._diffusion_plane
@@ -307,12 +319,13 @@ class DarkroomEngine:
                     roi_norm=normalized_roi(diff_roi, current_img.shape[:2]),
                     **geometry_kwargs(settings.geometry, distortion_k1),
                 )
-                plane = diffusion_plane(grid, diff_bounds, panchromatic)
+                plane = diffusion_plane(grid, diff_bounds, diff_weights)
                 cached = (diff_key, plane)
                 self._diffusion_plane = cached
             if cached[1] is not None:
                 context.metrics["diffusion_plane"] = cached[1]
                 context.metrics["diffusion_roi"] = diff_roi
+        timing.lap("diffusion")
 
         def run_exposure(img_in: ImageBuffer, ctx: PipelineContext) -> ImageBuffer:
             img_out = exposure_processor(settings).process(img_in, ctx)
@@ -325,12 +338,18 @@ class DarkroomEngine:
         # edit to either re-runs just the final stages.
         current_img, pipeline_changed = self._run_stage(
             current_img,
-            (without_curves(without_levels(settings.exposure)), settings.local, settings.process.hue_trim),
+            (
+                without_curves(without_levels(settings.exposure)),
+                settings.local,
+                settings.process.hue_trim,
+                collapse_weights(settings.process, settings.exposure),
+            ),
             "exposure",
             run_exposure,
             context,
             pipeline_changed,
         )
+        timing.lap("exposure")
 
         # Flat (digital-intermediate) master: keep only geometry and the mask-neutralized
         # inversion, then crop. The creative stages (lab, local, toning, finish) are bypassed, so
@@ -352,16 +371,20 @@ class DarkroomEngine:
                 context,
                 pipeline_changed,
             )
+            timing.lap("CLAHE")
 
             def run_lab(img_in: ImageBuffer, ctx: PipelineContext) -> ImageBuffer:
                 return PhotoLabProcessor(settings.lab).process(img_in, ctx)
 
             current_img, pipeline_changed = self._run_stage(current_img, settings.lab, "lab", run_lab, context, pipeline_changed)
+            timing.lap("lab")
 
             current_img = print_stages(settings, current_img, context)
+            timing.lap("alt process/toning")
 
         if not context.crop_preview_full:
             current_img = CropProcessor(settings.geometry).process(current_img, context)
+        timing.lap("crop")
 
         if not flat_intent:
             from negpy.services.export.print import PrintService
@@ -392,6 +415,7 @@ class DarkroomEngine:
                     context.metrics["curves_input_histogram"] = pre_curves
             if curves_active(settings.exposure):
                 current_img = apply_curves(current_img, settings.exposure)
+        timing.lap("finish/output encode")
 
         # No paper layout runs here, so the whole buffer is the picture. Reported rather
         # than left out: the controller merges each render's metrics into last_metrics, so
@@ -416,5 +440,6 @@ class DarkroomEngine:
                 context.metrics["uv_grid"] = uv_grid
             except Exception as e:
                 logger.error(f"Failed to generate UV grid: {e}")
+        timing.lap("UV grid")
 
         return current_img

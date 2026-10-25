@@ -1,20 +1,20 @@
+import math
 from typing import Any, Dict, Optional, Tuple
 
-import cv2
+import negpy_core
 import numpy as np
-from numba import njit, prange  # type: ignore
 
-from negpy.domain.types import LUMA_B, LUMA_G, LUMA_R, ImageBuffer
+from negpy.domain.types import ImageBuffer
 from negpy.features.exposure.papers import (
     PaperProfile,
     compose_density_matrices,
     effective_constants,
     resolve_print_color,
     resolve_saturation_matrix,
+    slope_gain,
 )
-from negpy.features.exposure.print_lut import lut_black_luminance, tetra_lookup
+from negpy.features.exposure.print_lut import lut_black_luminance
 from negpy.kernel.image.validation import ensure_image
-from negpy.kernel.system.parallel import parallel_njit
 
 
 def _expit(x: Any) -> Any:
@@ -25,36 +25,12 @@ def _expit(x: Any) -> Any:
     return np.exp(-np.logaddexp(0.0, -x))
 
 
-@njit(inline="always")
 def _fast_sigmoid(x: float) -> float:
-    """
-    Fast implementation of the logistic sigmoid function.
-    expit(x) = 1 / (1 + exp(-x))
-    """
+    """The logistic sigmoid 1 / (1 + exp(-x)), overflow-safe for large |x|."""
     if x >= 0:
-        z = np.exp(-x)
-        return float(1.0 / (1.0 + z))
-    else:
-        z = np.exp(x)
-        return float(z / (1.0 + z))
-
-
-@njit(inline="always")
-def _black_hold(v: float, d_max_eff: float, taper: float) -> float:
-    """Hold Black's weight on a shadow lift: 1 below `taper` under paper black, smoothstep to 0 at it.
-    Falls only where the lift is negative, so the lifted curve gets steeper and stays monotone."""
-    t = min(max((d_max_eff - v) / taper, 0.0), 1.0)
-    return t * t * (3.0 - 2.0 * t)
-
-
-@njit(inline="always")
-def _softplus(x: float) -> float:
-    """
-    Numerically stable softplus: log(1 + exp(x)). Antiderivative of the sigmoid.
-    """
-    if x > 0:
-        return float(x + np.log1p(np.exp(-x)))
-    return float(np.log1p(np.exp(x)))
+        return 1.0 / (1.0 + math.exp(-x))
+    z = math.exp(x)
+    return z / (1.0 + z)
 
 
 def _inv_softplus_np(y: Any) -> Any:
@@ -62,7 +38,6 @@ def _inv_softplus_np(y: Any) -> Any:
     return np.where(y > 20.0, y, np.log(np.expm1(np.maximum(y, 1e-12))))
 
 
-@njit(inline="always")
 def separation_damping_gain(k: float, damping: float, chroma: float, ref_spread: float) -> float:
     """
     One pixel's effective dye-separation k: the frame-wide k tapered by the
@@ -73,7 +48,7 @@ def separation_damping_gain(k: float, damping: float, chroma: float, ref_spread:
     frame-wide matrix cannot do. Monotone in chroma for k < e**2; the clamp
     bounds the k -> 0 corner (weakly monotone, so no rank swap).
 
-    Single source for the CPU kernel and the tests; exposure.wgsl mirrors it.
+    negpy_core's print curve and exposure.wgsl mirror it.
     """
     if k <= 0.0:
         return 0.0
@@ -84,347 +59,17 @@ def separation_damping_gain(k: float, damping: float, chroma: float, ref_spread:
     return float(kf)
 
 
-def separation_damping_gain_np(k: float, damping: float, chroma: Any, ref_spread: float) -> Any:
-    """Vectorized numpy twin of separation_damping_gain, for the transfer curve's
-    per-pixel gain over a whole image rather than the numba kernel's per-pixel scalar.
-    Same math; see that function for the derivation."""
-    if k <= 0.0:
-        return np.zeros_like(chroma, dtype=np.float32)
-    h = (np.float32(ref_spread) - chroma) / (np.float32(ref_spread) + chroma)
-    kf = np.power(np.float32(k), (1.0 - np.float32(damping)) + np.float32(damping) * h, dtype=np.float32)
-    return np.minimum(kf, np.float32(3.0))
-
-
-@njit(inline="always")
-def plane_taps(gh: int, gw: int, x: int, y: int, rect_x: float, rect_y: float, rect_w: float, rect_h: float):
-    """Taps and weights of render pixel (x, y) on a gh×gw analysis-grid plane covering `rect`: OpenCV's half-pixel
-    bilinear, taps clamped (edge replication outside the frame). exposure.wgsl mirrors this."""
-    px = (x + 0.5 - rect_x) * gw / rect_w - 0.5
-    py = (y + 0.5 - rect_y) * gh / rect_h - 0.5
-    lx = min(max(np.floor(px), 0.0), gw - 1.0)
-    ly = min(max(np.floor(py), 0.0), gh - 1.0)
-    hx = min(lx + 1.0, gw - 1.0)
-    hy = min(ly + 1.0, gh - 1.0)
-    fx = min(max(px - lx, 0.0), 1.0)
-    fy = min(max(py - ly, 0.0), 1.0)
-    return int(lx), int(hx), int(ly), int(hy), fx, fy
-
-
-@njit(inline="always")
-def tone_key_weight(lum: float, e0: float, e1: float) -> float:
-    """A tone-limited mask's weight at luma `lum`: a smoothstep from 0 at e0 to 1 at e1
-    (see placement.key_edges). Either edge order works. exposure.wgsl mirrors it."""
-    t = (lum - e0) / (e1 - e0)
-    if t < 0.0:
-        t = 0.0
-    elif t > 1.0:
-        t = 1.0
-    return t * t * (3.0 - 2.0 * t)
-
-
-@njit(inline="always")
-def quadratic_core(k: float, pivot: float, curv: float, u: float) -> float:
-    """k*(u - pivot) + curv*u², held at its vertex on the side where it would fold back.
-    The Cast Removal clamp bounds curv only near the frame's range. exposure.wgsl mirrors it."""
-    if curv != 0.0:
-        vertex = -k / (2.0 * curv)
-        if (curv > 0.0 and u < vertex) or (curv < 0.0 and u > vertex):
-            u = vertex
-    return k * (u - pivot) + curv * u * u
-
-
 def tone_key_weight_np(lum: Any, e0: float, e1: float) -> Any:
-    """Vectorized numpy twin of tone_key_weight, for the canvas tint over a whole raster."""
+    """A tone-limited mask's weight at luma `lum`, over a whole raster: a smoothstep from 0 at e0
+    to 1 at e1 (see placement.key_edges). The print curve in negpy_core and exposure.wgsl mirror it."""
     t = np.clip((np.asarray(lum, dtype=np.float32) - np.float32(e0)) / np.float32(e1 - e0), 0.0, 1.0)
     return t * t * (np.float32(3.0) - np.float32(2.0) * t)
-
-
-@parallel_njit(cache=True, fastmath=True)
-def _apply_print_curve_kernel(
-    img: np.ndarray,
-    pivots: np.ndarray,
-    slopes: np.ndarray,
-    curvatures: np.ndarray,
-    toe: np.ndarray,
-    shoulder: np.ndarray,
-    toe_width: np.ndarray,
-    shoulder_width: np.ndarray,
-    cmy_offsets: np.ndarray,
-    shadow_cmy: np.ndarray,
-    highlight_cmy: np.ndarray,
-    d_min_rgb: np.ndarray,
-    d_max: float,
-    a_toe_base: float,
-    a_sh_base: float,
-    width_ref: float,
-    toe_height: float,
-    sh_height: float,
-    zone_center: float,
-    shadow_density: float,
-    highlight_density: float,
-    shadow_grade: np.ndarray,
-    highlight_grade: np.ndarray,
-    zone_sh_center: float,
-    zone_hi_center: float,
-    zone_k: float,
-    v_star: float,
-    midtone_gamma: np.ndarray,
-    gamma_width: float,
-    dye_mix: np.ndarray,
-    use_dye_mix: bool,
-    sep_k3: np.ndarray,
-    sep_damping: float,
-    sep_ref: float,
-    use_sep_damping: bool,
-    ev_map: np.ndarray,
-    ev_scale: np.ndarray,
-    use_ev: bool,
-    grade_map: np.ndarray,
-    use_grade: bool,
-    key_alpha: np.ndarray,
-    key_params: np.ndarray,
-    use_key: bool,
-    grade_deltas: np.ndarray,
-    r0: float,
-    r_min: float,
-    r_max: float,
-    flash: float,
-    flash_v: float,
-    flash_gamma: float,
-    flash_map: np.ndarray,
-    use_flash: bool,
-    diff_plane: np.ndarray,
-    diff_rect: np.ndarray,
-    diff_mix: float,
-    diff_range: np.ndarray,
-    use_diff: bool,
-    lut: np.ndarray,
-    lut_e_max: np.ndarray,
-    lut_black: float,
-    use_lut: bool,
-    bpc: bool = False,
-    black_hold: float = 0.0,
-) -> np.ndarray:
-    """
-    Asymmetric H&D print curve: a straight line of slope `slope` through the
-    exposure pivot, smoothly bounded above by the toe (shadows -> paper black
-    d_max) and below by the shoulder (highlights -> paper white d_min). Toe and
-    shoulder are independent softplus bounds, so the `toe` slider shapes only
-    shadows and `shoulder` only highlights (film/print convention). `toe`/`shoulder`
-    are per-channel 3-arrays (global value + per-layer trims — endpoint crossover),
-    pre-scaled by toe_shoulder_strength.
-
-    d_min_rgb: per-channel paper-white floor (base+fog incl. tint). dye_mix:
-    dye coupling above that floor (D_rgb = M · D_dye) when use_dye_mix is set.
-    ev_map/ev_scale: per-pixel dodge/burn print-exposure offset (stops × the
-    normalized-space stop size, positive = burn) when use_ev is set; same domain as
-    cmy_offsets.
-    grade_map: per-pixel slope multiplier (local_grade_factor_map) when use_grade
-    is set — burning or dodging through a harder/softer filter.
-    key_alpha/key_params: tone-limited masks when use_key is set (see
-    apply_characteristic_curve). Their grade adds to grade_deltas in ISO-R space about r0,
-    which then replaces grade_map.
-    flash/flash_v/flash_gamma: preflash as a fraction of the threshold exposure (see
-    preflash_value).
-
-    Output is linear reflectance (transmittance = 10^-D); the working-space OETF is
-    applied at the engine output, not here.
-
-    bpc: black point compensation — paper Dmax maps to display black (ICC
-    relative-colorimetric style).
-
-    lut/lut_e_max: the stock's LUT when use_lut is set; it replaces 10^-D on the density above
-    base, and BPC then maps the luminance lut_black to 0 for all channels alike.
-    """
-    h, w, c = img.shape
-    res = np.empty_like(img)
-    eps = 1e-6
-
-    # Roll-off sharpness from the width, so a larger width is gentler; the slider sets the
-    # height. toe = shadow (upper, paper-black) bound, shoulder = highlight (lower,
-    # paper-white) bound. a_toe_base/a_sh_base carry the sharpness.
-    a_hl = np.empty(3, dtype=np.float64)
-    a_sh = np.empty(3, dtype=np.float64)
-    d_min_eff = np.empty(3, dtype=np.float64)
-    d_max_eff = np.empty(3, dtype=np.float64)
-    bpc_black = np.empty(3, dtype=np.float64)
-    for ch in range(3):
-        a_hl[ch] = a_sh_base * width_ref / max(shoulder_width[ch], eps)
-        a_sh_w = a_toe_base * width_ref / max(toe_width[ch], eps)
-        t_ch = toe[ch]
-        if t_ch >= 0.0:
-            d_max_base = d_max - t_ch * toe_height
-            a_sh[ch] = a_sh_w
-        else:
-            # Negative toe tightens the shadow roll-off instead of extending d_max_eff past
-            # paper black, which has almost no visible effect.
-            d_max_base = d_max
-            a_sh[ch] = a_sh_w * (1.0 - t_ch * 4.0)
-        dmn = d_min_rgb[ch] + shoulder[ch] * sh_height
-        if dmn < 0.0:
-            dmn = 0.0
-        dmx = d_max_base
-        if dmx < dmn + 0.1:
-            dmx = dmn + 0.1
-        d_min_eff[ch] = dmn
-        d_max_eff[ch] = dmx
-        # BPC references the physical d_max, not d_max_eff, so toe lifts survive. A negative
-        # toe raises the clip point: the bound reaches d_max only asymptotically, so an exact
-        # 0 needs the clip inside the shadow range.
-        db = d_max
-        if t_ch < 0.0:
-            db = d_max + t_ch * toe_height
-        bpc_black[ch] = 10.0**-db
-
-    use_split = (
-        shadow_grade[0] != 0.0
-        or shadow_grade[1] != 0.0
-        or shadow_grade[2] != 0.0
-        or highlight_grade[0] != 0.0
-        or highlight_grade[1] != 0.0
-        or highlight_grade[2] != 0.0
-    )
-
-    # Rows are independent, so parallelise over y. `dens` is allocated per row, so each
-    # worker thread has its own scratch.
-    for y in prange(h):
-        dens = np.empty(3, dtype=np.float64)
-        for x in range(w):
-            gfac = 1.0
-            ev_px = 0.0
-            if use_key:
-                if use_ev:
-                    ev_px = ev_map[y, x]
-                # The unburned tone: no mask can move the pixels it selects.
-                lum = LUMA_R * img[y, x, 0] + LUMA_G * img[y, x, 1] + LUMA_B * img[y, x, 2]
-                dr = grade_deltas[y, x]
-                for k in range(key_params.shape[0]):
-                    a = key_alpha[y, x, k] * tone_key_weight(lum, key_params[k, 2], key_params[k, 3])
-                    ev_px += key_params[k, 0] * a
-                    dr += key_params[k, 1] * a
-                r1 = r0 + dr
-                if r1 < r_min:
-                    r1 = r_min
-                elif r1 > r_max:
-                    r1 = r_max
-                gfac = r0 / r1
-            elif use_grade:
-                gfac = grade_map[y, x]
-            # The frame's preflash plus the masks' own, pre-summed like the stops.
-            fl = flash
-            if use_flash:
-                fl = fl + flash_map[y, x]
-            i0x = i1x = i0y = i1y = 0
-            fx = fy = 0.0
-            if use_diff:
-                i0x, i1x, i0y, i1y, fx, fy = plane_taps(
-                    diff_plane.shape[0], diff_plane.shape[1], x, y, diff_rect[0], diff_rect[1], diff_rect[2], diff_rect[3]
-                )
-            for ch in range(3):
-                base = img[y, x, ch]
-                if use_diff:
-                    # Diffusion mixes light, not density: the paper sees (1-d)·I + d·blur(I),
-                    # with I = 10^(val·r), r the channel's log range (diffusion_plane).
-                    r = diff_range[ch]
-                    top = diff_plane[i0y, i0x, ch] * (1.0 - fx) + diff_plane[i0y, i1x, ch] * fx
-                    bot = diff_plane[i1y, i0x, ch] * (1.0 - fx) + diff_plane[i1y, i1x, ch] * fx
-                    p = top * (1.0 - fy) + bot * fy
-                    base = np.log10((1.0 - diff_mix) * 10.0 ** (base * r) + diff_mix * 10.0 ** (p * r)) / r
-                val = base + cmy_offsets[ch]
-                if use_key:
-                    val = val + np.float32(ev_px * ev_scale[ch])
-                elif use_ev:
-                    val = val + ev_map[y, x] * ev_scale[ch]
-                # Quadratic per-channel core; curvature 0 gives the original straight line.
-                # gfac is the local grade, a slope rotation about this channel's pivot, so the
-                # region's own midtone holds. The cast-removal curvature stays global.
-                v = quadratic_core(slopes[ch] * gfac, pivots[ch], curvatures[ch], val)
-                if fl > 0.0:
-                    v = flash_v + flash_gamma * np.log10(10.0 ** ((v - flash_v) / flash_gamma) + fl)
-
-                # Variable-gamma paper S-curve: extra local gamma at the midtone centre
-                # (v_star), easing to zero toward the toe and shoulder. Centred on v_star, so
-                # the reference tone is preserved.
-                if midtone_gamma[ch] != 0.0:
-                    v = v + midtone_gamma[ch] * gamma_width * np.tanh((v - v_star) / gamma_width)
-
-                # Regional CMY: shadow weight rises with density, highlight falls.
-                w_sh = _fast_sigmoid(3.0 * (v - zone_center))
-                w_hi = 1.0 - w_sh
-                v = v + shadow_cmy[ch] * w_sh + highlight_cmy[ch] * w_hi
-
-                # Split Grade: a mid-sparing local contrast rotation about the zone centres.
-                # Must run as its own block before Zone Density, because sequential stays
-                # monotone and shared weights do not.
-                if use_split:
-                    w_gsh = _fast_sigmoid(zone_k * (v - zone_sh_center))
-                    w_ghi = 1.0 - _fast_sigmoid(zone_k * (v - zone_hi_center))
-                    v = v + shadow_grade[ch] * w_gsh * (v - zone_sh_center) + highlight_grade[ch] * w_ghi * (v - zone_hi_center)
-
-                # Zone Density (ΔD): neutral brightness offsets, mid-sparing
-                # weights centred in the three-quarter/quarter tones.
-                if shadow_density != 0.0 or highlight_density != 0.0:
-                    w_zsh = _fast_sigmoid(zone_k * (v - zone_sh_center))
-                    if black_hold > 0.0 and shadow_density < 0.0:
-                        w_zsh = w_zsh * _black_hold(v, d_max_eff[ch], black_hold)
-                    w_zhi = 1.0 - _fast_sigmoid(zone_k * (v - zone_hi_center))
-                    v = v + shadow_density * w_zsh + highlight_density * w_zhi
-
-                # Shoulder: smooth lower bound at paper white (highlights).
-                v1 = d_min_eff[ch] + _softplus(a_hl[ch] * (v - d_min_eff[ch])) / a_hl[ch]
-                # Toe: smooth upper bound at paper black (shadows).
-                dens[ch] = d_max_eff[ch] - _softplus(a_sh[ch] * (d_max_eff[ch] - v1)) / a_sh[ch]
-
-            if use_dye_mix:
-                # Dye unwanted absorptions: mix the densities above paper base.
-                e0 = dens[0] - d_min_rgb[0]
-                e1 = dens[1] - d_min_rgb[1]
-                e2 = dens[2] - d_min_rgb[2]
-                dens[0] = d_min_rgb[0] + dye_mix[0, 0] * e0 + dye_mix[0, 1] * e1 + dye_mix[0, 2] * e2
-                dens[1] = d_min_rgb[1] + dye_mix[1, 0] * e0 + dye_mix[1, 1] * e1 + dye_mix[1, 2] * e2
-                dens[2] = d_min_rgb[2] + dye_mix[2, 0] * e0 + dye_mix[2, 1] * e1 + dye_mix[2, 2] * e2
-
-            if use_sep_damping:
-                # Chroma-selective dye separation, in place of the frame-wide saturation
-                # matrix, which then carries the paper's coupling only and keeps
-                # compose_density_matrices' separation-outermost order. Chroma mirrors
-                # _rms_chroma in normalization.py.
-                s0 = dens[0] - d_min_rgb[0]
-                s1 = dens[1] - d_min_rgb[1]
-                s2 = dens[2] - d_min_rgb[2]
-                s_mean = (s0 + s1 + s2) / 3.0
-                chroma = np.sqrt(((s0 - s1) ** 2 + (s1 - s2) ** 2 + (s0 - s2) ** 2) / 3.0)
-                dens[0] = d_min_rgb[0] + s_mean + separation_damping_gain(sep_k3[0], sep_damping, chroma, sep_ref) * (s0 - s_mean)
-                dens[1] = d_min_rgb[1] + s_mean + separation_damping_gain(sep_k3[1], sep_damping, chroma, sep_ref) * (s1 - s_mean)
-                dens[2] = d_min_rgb[2] + s_mean + separation_damping_gain(sep_k3[2], sep_damping, chroma, sep_ref) * (s2 - s_mean)
-
-            if use_lut:
-                lr, lg, lb = tetra_lookup(lut, lut_e_max, dens[0] - d_min_rgb[0], dens[1] - d_min_rgb[1], dens[2] - d_min_rgb[2])
-                rgb = (lr, lg, lb)
-                for ch in range(3):
-                    transmittance = 10.0 ** (-d_min_rgb[ch]) * rgb[ch]
-                    if bpc:
-                        transmittance = (transmittance - lut_black) / (1.0 - lut_black)
-                    res[y, x, ch] = min(max(transmittance, 0.0), 1.0)
-            else:
-                for ch in range(3):
-                    transmittance = 10.0 ** (-dens[ch])
-                    if bpc:
-                        transmittance = (transmittance - bpc_black[ch]) / (1.0 - bpc_black[ch])
-
-                    final_val = transmittance
-                    if final_val < 0.0:
-                        final_val = 0.0
-                    elif final_val > 1.0:
-                        final_val = 1.0
-                    res[y, x, ch] = final_val
-    return res
 
 
 class CharacteristicCurve:
     """
     Asymmetric H&D print curve (toe-linear-shoulder) in density space — the NumPy
-    mirror of _apply_print_curve_kernel, used by the curve chart so the displayed
+    mirror of the print curve in negpy_core (print_curve.rs), used by the curve chart so the displayed
     curve matches the render. Returns density (pre-transmittance/encode). Neutral
     (no regional CMY color), since the chart shows the achromatic transfer; the
     achromatic zone density offsets (shadow/highlight ΔD) are included.
@@ -457,13 +102,13 @@ class CharacteristicCurve:
         self.x0 = float(pivot)
         self.curvature = float(curvature)
         self.flash = max(float(preflash), 0.0)
-        self.flash_v, self.flash_gamma = preflash_params(grade, d_min, paper)
+        self.midtone_gamma = float(c["paper_midtone_gamma"]) if midtone_gamma is None else float(midtone_gamma)
+        self.flash_v, self.flash_gamma = preflash_params(grade, d_min, paper, self.midtone_gamma)
         self.d_min = float(d_min)
         self.v_star = _reference_linear_value(d_min, paper)
-        self.midtone_gamma = float(c["paper_midtone_gamma"]) if midtone_gamma is None else float(midtone_gamma)
         self.gamma_width = float(c["paper_gamma_width"])
-        self.zone_sh_center = float(c["anchor_target_density"]) + float(c["zone_density_shadow_offset"])
-        self.zone_hi_center = float(c["anchor_target_density"]) + float(c["zone_density_highlight_offset"])
+        self.zone_sh_center = float(c["reference_print_density"]) + float(c["zone_density_shadow_offset"])
+        self.zone_hi_center = float(c["reference_print_density"]) + float(c["zone_density_highlight_offset"])
         self.zone_k = float(c["zone_density_sharpness"])
         self.shadow_density = float(shadow_density)
         self.highlight_density = float(highlight_density)
@@ -627,6 +272,7 @@ def curve_params_from_metrics(
         neutral_axis_norm=neutral_axis_norm,
         grade_trims=(exposure.grade_trim_red, exposure.grade_trim_green, exposure.grade_trim_blue),
         shadow_point=metrics.get("shadow_point"),
+        midtone_gamma=effective_midtone_gamma(profile, exposure.midtone_gamma),
     )
 
 
@@ -802,13 +448,13 @@ def apply_characteristic_curve(
 
     toe3, sh3 = per_channel_toe_shoulder(toe, shoulder, toe_trims, shoulder_trims)
     tw3, sw3 = per_channel_widths(toe_width, shoulder_width, toe_width_trims, shoulder_width_trims)
-    flash_v, flash_gamma = preflash_params(frame_grade, d_min, paper)
+    flash_v, flash_gamma = preflash_params(frame_grade, d_min, paper, midtone_gamma)
     toe_k = [t * ts for t in toe3]
     d_min_rgb = paper_dmin_rgb(d_min, paper)
     lut_black = 0.0
     if lut is not None and bpc:
         lut_black = lut_black_luminance(lut, d_min_rgb, black_density_rgb(float(c["d_max"]), toe_k, float(c["toe_height"])))
-    res = _apply_print_curve_kernel(
+    res = negpy_core.apply_print_curve(
         np.ascontiguousarray(img.astype(np.float32)),
         pivots,
         slopes,
@@ -827,13 +473,13 @@ def apply_characteristic_curve(
         width_ref=float(c["toeshoulder_width_ref"]),
         toe_height=float(c["toe_height"]),
         sh_height=float(c["shoulder_height"]),
-        zone_center=float(c["anchor_target_density"]),
+        zone_center=float(c["reference_print_density"]),
         shadow_density=float(shadow_density),
         highlight_density=float(highlight_density),
         shadow_grade=np.array(shadow_grade_deltas, dtype=np.float64),
         highlight_grade=np.array(highlight_grade_deltas, dtype=np.float64),
-        zone_sh_center=float(c["anchor_target_density"]) + float(c["zone_density_shadow_offset"]),
-        zone_hi_center=float(c["anchor_target_density"]) + float(c["zone_density_highlight_offset"]),
+        zone_sh_center=float(c["reference_print_density"]) + float(c["zone_density_shadow_offset"]),
+        zone_hi_center=float(c["reference_print_density"]) + float(c["zone_density_highlight_offset"]),
         zone_k=float(c["zone_density_sharpness"]),
         v_star=float(v_star),
         midtone_gamma=np.array([float(midtone_gamma) + snap_trims[ch] for ch in range(3)], dtype=np.float64),
@@ -892,17 +538,18 @@ def apply_flat_curve(
     gain: float,
     lift: float,
     cmy_offsets: Tuple[float, float, float] = (0.0, 0.0, 0.0),
+    stock_matrix: Optional[np.ndarray] = None,
 ) -> ImageBuffer:
     """
     True log master: emit the normalized log signal directly as the code value
     (positive-oriented 1 - val), linearly remapped with headroom. No 10^-D decode
     and no sRGB OETF — the flat, log-video look, fully invertible for downstream
-    editing. WB rides as an additive per-channel shift in log space.
+    editing. WB rides as an additive per-channel shift in log space; the print
+    stock's density matrix (rows sum 1) mixes after it, as in the print kernel.
     """
-    arr = np.asarray(image, dtype=np.float32)
-    off = np.asarray(cmy_offsets, dtype=np.float32)
-    code = lift + gain * (1.0 - (arr + off))
-    return ensure_image(np.clip(code, 0.0, 1.0).astype(np.float32))
+    m = None if stock_matrix is None else np.ascontiguousarray(stock_matrix, dtype=np.float32)
+    offsets = tuple(float(np.float32(o)) for o in cmy_offsets)
+    return ensure_image(negpy_core.flat_curve(np.ascontiguousarray(image, dtype=np.float32), float(gain), float(lift), offsets, m))
 
 
 def default_grade_range() -> float:
@@ -913,12 +560,13 @@ def default_grade_range() -> float:
     return float(c["auto_grade_target"]) * float(c["auto_grade_nominal_ratio"]) * float(c["auto_grade_nominal_range"])
 
 
-def grade_to_slope(grade: float, density_range: Optional[float]) -> float:
+def grade_to_slope(grade: float, density_range: Optional[float], gain: float = 1.0) -> float:
     """
     Straight-line slope k from the grade given as an ISO R paper exposure range
     (R180 very soft ... R50 very hard; R110 ~ classic grade 2 paper). k is the
     literal H&D gamma: contrast = negative density range / paper exposure range,
-    like real graded paper — k = grade_contrast_scale * range / (R/100).
+    like real graded paper — k = grade_contrast_scale * range / (R/100) * gain,
+    with gain the paper's slope_gain.
     """
     from negpy.features.exposure.models import EXPOSURE_CONSTANTS
 
@@ -926,7 +574,7 @@ def grade_to_slope(grade: float, density_range: Optional[float]) -> float:
     rng_in = default_grade_range() if density_range is None else density_range
     er = min(max(grade, c["iso_r_min"]), c["iso_r_max"]) / 100.0
     rng = min(max(abs(float(rng_in)), 0.3), 3.5)
-    k = float(c["grade_contrast_scale"]) * rng / er
+    k = float(c["grade_contrast_scale"]) * rng / er * float(gain)
     return float(min(max(k, c["slope_min"]), c["slope_max"]))
 
 
@@ -950,7 +598,7 @@ def per_channel_dye_separation(
     )
 
 
-def slope_to_grade(slope: float, density_range: Optional[float]) -> float:
+def slope_to_grade(slope: float, density_range: Optional[float], gain: float = 1.0) -> float:
     """
     Inverse of grade_to_slope: the ISO R paper grade equivalent to an effective
     slope, given the density range that produced it. Used to display the contrast
@@ -964,7 +612,7 @@ def slope_to_grade(slope: float, density_range: Optional[float]) -> float:
     rng = min(max(abs(float(rng_in)), 0.3), 3.5)
     if slope <= 0:
         return float(c["iso_r_max"])
-    er = float(c["grade_contrast_scale"]) * rng / float(slope)
+    er = float(c["grade_contrast_scale"]) * rng * float(gain) / float(slope)
     return float(min(max(er * 100.0, c["iso_r_min"]), c["iso_r_max"]))
 
 
@@ -1097,12 +745,12 @@ def effective_grade_range(
 def _reference_linear_value(d_min: float = 0.0, paper: Optional[PaperProfile] = None, target: Optional[float] = None) -> float:
     """
     Straight-line density value v* that the base shoulder+toe bounds map onto `target`
-    (default anchor_target_density). The reference tone is placed here so it
+    (default reference_print_density). The reference tone is placed here so it
     prints at target, and the paper S-curve is centred here so the anchor is
     preserved. Closed form via inverse softplus at the base toe/shoulder sharpness.
     """
     c = effective_constants(paper)
-    t = float(c["anchor_target_density"]) if target is None else float(target)
+    t = float(c["reference_print_density"]) if target is None else float(target)
     d_max = float(c["d_max"])
     a_hl = float(c["shoulder_sharpness_base"])  # highlight (lower) bound
     a_sh = float(c["toe_sharpness_base"])  # shadow (upper) bound
@@ -1110,7 +758,50 @@ def _reference_linear_value(d_min: float = 0.0, paper: Optional[PaperProfile] = 
     return float(d_min + _inv_softplus_np(a_hl * (v1 - d_min)) / a_hl)
 
 
-def preflash_params(grade: float, d_min: float = 0.0, paper: Optional[PaperProfile] = None) -> Tuple[float, float]:
+def _midtone_terms(d_min: float, paper: Optional[PaperProfile], midtone_gamma: Optional[float]) -> Tuple[float, float, float]:
+    c = effective_constants(paper)
+    mg = float(c["paper_midtone_gamma"]) if midtone_gamma is None else float(midtone_gamma)
+    return mg, float(c["paper_gamma_width"]), _reference_linear_value(d_min, paper)
+
+
+def _through_midtone(v: float, d_min: float = 0.0, paper: Optional[PaperProfile] = None, midtone_gamma: Optional[float] = None) -> float:
+    """Straight-line value `v` after the variable midtone gamma, as the kernels apply it.
+    midtone_gamma: the effective value (paper + Snap); None takes the paper's own."""
+    mg, w, v_star = _midtone_terms(d_min, paper, midtone_gamma)
+    return float(v + mg * w * np.tanh((v - v_star) / w))
+
+
+def _straight_line_target(
+    d_min: float = 0.0, paper: Optional[PaperProfile] = None, target: Optional[float] = None, midtone_gamma: Optional[float] = None
+) -> float:
+    """Straight-line value that prints `target` through the midtone gamma and the bounds: the
+    inverse of _through_midtone at _reference_linear_value. Bisection, since the midtone term is
+    monotone and moves a value by at most |mg| * width."""
+    u = _reference_linear_value(d_min, paper, target)
+    mg, w, v_star = _midtone_terms(d_min, paper, midtone_gamma)
+    lo, hi = u - abs(mg) * w, u + abs(mg) * w
+    for _ in range(60):
+        mid = 0.5 * (lo + hi)
+        if mid + mg * w * math.tanh((mid - v_star) / w) < u:
+            lo = mid
+        else:
+            hi = mid
+    return 0.5 * (lo + hi)
+
+
+def _anchor_linear_value(
+    d_min: float = 0.0, paper: Optional[PaperProfile] = None, metered: bool = False, midtone_gamma: Optional[float] = None
+) -> float:
+    """Straight-line value the anchor prints from: a metered anchor lands on
+    anchor_target_density through the midtone gamma, an unmetered one on v*."""
+    if not metered:
+        return _reference_linear_value(d_min, paper)
+    return _straight_line_target(d_min, paper, float(effective_constants(paper)["anchor_target_density"]), midtone_gamma)
+
+
+def preflash_params(
+    grade: float, d_min: float = 0.0, paper: Optional[PaperProfile] = None, midtone_gamma: Optional[float] = None
+) -> Tuple[float, float]:
     """(v_th, gamma) for preflash_value. v_th is the straight-line value that prints the paper's
     threshold, d_min + preflash_threshold_density (where the ISO R range starts). gamma is the
     paper's density per log10 exposure at `grade`, so the flash is a paper exposure and does
@@ -1118,9 +809,9 @@ def preflash_params(grade: float, d_min: float = 0.0, paper: Optional[PaperProfi
     from negpy.features.exposure.models import EXPOSURE_CONSTANTS
 
     c = effective_constants(paper)
-    v_th = _reference_linear_value(d_min, paper, target=d_min + float(c["preflash_threshold_density"]))
+    v_th = _straight_line_target(d_min, paper, d_min + float(c["preflash_threshold_density"]), midtone_gamma)
     er = min(max(float(grade), EXPOSURE_CONSTANTS["iso_r_min"]), EXPOSURE_CONSTANTS["iso_r_max"]) / 100.0
-    return v_th, float(EXPOSURE_CONSTANTS["grade_contrast_scale"]) / er
+    return v_th, float(EXPOSURE_CONSTANTS["grade_contrast_scale"]) / er * slope_gain(paper)
 
 
 def preflash_value(v: Any, v_th: float, flash: float, gamma: float) -> Any:
@@ -1129,7 +820,15 @@ def preflash_value(v: Any, v_th: float, flash: float, gamma: float) -> Any:
     return v_th + gamma * np.log10(10.0 ** ((v - v_th) / gamma) + flash)
 
 
-def shadow_reach_slope(slope: float, anchor: float, shadow_point: float, d_min: float = 0.0, paper: Optional[PaperProfile] = None) -> float:
+def shadow_reach_slope(
+    slope: float,
+    anchor: float,
+    shadow_point: float,
+    d_min: float = 0.0,
+    paper: Optional[PaperProfile] = None,
+    midtone_gamma: Optional[float] = None,
+    metered: bool = False,
+) -> float:
     """
     Auto Grade floor on the slope: the textured dark tail at `shadow_point` must print
     at least shadow_reach_density while the anchor stays at its target, so the slope
@@ -1140,8 +839,8 @@ def shadow_reach_slope(slope: float, anchor: float, shadow_point: float, d_min: 
     span = float(shadow_point) - float(anchor)
     if span <= 1e-6:
         return slope
-    v_black = _reference_linear_value(d_min, paper, target=float(c["shadow_reach_density"]))
-    needed = (v_black - _reference_linear_value(d_min, paper)) / span
+    v_black = _straight_line_target(d_min, paper, float(c["shadow_reach_density"]), midtone_gamma)
+    needed = (v_black - _anchor_linear_value(d_min, paper, metered, midtone_gamma)) / span
     return float(min(max(slope, needed), float(c["slope_max"])))
 
 
@@ -1153,13 +852,14 @@ def highlight_hold_offset(
     paper: Optional[PaperProfile] = None,
     preflash: float = 0.0,
     grade: float = 115.0,
+    midtone_gamma: Optional[float] = None,
 ) -> float:
     """
     Auto Grade's soft exposure: the highlight zone burn (a highlight_density term) that
     lands the textured bright tail at `highlight_point` on highlight_hold_density when the
     straight line would print it brighter. Solved against the kernel's own zone weight at
     that tone, so the burn stays under the shoulder. Never lifts; 0 when the tone holds.
-    Measured after the preflash, so the burn only tops up what the flash leaves.
+    Measured after the preflash and the midtone gamma, so the burn only tops up what they leave.
     """
     c = effective_constants(paper)
     target = float(c["highlight_hold_density"])
@@ -1167,12 +867,13 @@ def highlight_hold_offset(
         return 0.0
     v = float(slope) * (float(highlight_point) - float(pivot))
     if preflash > 0.0:
-        v_th, gamma = preflash_params(grade, d_min, paper)
+        v_th, gamma = preflash_params(grade, d_min, paper, midtone_gamma)
         v = float(preflash_value(v, v_th, preflash, gamma))
+    v = _through_midtone(v, d_min, paper, midtone_gamma)
     v_hold = _reference_linear_value(d_min, paper, target=target)
     if v >= v_hold:
         return 0.0
-    z_hi = float(c["anchor_target_density"]) + float(c["zone_density_highlight_offset"])
+    z_hi = float(c["reference_print_density"]) + float(c["zone_density_highlight_offset"])
     w = 1.0 - _fast_sigmoid(float(c["zone_density_sharpness"]) * (v - z_hi))
     return float(min((v_hold - v) / max(w, 1e-6), float(c["highlight_hold_max"])))
 
@@ -1183,6 +884,7 @@ def shadow_hold_offset(
     shadow_point: float,
     d_min: float = 0.0,
     paper: Optional[PaperProfile] = None,
+    midtone_gamma: Optional[float] = None,
 ) -> float:
     """Auto Grade's shadow lift (a negative shadow_density), the partner of
     highlight_hold_offset, on the textured dark tail past Shadow Reach's line. A partial
@@ -1191,7 +893,7 @@ def shadow_hold_offset(
     strength = float(c["shadow_hold_strength"])
     if strength <= 0.0:
         return 0.0
-    v = float(slope) * (float(shadow_point) - float(pivot))
+    v = _through_midtone(float(slope) * (float(shadow_point) - float(pivot)), d_min, paper, midtone_gamma)
     v_start = _reference_linear_value(d_min, paper, target=float(c["shadow_reach_density"])) + float(c["shadow_hold_overshoot"])
     if v <= v_start:
         return 0.0
@@ -1208,7 +910,8 @@ def auto_shadow_from_metrics(exposure: Any, process_mode: Optional[str], metrics
     profile = effective_paper_profile(exposure.paper_profile, process_mode)
     d_min = profile.d_min if exposure.paper_dmin else 0.0
     slopes, pivots, _ = curve_params_from_metrics(exposure, process_mode, metrics)
-    return shadow_hold_offset(slopes[1], pivots[1], float(point), d_min=d_min, paper=profile)
+    mg = effective_midtone_gamma(profile, exposure.midtone_gamma)
+    return shadow_hold_offset(slopes[1], pivots[1], float(point), d_min=d_min, paper=profile, midtone_gamma=mg)
 
 
 def auto_highlight_from_metrics(exposure: Any, process_mode: Optional[str], metrics: Any) -> float:
@@ -1223,25 +926,36 @@ def auto_highlight_from_metrics(exposure: Any, process_mode: Optional[str], metr
     d_min = profile.d_min if exposure.paper_dmin else 0.0
     slopes, pivots, _ = curve_params_from_metrics(exposure, process_mode, metrics)
     return highlight_hold_offset(
-        slopes[1], pivots[1], float(point), d_min=d_min, paper=profile, preflash=exposure.preflash, grade=exposure.grade
+        slopes[1],
+        pivots[1],
+        float(point),
+        d_min=d_min,
+        paper=profile,
+        preflash=exposure.preflash,
+        grade=exposure.grade,
+        midtone_gamma=effective_midtone_gamma(profile, exposure.midtone_gamma),
     )
 
 
 def compute_pivot(
-    slope: float, density: float, d_min: float = 0.0, anchor: Optional[float] = None, paper: Optional[PaperProfile] = None
+    slope: float,
+    density: float,
+    d_min: float = 0.0,
+    anchor: Optional[float] = None,
+    paper: Optional[PaperProfile] = None,
+    midtone_gamma: Optional[float] = None,
 ) -> float:
     """
     Fixed calibrated exposure: solve the curve pivot so the reference tone
-    prints at anchor_target_density for the current effective slope — grade
-    changes rotate around that reference tone instead of shifting brightness.
-    The density slider offsets exposure around it. The reference tone defaults
-    to assumed_anchor (a typical negative's normalized median); pass `anchor`
-    to use a per-frame metered median (auto-exposure) instead.
+    (assumed_anchor) prints at reference_print_density for the current effective
+    slope, so grade changes rotate around it instead of shifting brightness.
+    The density slider offsets exposure around it. A metered `anchor` (Auto
+    Density) prints at anchor_target_density instead.
     """
     c = effective_constants(paper)
     ref = c["assumed_anchor"] if anchor is None else anchor
-    v_star = _reference_linear_value(d_min, paper)
-    base = ref - v_star / slope
+    v = _anchor_linear_value(d_min, paper, anchor is not None, midtone_gamma)
+    base = ref - v / slope
     return base + (1.0 - density) * c["density_multiplier"]
 
 
@@ -1300,14 +1014,17 @@ def auto_base_slope(
     anchor: Optional[float],
     d_min: float = 0.0,
     paper: Optional[PaperProfile] = None,
+    midtone_gamma: Optional[float] = None,
 ) -> float:
     """Shared straight-line slope before the per-layer gammas: Grade on the effective range,
     raised to Auto Grade's Shadow Reach floor."""
-    slope = grade_to_slope(grade, effective_grade_range(auto_normalize_contrast, lum_range, textural_range))
+    slope = grade_to_slope(grade, effective_grade_range(auto_normalize_contrast, lum_range, textural_range), slope_gain(paper))
     if auto_normalize_contrast and shadow_point is not None:
         c = effective_constants(paper)
         ref = float(c["assumed_anchor"]) if anchor is None else float(anchor)
-        slope = shadow_reach_slope(slope, ref, shadow_point, d_min=d_min, paper=paper)
+        slope = shadow_reach_slope(
+            slope, ref, shadow_point, d_min=d_min, paper=paper, midtone_gamma=midtone_gamma, metered=anchor is not None
+        )
     return slope
 
 
@@ -1324,6 +1041,7 @@ def per_channel_curve_params(
     neutral_axis_norm: Any = None,
     grade_trims: Tuple[float, float, float] = (0.0, 0.0, 0.0),
     shadow_point: Optional[float] = None,
+    midtone_gamma: Optional[float] = None,
 ) -> Tuple[Tuple[float, float, float], Tuple[float, float, float], Tuple[float, float, float]]:
     """
     Per-channel (slopes, pivots, curvatures); single source of truth for CPU/GPU/chart.
@@ -1348,7 +1066,9 @@ def per_channel_curve_params(
         )
     slope_min = float(c["slope_min"])
     slope_max = float(c["slope_max"])
-    base_slope = auto_base_slope(grade, auto_normalize_contrast, lum_range, textural_range, shadow_point, anchor, d_min, paper)
+    base_slope = auto_base_slope(
+        grade, auto_normalize_contrast, lum_range, textural_range, shadow_point, anchor, d_min, paper, midtone_gamma
+    )
 
     epsilon = 1e-6
 
@@ -1361,7 +1081,7 @@ def per_channel_curve_params(
         curv_lim = float(c["neutral_axis_curv_max_ratio"])
         m_g, s_g = float(mid_norm[1]), float(sh_norm[1])
         slope_g = min(max(base_slope * cg[1], slope_min), slope_max)
-        pivot_g = compute_pivot(slope_g, density, d_min=d_min, anchor=anchor, paper=paper)
+        pivot_g = compute_pivot(slope_g, density, d_min=d_min, anchor=anchor, paper=paper, midtone_gamma=midtone_gamma)
         target = lambda g: slope_g * (g - pivot_g)  # noqa: E731  green's core at a green ref
         t_m, t_s = target(m_g), target(s_g)
         h_g = float(hl_norm[1]) if hl_norm is not None else None
@@ -1404,9 +1124,9 @@ def per_channel_curve_params(
     s0 = min(max(base_slope * cg[0], slope_min), slope_max)
     s1 = min(max(base_slope * cg[1], slope_min), slope_max)
     s2 = min(max(base_slope * cg[2], slope_min), slope_max)
-    p0 = compute_pivot(s0, density, d_min=d_min, anchor=anchor, paper=paper)
-    p1 = compute_pivot(s1, density, d_min=d_min, anchor=anchor, paper=paper)
-    p2 = compute_pivot(s2, density, d_min=d_min, anchor=anchor, paper=paper)
+    p0 = compute_pivot(s0, density, d_min=d_min, anchor=anchor, paper=paper, midtone_gamma=midtone_gamma)
+    p1 = compute_pivot(s1, density, d_min=d_min, anchor=anchor, paper=paper, midtone_gamma=midtone_gamma)
+    p2 = compute_pivot(s2, density, d_min=d_min, anchor=anchor, paper=paper, midtone_gamma=midtone_gamma)
     return (s0, s1, s2), (p0, p1, p2), (0.0, 0.0, 0.0)
 
 
@@ -1520,54 +1240,80 @@ def expand_mask_plane(
     it lands back at `roi`, edge-replicated so the uncropped preview has no seam.
 
     Split from `contrast_mask_ev` so a caller can cache this across slider values: only
-    the scalar depends on the gamma. The GPU shader mirrors the bilinear mapping.
+    the coefficients move with them. The GPU shader mirrors the bilinear mapping.
     """
+    return _expanded(plane, out_shape, roi, 1.0)
+
+
+def _expanded(
+    plane: Optional[np.ndarray], out_shape: Tuple[int, int], roi: Optional[Tuple[int, int, int, int]], scale: float
+) -> Optional[np.ndarray]:
     if plane is None:
         return None
     h, w = out_shape
-    if roi is None:
-        if plane.shape[:2] != (h, w):
-            plane = cv2.resize(plane, (w, h), interpolation=cv2.INTER_LINEAR)
-        return np.ascontiguousarray(plane, dtype=np.float32)
-
-    y1, y2, x1, x2 = roi
+    y1, y2, x1, x2 = (0, h, 0, w) if roi is None else roi
     y1, x1 = max(0, y1), max(0, x1)
     y2, x2 = min(h, y2), min(w, x2)
     if y2 - y1 < 1 or x2 - x1 < 1:
         return None
-    inner = cv2.resize(plane, (x2 - x1, y2 - y1), interpolation=cv2.INTER_LINEAR)
-    if (y1, x1, y2, x2) == (0, 0, h, w):
-        return np.ascontiguousarray(inner, dtype=np.float32)
-    return np.ascontiguousarray(np.pad(inner, ((y1, h - y2), (x1, w - x2)), mode="edge"), dtype=np.float32)
+    return negpy_core.expand_plane(np.ascontiguousarray(plane, dtype=np.float32), (h, w), (y1, y2, x1, x2), scale)
 
 
-def contrast_mask_scale(gamma: float, density_range: float) -> float:
+# Contrast Mask tone codes, after the Frontier's HyperTone: 10-bit print density with mid-gray at
+# 412, reference_print_density at 450 and MASK_CODES_PER_DENSITY codes per unit. Its table is
+# sign(412 - i) * (i - 412)^2 / 256 over codes 0..1023, capped at 819, and a quarter of it is added.
+MASK_MID_CODE = 412.0
+MASK_AIM_CODE = 450.0
+MASK_CODES_PER_DENSITY = 145.0
+MASK_CODE_MAX = 1023.0
+MASK_TABLE_CAP = 819.0
+
+
+def contrast_mask_coeffs(
+    strength: float,
+    centre: float,
+    slopes: Tuple[float, float, float],
+    pivots: Tuple[float, float, float],
+    offsets: Tuple[float, float, float],
+    density_range: float,
+) -> Optional[Tuple[float, float, float, float, float, float, float]]:
     """
-    Stops of print exposure per unit of mask plane.
-
-    The sandwich D' = D - g*blur(D) is val - g*blur in normalized space; one stop is
-    log10(2) of density, and equal stops is an equal density change in every channel,
-    as a neutral panchromatic masking film gives. Positive g is a blurred positive and
-    subtracts the low frequencies; negative g matches the negative's polarity and adds
-    them.
+    The (a, b, lo, hi, g_lo, g_hi, lim) of negpy_core.contrast_mask_stops, or None when off. Both sides
+    take `strength` of the full table. The luma's code is the mean of the three
+    channels' straight lines, as the Frontier reads the mean of its channels; green's sizes the stops.
     """
-    return -float(gamma) * float(density_range) / float(np.log10(2.0))
+    from negpy.features.exposure.models import EXPOSURE_CONSTANTS
+
+    slope = float(np.mean(slopes))
+    if strength <= 0.0 or slope <= 0.0 or slopes[1] <= 0.0 or density_range <= 0.0:
+        return None
+    c = MASK_CODES_PER_DENSITY
+    ref = float(EXPOSURE_CONSTANTS["reference_print_density"])
+    shift = float(np.mean([k * (o - p) for k, o, p in zip(slopes, offsets, pivots)]))
+    stops_per_code = float(density_range) / (c * float(slopes[1]) * math.log10(2.0))
+    gain = float(strength) * stops_per_code / (4.0 * 256.0)
+    return (
+        c * slope,
+        MASK_AIM_CODE + c * (slope * centre + shift - ref) - MASK_MID_CODE,
+        -MASK_MID_CODE,
+        MASK_CODE_MAX - MASK_MID_CODE,
+        gain,
+        gain,
+        MASK_TABLE_CAP / 4.0 * stops_per_code,
+    )
 
 
 def contrast_mask_ev(
     plane: Optional[np.ndarray],
-    gamma: float,
-    density_range: float,
+    coeffs: Optional[Tuple[float, ...]],
     out_shape: Tuple[int, int],
     roi: Optional[Tuple[int, int, int, int]] = None,
 ) -> Optional[np.ndarray]:
     """The contrast mask as print-exposure stops, ready to add to the dodge/burn map."""
-    if plane is None or abs(gamma) < 1e-6:
+    if plane is None or coeffs is None:
         return None
-    expanded = expand_mask_plane(plane, out_shape, roi)
-    if expanded is None:
-        return None
-    return (expanded * contrast_mask_scale(gamma, density_range)).astype(np.float32)
+    expanded = _expanded(plane, out_shape, roi, 1.0)
+    return None if expanded is None else negpy_core.contrast_mask_stops(expanded, tuple(float(k) for k in coeffs))
 
 
 def cmy_to_density(val: float, log_range: float = 1.0) -> float:

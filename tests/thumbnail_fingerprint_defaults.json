@@ -17,8 +17,9 @@
   "exposure": {
    "auto_exposure": "true",
    "auto_normalize_contrast": "true",
+   "bw_filter": "\"none\"",
    "cast_removal_strength": "1.0",
-   "contrast_mask": "0.0",
+   "contrast_mask_strength": "0.0",
    "curve_0": "0.0",
    "curve_0_blue": "0.0",
    "curve_0_green": "0.0",
@@ -122,7 +123,6 @@
    "levels_out_low_blue": "0",
    "levels_out_low_green": "0",
    "levels_out_low_red": "0",
-   "mask_spacer": "4.0",
    "midtone_gamma": "0.0",
    "midtone_gamma_trim_blue": "0.0",
    "midtone_gamma_trim_green": "0.0",
@@ -255,6 +255,7 @@
    "sensor_matrix": "null",
    "sensor_profile": "\"None\"",
    "sensor_unmix": "\"two_scale\"",
+   "source_color": "null",
    "use_cast_average": "false",
    "use_color_average": "false",
    "use_luma_average": "false",
@@ -291,5 +292,5 @@
    "vanadium_strength": "0.0"
   }
  },
- "render_version": 13
+ "render_version": 19
 }

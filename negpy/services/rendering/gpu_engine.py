@@ -5,7 +5,7 @@ import struct
 import time
 from typing import Any, Dict, Optional, Tuple
 
-import cv2
+import negpy_core
 import numpy as np
 import wgpu  # type: ignore
 
@@ -34,7 +34,6 @@ from negpy.features.exposure.normalization import (
     base_scan_density,
     density_above_base,
     luminance_density_range,
-    measure_base_log,
     measure_anchor_from_log,
     measure_clip_fractions,
     measure_neutral_axis_from_log,
@@ -85,6 +84,7 @@ from negpy.features.transparency.logic import (
 )
 from negpy.features.process.capture_color import apply_camera_matrix, camera_to_working_matrix
 from negpy.features.process.logic import should_fold_camera_wb
+from negpy.features.exposure.bw_filter import collapse_weights, plane_weights, printed_exposure
 from negpy.features.process.models import ProcessMode, per_channel_point_offsets, pooled_neutral_axis
 from negpy.features.process.path import RenderPath, render_path
 from negpy.infrastructure.gpu.device import GPUDevice
@@ -94,6 +94,8 @@ from negpy.kernel.image.logic import rgba_to_rgb_into, working_oetf_decode
 from negpy.kernel.system.config import APP_CONFIG
 from negpy.kernel.system.logging import get_logger
 from negpy.kernel.system.paths import get_resource_path
+from negpy.kernel.system import timing
+from negpy.services.rendering.base_read import NOT_READ, base_log_for, cached_base_log
 from negpy.services.export.print import PrintService
 from negpy.services.view.coordinate_mapping import CoordinateMapping
 
@@ -152,7 +154,7 @@ def _downsample_for_analysis(img: np.ndarray, max_size: int) -> np.ndarray:
     scale = min(1.0, max_size / max(h, w))
     if scale >= 1.0:
         return img
-    return cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+    return negpy_core.resize_area(np.ascontiguousarray(img, dtype=np.float32), (int(w * scale), int(h * scale)))
 
 
 def _build_analysis_source(
@@ -374,7 +376,7 @@ class GPUEngine:
         self._uniform_sizes = {
             "geometry": 64,
             "normalization": 160,
-            "exposure": 448,
+            "exposure": 480,
             "transfer": 224,
             "clahe_u": 32,
             "lab": 96,
@@ -399,8 +401,6 @@ class GPUEngine:
         self._clip_cache: Optional[tuple] = None
         # (key, prefiltered grid, clip fractions), keyed without the clip sliders.
         self._prefilter_cache: Optional[tuple] = None
-        # The clear base, read off the raw source once per source; every edit reuses it.
-        self._base_cache: Optional[tuple] = None
         self._last_settings: Optional[WorkspaceConfig] = None
         self._last_targets_rev: int = -1
         self._last_scale_factor: float = 1.0
@@ -686,6 +686,7 @@ class GPUEngine:
         camera_wb: Optional[list] = None,
         contrast_mask_override: Optional[Tuple[np.ndarray, float, Tuple[int, int, int, int]]] = None,
         film_base: Optional[tuple] = None,
+        source_base_log: Any = NOT_READ,
         sabattier_sigma_override: Optional[float] = None,
         diffusion_override: Optional[Tuple[np.ndarray, Tuple[int, int, int, int]]] = None,
         # Crop tool preview: toning and finish span the whole rotated frame, with no border or
@@ -796,6 +797,7 @@ class GPUEngine:
                 None,
             )
 
+        timing.lap("upload source")
         analysis_t0 = time.perf_counter()
         cast_on = settings.exposure.cast_removal_strength > 0.0 and not tiling_mode
         # The neutral axis runs on both colour processes; B&W has no channels to balance.
@@ -824,7 +826,9 @@ class GPUEngine:
         # A drag renders without metrics and caches no densities; the release that reads them
         # back re-runs the grid once so the cache fills.
         # A source with no base is known as such, so it never re-enters the grid for it.
-        base_known_empty = self._base_cache is not None and self._base_cache[0] == analysis_source_hash and self._base_cache[1] is None
+        if source_base_log is NOT_READ:
+            source_base_log = cached_base_log(analysis_source_hash)
+        base_known_empty = source_base_log is None
         needs_density = readback_metrics and not tiling_mode and not transfer and density_above_base_value is None and not base_known_empty
         if needs_bounds_analysis or needs_axis or needs_anchor or needs_textural or needs_shadow or needs_highlight or needs_density:
             # Keyed without the clip sliders: a clip drag reuses the grid and
@@ -917,22 +921,16 @@ class GPUEngine:
         else:
             bounds, base_bounds = resolve_bounds_detailed(settings.process, _analyze_bounds)
             anchor_bounds = luma_source_bounds(settings.process, base_bounds)
-        pass_base_log = None  # a rebate read with no source identity to cache it under (the tiled reference pass)
         if prefiltered is not None and readback_metrics and not transfer and (density_above_base_value is None or needs_bounds_analysis):
             # Only a preview reads the densities, like the anchor's readback_metrics gate. A base
-            # the user set on the roll wins; else the rebate reader's, a property of the source
-            # read off the raw frame once per source, or per render on a pass with no source
-            # identity (the tiled reference pass).
+            # the user set on the roll wins; else the source's rebate read, which run_pipeline
+            # passes in, read here only for a caller that did not.
             if film_base is not None:
                 density_above_base_value = density_above_base(tuple(film_base), bounds, prefiltered, unmix_m)
             else:
-                if analysis_source_hash is None:
-                    base_log = pass_base_log = measure_base_log(img)
-                else:
-                    if self._base_cache is None or self._base_cache[0] != analysis_source_hash:
-                        self._base_cache = (analysis_source_hash, measure_base_log(img))
-                    base_log = self._base_cache[1]
-                density_above_base_value = density_above_base(base_log, bounds, prefiltered, unmix_m)
+                if source_base_log is NOT_READ:
+                    source_base_log = base_log_for(analysis_source_hash, img)
+                density_above_base_value = density_above_base(source_base_log, bounds, prefiltered, unmix_m)
 
         # Neutral axis for the two-point Cast Removal; normalized at consumption. The
         # transparency curve renders through the fixed window, so the axis is measured
@@ -994,7 +992,7 @@ class GPUEngine:
         y2_f, x2_f = min(h_rot, y2_f), min(w_rot, x2_f)
         frame_rect = (x1_f, y1_f, x2_f - x1_f, y2_f - y1_f)
         mask_rect = None
-        if settings.exposure.contrast_mask != 0.0:
+        if settings.exposure.contrast_mask_strength > 0.0 and render_path(settings.process) is RenderPath.PRINT:
             if tiling_mode:
                 # A tile holds no pre-geometry source, so the caller builds the plane once
                 # for the whole export and the frame shifts into tile coords here.
@@ -1004,13 +1002,14 @@ class GPUEngine:
                     mask_rect = (frame[0] - global_offset[0], frame[1] - global_offset[1], frame[2], frame[3])
             else:
                 geo = settings.geometry
+                bw_weights = plane_weights(settings.process, settings.exposure)
                 mask_key = (
                     analysis_key,
                     bounds,
                     roi,
                     (h_rot, w_rot),
-                    settings.exposure.mask_spacer,
                     (geo.rotation, geo.fine_rotation, geo.flip_horizontal, geo.flip_vertical, geo.converge_v, geo.converge_h, k1_eff),
+                    bw_weights,
                 )
                 if self._mask_plane is None or self._mask_plane[0] != mask_key:
                     self._mask_plane = (
@@ -1020,7 +1019,7 @@ class GPUEngine:
                             bounds,
                             unmix_m,
                             roi_norm=normalized_roi(roi, (h_rot, w_rot)),
-                            spacer=settings.exposure.mask_spacer,
+                            bw_weights=bw_weights,
                             **geometry_kwargs(settings.geometry, k1_eff),
                         ),
                     )
@@ -1033,10 +1032,8 @@ class GPUEngine:
             if mask_rect[2] < 1 or mask_rect[3] < 1:
                 mask_plane = None
             else:
-                from negpy.features.exposure.logic import contrast_mask_scale
-
                 mask_uniform = (
-                    contrast_mask_scale(settings.exposure.contrast_mask, luminance_density_range(bounds)),
+                    mask_centre,
                     float(mask_rect[0]),
                     float(mask_rect[1]),
                     float(mask_rect[2]),
@@ -1060,7 +1057,7 @@ class GPUEngine:
                 diff_bounds = LogNegativeBounds(
                     tuple(bounds.floors[ch] + wp3[ch] for ch in range(3)), tuple(bounds.ceils[ch] + bp3[ch] for ch in range(3))
                 )
-                panchromatic = settings.process.process_mode == ProcessMode.BW
+                diff_weights = plane_weights(settings.process, settings.exposure)
                 grid_key = (
                     analysis_key,
                     roi,
@@ -1078,11 +1075,11 @@ class GPUEngine:
                             **geometry_kwargs(geo, k1_eff),
                         ),
                     )
-                diff_key = (grid_key, tuple(diff_bounds.floors), tuple(diff_bounds.ceils), panchromatic)
+                diff_key = (grid_key, tuple(diff_bounds.floors), tuple(diff_bounds.ceils), diff_weights)
                 # A None plane (an unmetered frame) is cached under its key like any other.
                 cached = self._diffusion_plane
                 if cached is None or cached[0] != diff_key:
-                    cached = (diff_key, diffusion_plane(self._diffusion_grid[1], diff_bounds, panchromatic))
+                    cached = (diff_key, diffusion_plane(self._diffusion_grid[1], diff_bounds, diff_weights))
                     self._diffusion_plane = cached
                 diff_plane = cached[1]
                 diff_rect = frame_rect
@@ -1090,6 +1087,8 @@ class GPUEngine:
                 diff_plane = None
         plane_rect = mask_rect if mask_plane is not None else diff_rect
         plane_tex_key = (mask_key if mask_plane is not None else None, diff_key if diff_plane is not None else None)
+
+        timing.lap("meter/mask planes")
 
         # CPU meter cost, logged once per source (skips creative-slider re-renders).
         if analysis_source is not None and analysis_source_hash is not None and analysis_source_hash != self._analysis_timing_hash:
@@ -1137,6 +1136,7 @@ class GPUEngine:
         if clahe_cdf_override is not None:
             self._buffers["clahe_c"].upload(clahe_cdf_override)
 
+        timing.lap("uniforms")
         # Texture chain
         tex_geom = self._get_intermediate_texture(
             w_rot,
@@ -1723,6 +1723,7 @@ class GPUEngine:
             tex_final = tex_curves
 
         device.queue.submit([enc.finish()])
+        timing.lap("record/submit passes")
         # The exact stretch the shader normalized with (mirrors the CPU "final_bounds").
         # The transfer path renders through the fixed window, not the measured one.
         _base_bounds = LogNegativeBounds(*transfer_bounds()) if transfer else bounds
@@ -1736,10 +1737,8 @@ class GPUEngine:
         if not transfer:
             if film_base is not None:
                 read_base_log = tuple(film_base)
-            elif self._base_cache is not None and self._base_cache[0] == analysis_source_hash:
-                read_base_log = self._base_cache[1]
-            else:
-                read_base_log = pass_base_log
+            elif source_base_log is not NOT_READ:
+                read_base_log = source_base_log
         metrics: Dict[str, Any] = {
             "active_roi": roi,
             "base_positive": tex_final,
@@ -1761,9 +1760,13 @@ class GPUEngine:
             # Raw cast refs so the chart can re-solve the exact render curves.
             "neutral_axis_refs": neutral_axis_refs,
         }
+        # A drag with no read leaves the base out, so the merged metrics keep the last frame's.
+        if not transfer and film_base is None and source_base_log is NOT_READ:
+            del metrics["film_base_density"]
 
         if not tiling_mode and readback_metrics:
             raw_metrics = self._readback_metrics()
+            timing.lap("GPU wait/metrics readback")
             metrics["histogram_raw"] = raw_metrics[:_METRICS_HIST_WORDS].reshape((4, HISTOGRAM_BINS))
             metrics["histogram_density"] = (
                 raw_metrics[_METRICS_DENSITY_BASE : _METRICS_DENSITY_BASE + _METRICS_DENSITY_WORDS]
@@ -1847,6 +1850,7 @@ class GPUEngine:
         self._last_scale_factor = scale_factor
         self._last_render_size_ref = render_size_ref
         self._last_full_frame = full_frame
+        timing.lap("metrics")
         return tex_final, metrics
 
     def _upload_unified_uniforms(
@@ -1873,7 +1877,7 @@ class GPUEngine:
         unmix: Optional[np.ndarray] = None,
         cam_xyz: Optional[list] = None,
         camera_wb: Optional[list] = None,
-        contrast_mask: Optional[Tuple[float, float, float, float, float]] = None,
+        contrast_mask: Optional[Tuple[Any, ...]] = None,
         sabattier_sigma: float = 0.0,
         plane_rect: Optional[Tuple[float, float, float, float]] = None,
         diffusion_mix: float = 0.0,
@@ -1953,6 +1957,7 @@ class GPUEngine:
         from negpy.features.exposure.logic import (
             _reference_linear_value,
             cast_solve_inputs,
+            contrast_mask_coeffs,
             filtration_offsets,
             neutral_axis_affine,
             per_channel_dye_separation,
@@ -1965,6 +1970,7 @@ class GPUEngine:
             highlight_hold_offset,
             shadow_hold_offset,
             per_channel_curve_params,
+            effective_midtone_gamma,
             per_channel_midtone_gamma,
             per_channel_widths,
             preflash_params,
@@ -2075,7 +2081,7 @@ class GPUEngine:
             resolve_saturation_matrix,
         )
 
-        exp = settings.exposure
+        exp = printed_exposure(settings.process, settings.exposure)
         paper = effective_paper_profile(exp.paper_profile, settings.process.process_mode)
         pc = effective_constants(paper)  # tonal overrides; non-paper keys == EXPOSURE_CONSTANTS
         d_min = paper.d_min if exp.paper_dmin else 0.0
@@ -2090,6 +2096,7 @@ class GPUEngine:
             neutral_axis_refs,
             exp.cast_removal_strength,
         )
+        mg = effective_midtone_gamma(paper, exp.midtone_gamma)
         slopes, pivots, curvatures = per_channel_curve_params(
             exp.grade,
             exp.density,
@@ -2103,14 +2110,17 @@ class GPUEngine:
             neutral_axis_norm=neutral_axis_norm,
             grade_trims=(exp.grade_trim_red, exp.grade_trim_green, exp.grade_trim_blue),
             shadow_point=shadow_point,
+            midtone_gamma=mg,
         )
         hl_auto = (
-            highlight_hold_offset(slopes[1], pivots[1], highlight_point, d_min=d_min, paper=paper, preflash=exp.preflash, grade=exp.grade)
+            highlight_hold_offset(
+                slopes[1], pivots[1], highlight_point, d_min=d_min, paper=paper, preflash=exp.preflash, grade=exp.grade, midtone_gamma=mg
+            )
             if exp.auto_normalize_contrast and highlight_point is not None
             else 0.0
         )
         sh_auto = (
-            shadow_hold_offset(slopes[1], pivots[1], shadow_point, d_min=d_min, paper=paper)
+            shadow_hold_offset(slopes[1], pivots[1], shadow_point, d_min=d_min, paper=paper, midtone_gamma=mg)
             if exp.auto_normalize_contrast and shadow_point is not None
             else 0.0
         )
@@ -2192,7 +2202,12 @@ class GPUEngine:
         key_rows = np.zeros((MAX_KEYED_MASKS, 4), dtype=np.float32)
         if key_params is not None:
             key_rows[: len(key_params)] = key_params
-        contrast_mask_scale_v = float(contrast_mask[0]) if contrast_mask else 0.0
+        # (lim, a, b, lo, hi, g_lo, g_hi); lim 0 = off.
+        mask_k = (0.0,) * 7
+        if contrast_mask:
+            coeffs = contrast_mask_coeffs(exp.contrast_mask_strength, contrast_mask[0], slopes, pivots, wb_offsets, lum_range)
+            if coeffs is not None:
+                mask_k = (coeffs[6], *coeffs[:6])
         plane_rect_v = (
             tuple(float(v) for v in contrast_mask[1:])
             if contrast_mask
@@ -2224,7 +2239,7 @@ class GPUEngine:
                 exp.highlight_yellow * cmy_m,
                 _sh3[2],
             )
-            # Asymmetric H&D print-curve scalars; mirrors _apply_print_curve_kernel.
+            # Asymmetric H&D print-curve scalars; mirrors negpy_core print_curve.rs.
             # Per-channel knee widths occupy the dead scalar toe/shoulder/
             # midtone_gamma slots and the former flare pad (see exposure.wgsl).
             + struct.pack(
@@ -2243,7 +2258,7 @@ class GPUEngine:
                 sep_damping,
                 pc["toe_height"],
                 pc["shoulder_height"],
-                pc["anchor_target_density"],
+                pc["reference_print_density"],
                 _sw3[1],
                 # Separation Damping's per-layer k, red (ex-surround_gamma slot). Green and
                 # blue ride the split_sh/split_hi w-lanes.
@@ -2279,12 +2294,14 @@ class GPUEngine:
                 "ffff",
                 math.radians(float(settings.process.hue_trim)),
                 max(exp.preflash, 0.0),
-                *preflash_params(exp.grade, d_min, paper),
+                *preflash_params(exp.grade, d_min, paper, mg),
             )
-            # Contrast Mask: stops per plane unit (0 = off), then the printed frame's origin and span in rotated pixels, shared
-            # with the Diffusion plane; w = the diffusion mix (0 = off). The shader does the upscale.
-            + struct.pack("ffff", contrast_mask_scale_v, plane_rect_v[0], plane_rect_v[1], diffusion_mix)
-            + struct.pack("ffff", plane_rect_v[2], plane_rect_v[3], 0.0, 0.0)
+            # Contrast Mask: its stop cap (0 = off), then the printed frame's origin and span in rotated pixels, shared
+            # with the Diffusion plane; w = the diffusion mix (0 = off). The shader does the upscale. The span's
+            # zw and the next row carry the rest of contrast_mask_coeffs.
+            + struct.pack("ffff", mask_k[0], plane_rect_v[0], plane_rect_v[1], diffusion_mix)
+            + struct.pack("ffff", plane_rect_v[2], plane_rect_v[3], mask_k[3], mask_k[4])
+            + struct.pack("ffff", mask_k[1], mask_k[2], mask_k[5], mask_k[6])
             + key_rows.tobytes()
             + key_meta
             # Diffusion: each channel's log range, one normalized unit of val in density; w = the
@@ -2292,6 +2309,7 @@ class GPUEngine:
             + struct.pack("ffff", *channel_density_ranges(LogNegativeBounds(adj_floors, adj_ceils)), black_hold_taper(exp, paper))
             # Print-stock LUT: xyz = e_max (0 = no LUT), w = the black that BPC maps to 0.
             + struct.pack("ffff", *lut_row)
+            + struct.pack("ffff", *collapse_weights(settings.process, exp), 0.0)
         )
 
         cls = float(settings.lab.clahe_strength)
@@ -2805,6 +2823,7 @@ class GPUEngine:
         memory_bounded: bool = False,
         render_size_ref: Optional[float] = None,
         film_base: Optional[tuple] = None,
+        source_base_log: Any = NOT_READ,
     ) -> Tuple[np.ndarray, Dict[str, Any]]:
         """High-level processing entry point with automatic tiling."""
         self._init_resources()
@@ -2821,6 +2840,7 @@ class GPUEngine:
                 memory_bounded=memory_bounded,
                 render_size_ref=render_size_ref,
                 film_base=film_base,
+                source_base_log=source_base_log,
             )
         tex_final, metrics = self.process_to_texture(
             img,
@@ -2834,8 +2854,11 @@ class GPUEngine:
             analysis_source_hash=analysis_source_hash,
             render_size_ref=render_size_ref,
             film_base=film_base,
+            source_base_log=source_base_log,
         )
-        return self._readback_downsampled(tex_final), metrics
+        out = self._readback_downsampled(tex_final)
+        timing.lap("GPU wait/readback")
+        return out, metrics
 
     def _process_tiled(
         self,
@@ -2849,6 +2872,7 @@ class GPUEngine:
         readback_metrics: bool = True,
         memory_bounded: bool = False,
         render_size_ref: Optional[float] = None,
+        source_base_log: Any = NOT_READ,
     ) -> Tuple[np.ndarray, Dict[str, Any]]:
         """Processes ultra-high resolution images using memory-efficient tiling."""
         h, w = img.shape[:2]
@@ -2898,21 +2922,23 @@ class GPUEngine:
             )
 
         preview_scale = APP_CONFIG.preview_render_size / max(h, w)
-        img_small = cv2.resize(img, (int(w * preview_scale), int(h * preview_scale)))
+        img_small = negpy_core.resize_linear(np.ascontiguousarray(img, dtype=np.float32), (int(w * preview_scale), int(h * preview_scale)))
 
         # This render meters the whole frame for the tiles; the CLAHE CDF it leaves behind
         # is the one they share. Taken from here rather than from the last preview, which
         # may belong to another image or to settings the export has since moved past.
-        _, metrics_ref = self.process_to_texture(
-            img_small,
-            settings,
-            scale_factor=scale_factor,
-            cam_xyz=cam_xyz,
-            camera_wb=camera_wb,
-            readback_metrics=readback_metrics,
-            apply_layout=False,
-            film_base=film_base,
-        )
+        with timing.step("reference pass"):
+            _, metrics_ref = self.process_to_texture(
+                img_small,
+                settings,
+                scale_factor=scale_factor,
+                cam_xyz=cam_xyz,
+                camera_wb=camera_wb,
+                readback_metrics=readback_metrics,
+                apply_layout=False,
+                film_base=film_base,
+                source_base_log=source_base_log,
+            )
 
         global_cdfs = self._readback_clahe_cdf()
 
@@ -3043,14 +3069,14 @@ class GPUEngine:
             global_highlight_point = measure_highlight_point_from_log(_meter_grid(), meter_bounds, None, 0.0)
 
         global_mask = None
-        if settings.exposure.contrast_mask != 0.0:
+        if settings.exposure.contrast_mask_strength > 0.0 and render_path(settings.process) is RenderPath.PRINT:
             global_mask = (
                 *contrast_mask_plane(
                     img,
                     global_bounds,
                     unmix_m,
                     roi_norm=normalized_roi(roi, (h_rot, w_rot)),
-                    spacer=settings.exposure.mask_spacer,
+                    bw_weights=plane_weights(settings.process, settings.exposure),
                     **geometry_kwargs(settings.geometry, k1_eff),
                 ),
                 (x1, y1, crop_w, crop_h),
@@ -3069,7 +3095,7 @@ class GPUEngine:
                 roi_norm=normalized_roi(roi, (h_rot, w_rot)),
                 **geometry_kwargs(settings.geometry, k1_eff),
             )
-            plane = diffusion_plane(grid, trimmed, settings.process.process_mode == ProcessMode.BW)
+            plane = diffusion_plane(grid, trimmed, plane_weights(settings.process, settings.exposure))
             global_diffusion = None if plane is None else (plane, (x1, y1, crop_w, crop_h))
             self._mask_tex_key = None
 
@@ -3120,68 +3146,66 @@ class GPUEngine:
         pending: Optional[tuple] = None
         tile_index = 0
         pooled_shape: Optional[tuple] = None  # low VRAM: the one tile input shape the pool holds
-        for ty in range(0, crop_h, tile_size):
-            for tx in range(0, crop_w, tile_size):
-                tw, th = min(tile_size, crop_w - tx), min(tile_size, crop_h - ty)
-                ix1, iy1 = max(0, x1 + tx - halo), max(0, y1 + ty - halo)
-                ix2, iy2 = (
-                    min(w_rot, x1 + tx + tw + halo),
-                    min(h_rot, y1 + ty + th + halo),
-                )
-                maps_tile = np.ascontiguousarray(local_maps_rot[iy1:iy2, ix1:ix2]) if local_maps_rot is not None else None
-                ox, oy = x1 + tx - ix1, y1 + ty - iy1
-                if low_vram and pooled_shape not in (None, (iy2 - iy1, ix2 - ix1)):
-                    self._release_texture_pool()
-                pooled_shape = (iy2 - iy1, ix2 - ix1)
-                tile_res, _ = self.process_to_texture(
-                    img_rot[iy1:iy2, ix1:ix2],
-                    settings,
-                    scale_factor=scale_factor,
-                    tiling_mode=True,
-                    bounds_override=global_bounds,
-                    metered_anchor_override=global_metered_anchor,
-                    textural_range_override=global_textural_range,
-                    neutral_axis_override=global_neutral_axis,
-                    shadow_point_override=global_shadow_point,
-                    highlight_point_override=global_highlight_point,
-                    global_offset=(ix1, iy1),
-                    full_dims=(w_rot, h_rot),
-                    clahe_cdf_override=global_cdfs,
-                    apply_layout=False,
-                    vignette_full_crop=(crop_w, crop_h, tx - ox, ty - oy),
-                    local_maps=maps_tile,
-                    cam_xyz=cam_xyz,
-                    camera_wb=camera_wb,
-                    contrast_mask_override=global_mask,
-                    sabattier_sigma_override=sabattier_sigma,
-                    diffusion_override=global_diffusion,
-                )
-                handle = self._submit_readback(tile_res, slot=0 if low_vram else tile_index % 2)
-                if low_vram:
-                    self._resolve_readback(handle, full_source_res[ty : ty + th, tx : tx + tw], (oy, ox))
-                else:
-                    if pending is not None:
-                        p_handle, p_ty, p_tx, p_th, p_tw, p_oy, p_ox = pending
-                        self._resolve_readback(p_handle, full_source_res[p_ty : p_ty + p_th, p_tx : p_tx + p_tw], (p_oy, p_ox))
-                    pending = (handle, ty, tx, th, tw, oy, ox)
-                tile_index += 1
-        if pending is not None:
-            p_handle, p_ty, p_tx, p_th, p_tw, p_oy, p_ox = pending
-            self._resolve_readback(p_handle, full_source_res[p_ty : p_ty + p_th, p_tx : p_tx + p_tw], (p_oy, p_ox))
-        if low_vram:
-            self._release_texture_pool()
+        timing.lap("global bounds/setup")
+        with timing.step("tiles"):
+            for ty in range(0, crop_h, tile_size):
+                for tx in range(0, crop_w, tile_size):
+                    tw, th = min(tile_size, crop_w - tx), min(tile_size, crop_h - ty)
+                    ix1, iy1 = max(0, x1 + tx - halo), max(0, y1 + ty - halo)
+                    ix2, iy2 = (
+                        min(w_rot, x1 + tx + tw + halo),
+                        min(h_rot, y1 + ty + th + halo),
+                    )
+                    maps_tile = np.ascontiguousarray(local_maps_rot[iy1:iy2, ix1:ix2]) if local_maps_rot is not None else None
+                    ox, oy = x1 + tx - ix1, y1 + ty - iy1
+                    if low_vram and pooled_shape not in (None, (iy2 - iy1, ix2 - ix1)):
+                        self._release_texture_pool()
+                    pooled_shape = (iy2 - iy1, ix2 - ix1)
+                    tile_res, _ = self.process_to_texture(
+                        img_rot[iy1:iy2, ix1:ix2],
+                        settings,
+                        scale_factor=scale_factor,
+                        tiling_mode=True,
+                        bounds_override=global_bounds,
+                        metered_anchor_override=global_metered_anchor,
+                        textural_range_override=global_textural_range,
+                        neutral_axis_override=global_neutral_axis,
+                        shadow_point_override=global_shadow_point,
+                        highlight_point_override=global_highlight_point,
+                        global_offset=(ix1, iy1),
+                        full_dims=(w_rot, h_rot),
+                        clahe_cdf_override=global_cdfs,
+                        apply_layout=False,
+                        vignette_full_crop=(crop_w, crop_h, tx - ox, ty - oy),
+                        local_maps=maps_tile,
+                        cam_xyz=cam_xyz,
+                        camera_wb=camera_wb,
+                        contrast_mask_override=global_mask,
+                        sabattier_sigma_override=sabattier_sigma,
+                        diffusion_override=global_diffusion,
+                    )
+                    handle = self._submit_readback(tile_res, slot=0 if low_vram else tile_index % 2)
+                    if low_vram:
+                        self._resolve_readback(handle, full_source_res[ty : ty + th, tx : tx + tw], (oy, ox))
+                    else:
+                        if pending is not None:
+                            p_handle, p_ty, p_tx, p_th, p_tw, p_oy, p_ox = pending
+                            self._resolve_readback(p_handle, full_source_res[p_ty : p_ty + p_th, p_tx : p_tx + p_tw], (p_oy, p_ox))
+                        pending = (handle, ty, tx, th, tw, oy, ox)
+                    tile_index += 1
+            if pending is not None:
+                p_handle, p_ty, p_tx, p_th, p_tw, p_oy, p_ox = pending
+                self._resolve_readback(p_handle, full_source_res[p_ty : p_ty + p_th, p_tx : p_tx + p_tw], (p_oy, p_ox))
+            if low_vram:
+                self._release_texture_pool()
 
         # Mirrors PrintService.apply_layout: only INTER_AREA is area-correct on a shrink.
         shrinking = content_w < crop_w or content_h < crop_h
-        scaled_content = (
-            cv2.resize(
-                full_source_res,
-                (content_w, content_h),
-                interpolation=cv2.INTER_AREA if shrinking else cv2.INTER_LANCZOS4,
-            )
-            if (content_w != crop_w or content_h != crop_h)
-            else full_source_res
-        )
+        scaled_content = full_source_res
+        if content_w != crop_w or content_h != crop_h:
+            src = np.ascontiguousarray(full_source_res, dtype=np.float32)
+            size = (content_w, content_h)
+            scaled_content = negpy_core.resize_area(src, size) if shrinking else negpy_core.resize_kernel(src, size, lanczos=True)
         # No border means the paper buffer is a full-res allocation, fill and copy that
         # reproduces the content exactly.
         if (paper_w, paper_h, off_x, off_y) == (content_w, content_h, 0, 0):

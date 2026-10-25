@@ -1,11 +1,13 @@
 import os
 import tempfile
 
+import negpy_core
 import numpy as np
 import tifffile
 
 from negpy.infrastructure.scanners.result import ScanResult
 from negpy.kernel.system.logging import get_logger
+from negpy.kernel.system.paths import apply_umask_mode
 
 logger = get_logger(__name__)
 
@@ -35,7 +37,7 @@ def _to_grey(rgb: np.ndarray) -> np.ndarray:
     """
     if rgb.ndim == 2:
         return rgb
-    return ((np.sum(rgb, axis=-1, dtype=np.uint32) + 1) // 3).astype(rgb.dtype)
+    return negpy_core.to_grey(np.ascontiguousarray(rgb))
 
 
 def write_tiff_16bit(result: ScanResult, path: str, *, mono: bool = False) -> str:
@@ -67,6 +69,7 @@ def write_tiff_16bit(result: ScanResult, path: str, *, mono: bool = False) -> st
             iccprofile=None if mono else result.icc_profile,
             **tags,
         )
+        apply_umask_mode(tmp_path)
         os.replace(tmp_path, path)
     except Exception:
         if os.path.exists(tmp_path):
@@ -81,6 +84,7 @@ def write_tiff_16bit(result: ScanResult, path: str, *, mono: bool = False) -> st
         os.close(fd_ir)
         try:
             tifffile.imwrite(tmp_ir, ir_data, photometric="minisblack", compression="zlib", predictor=True, **tags)
+            apply_umask_mode(tmp_ir)
             os.replace(tmp_ir, ir_path)
         except Exception:
             if os.path.exists(tmp_ir):
@@ -97,6 +101,7 @@ def write_tiff_16bit(result: ScanResult, path: str, *, mono: bool = False) -> st
         os.close(fd_v)
         try:
             tifffile.imwrite(tmp_v, valid_data, photometric="minisblack", compression="zlib", predictor=True)
+            apply_umask_mode(tmp_v)
             os.replace(tmp_v, valid_path)
         except Exception:
             if os.path.exists(tmp_v):

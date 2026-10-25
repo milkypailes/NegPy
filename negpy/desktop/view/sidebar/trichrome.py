@@ -18,17 +18,10 @@ class TrichromeSidebar(BaseSidebar):
             "mdi.google-circles-communities",
             tr("Trichrome Mode"),
             self.controller.rgb_scan_mode_for_roll(self.state.active_roll_id),
-            wrap_tooltip(
-                tr(
-                    "Assemble each frame from its red, green and blue exposures, grouped in capture order on load. "
-                    "Each roll keeps its own mode."
-                )
-            ),
+            wrap_tooltip(tr("Make each frame from three exposures (red, green and blue), a setting that each roll keeps.")),
             align_left=True,
         )
-        self.edit_btn = self._icon_action(
-            "fa5s.pen", tr("Edit Triplet…: assign this frame's three exposures by hand, for a frame the grouping got wrong")
-        )
+        self.edit_btn = self._icon_action("fa5s.pen", tr("Edit Triplet…: pick this frame's three exposures by hand."))
         row = QHBoxLayout()
         row.addWidget(self.enable_btn, 1)
         row.addWidget(self.edit_btn)
@@ -69,10 +62,10 @@ class TrichromeSidebar(BaseSidebar):
             self.enable_btn.setChecked(self.controller.rgb_scan_mode_for_roll(self.state.active_roll_id))
             self.edit_btn.setEnabled(bool(self.state.uploaded_files))
             if is_rgb_triplet(conf):
-                green, blue = os.path.basename(conf.green_path), os.path.basename(conf.blue_path)
-                self.hint.setText(tr("This frame is assembled with {green} and {blue}.", green=green, blue=blue))
+                parts = [os.path.basename(p) for p in (self.state.current_file_path or "", conf.green_path, conf.blue_path) if p]
+                self.hint.setText(tr("Assembled from {others} and {last}.", others=", ".join(parts[:-1]), last=parts[-1]))
             else:
-                self.hint.setText(tr("This frame is a single exposure."))
+                self.hint.setText(tr("This frame is one exposure, not a Trichrome triplet."))
         finally:
             self.block_signals(False)
 

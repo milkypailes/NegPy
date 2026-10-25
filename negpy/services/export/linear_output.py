@@ -9,12 +9,13 @@ from dataclasses import dataclass, replace
 from typing import Any, Optional
 
 import imagecodecs
+import negpy_core
 import numpy as np
 import rawpy
 import tifffile as _tifffile
 
 from negpy.features.flatfield.logic import apply_flatfield as _apply_flatfield_correction
-from negpy.features.retouch.models import IR_METHOD_OPENICE, RetouchConfig
+from negpy.features.retouch.models import RetouchConfig
 from negpy.features.flatfield.models import FlatFieldConfig
 from negpy.domain.models import TiffCompression
 from negpy.features.metadata.resolution import Resolution
@@ -278,13 +279,11 @@ def wb_bake_block_reason(rgbscan: Optional[RgbScanConfig], process: Optional[Pro
     """Why baking the as-shot WB gains cannot apply — "trichrome", "narrowband", or "" when it can.
 
     The as-shot gains are the camera's correction for a broadband scene under some assumed
-    illuminant. A narrowband capture (Trichrome's three isolated exposures, or a Single-Shot
-    Narrowband profile) has no such scene: the gains are an artifact of whatever preset was
+    illuminant. A narrowband capture (Trichrome's three isolated exposures, or a Single Exposure with a sensor crosstalk profile) has no such scene: the gains are an artifact of whatever preset was
     dialed on the camera, not a correction the light or the film calls for. Channel separation
     for these captures comes from the triplet or the sensor unmix instead.
 
-    Single-Shot Narrowband is flagged by a calibrated sensor matrix (Single-Shot Narrowband
-    Calibration).
+    A Single Exposure under narrowband light is flagged by its calibrated sensor crosstalk matrix.
     """
     if rgbscan is not None and is_rgb_triplet(rgbscan):
         return "trichrome"
@@ -295,12 +294,6 @@ def wb_bake_block_reason(rgbscan: Optional[RgbScanConfig], process: Optional[Pro
 
 def _apply_ice(rgb: np.ndarray, ir: np.ndarray, retouch: RetouchConfig) -> np.ndarray:
     """Apply IR dust correction to a linear RGB buffer using the IR channel."""
-    if retouch.ir_method == IR_METHOD_OPENICE:
-        from negpy.features.retouch import openice
-
-        corrected, _, _, _ = openice.run(rgb, ir, float(retouch.ir_threshold), None)
-        return corrected
-
     from negpy.features.retouch.logic import (
         apply_ir_attenuation,
         apply_score_repair,
@@ -315,10 +308,8 @@ def _apply_ice(rgb: np.ndarray, ir: np.ndarray, retouch: RetouchConfig) -> np.nd
     ir_det = downsample_ir(np.ascontiguousarray(ir, dtype=np.float32), target)
     h, w = rgb.shape[:2]
     if max(h, w) > target:
-        import cv2
-
         s = target / max(h, w)
-        rgb_det = cv2.resize(rgb, (max(1, round(w * s)), max(1, round(h * s))), interpolation=cv2.INTER_AREA)
+        rgb_det = negpy_core.resize_area(np.ascontiguousarray(rgb, dtype=np.float32), (max(1, round(w * s)), max(1, round(h * s))))
     else:
         rgb_det = rgb
     ratio_det, gain_det, degenerate, _ = ir_ratio_and_gain(ir_det, rgb_det)

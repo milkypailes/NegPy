@@ -10,57 +10,62 @@ class ThemeConfig:
 
     # Fonts (families are resolved at runtime in styles/fonts.py). Four roles, in px:
     # small = caption/hint, base = body (also the QSS global), header = section, title = dialog.
-    # display is the sidebar wordmark alone.
     font_size_small: int = 12
     font_size_base: int = 13
     font_size_header: int = 14
     font_size_title: int = 16
-    font_size_display: int = 24
     # Chart axis and swatch captions only: the one size below the reading scale.
     font_size_micro: int = 9
 
     # Colors. Surfaces, darkest first.
-    bg_dark: str = "#0D0D0D"
-    bg_panel: str = "#0D0D0D"
-    bg_input: str = "#0A0A0A"
-    bg_card: str = "#121212"
-    bg_header: str = "#161616"
-    bg_status_bar: str = "#0a0a0a"
-    bg_selected: str = "#222222"
-    bg_hover: str = "#262626"
-    bg_menu_selected: str = "#2E2E2E"
-    # The checked-toggle tint: warm, so an engaged tool reads apart from a hovered one.
-    bg_checked: str = "#2A1D1D"
-    bg_checked_hover: str = "#351F1F"
-    bg_accent_muted: str = "#1A1414"
-    border_input: str = "#1A1A1A"
-    border_primary: str = "#262626"
-    border_color: str = "#333333"
-    border_hover: str = "#3A3A3A"
+    # bg_dark is also the macOS window background (view/mac_window.py): an alternate theme updates that fix.
+    bg_dark: str = "#252525"
+    bg_panel: str = "#252525"
+    bg_input: str = "#222222"
+    bg_card: str = "#2A2A2A"
+    bg_header: str = "#2E2E2E"
+    bg_selected: str = "#3A3A3A"
+    bg_hover: str = "#3E3E3E"
+    bg_menu_selected: str = "#464646"
+    # A checked toggle and a segmented control's current choice; also the Scan button's tint
+    # while it cannot start or while it reads Stop.
+    bg_checked: str = "#423535"
+    bg_checked_hover: str = "#4D3737"
+    border_checked: str = "#623C3C"
+    border_checked_hover: str = "#764242"
+    # The primary action: the strongest button on a panel.
+    bg_primary: str = "#623434"
+    bg_primary_hover: str = "#723939"
+    # An edited card's frame-scope stripe and lit Frame icon; a roll-scope card takes border_checked_hover.
+    border_scope_frame: str = "#5D4B24"
+    # The dot on an edited control. A warning takes a sign in warn_amber, never a dot.
+    mark_edited: str = "#C79A3A"
+    bg_accent_muted: str = "#322C2C"
+    border_input: str = "#323232"
+    border_primary: str = "#3E3E3E"
+    border_color: str = "#4B4B4B"
+    border_hover: str = "#525252"
+    # Keyboard focus: a neutral edge, as hover and the arrow-key row are neutral.
+    border_focus: str = "#7A7A7A"
     border_indicator: str = "#5A5A5A"
-    border_indicator_hover: str = "#8A8A8A"
-    bg_indicator: str = "#1A1A1A"
-    bg_indicator_hover: str = "#202020"
-    bg_indicator_disabled: str = "#141414"
-    slider_disabled: str = "#555555"
-    slider_fill_disabled: str = "#2A2A2A"
+    slider_disabled: str = "#6D6D6D"
     text_on_accent: str = "#FFFFFF"
     text_primary: str = "#E4E4E4"
     text_secondary: str = "#B4B4B4"
-    # hint = readable secondary copy (6.4:1 on bg_panel); muted = disabled widgets only, and
-    # too dim (3.6:1) for text a user must read.
+    # hint = readable secondary copy (5.0:1 on bg_panel); muted = disabled widgets only, and
+    # too dim (2.9:1) for text a user must read.
     text_hint: str = "#949494"
     text_muted: str = "#6B6B6B"
     text_unit: str = "#7C7C7C"
     warn_amber: str = "#C79A3A"
-    accent_primary: str = "#B71C1C"
-    accent_secondary: str = "#C62828"
-    accent_pressed: str = "#8E1414"
-    # Errors and invalid input. Not the brand accent: red already means "selected" and "armed".
+    # Marks drawn over the photo: white on a dark edge or plate, which reads on any picture.
+    mark_photo: str = "#FFFFFF"
+    # The dark edge or plate under a photo mark; each site sets its own alpha (templates.with_alpha).
+    mark_shadow: str = "#000000"
+    # Errors and invalid input. Error copy takes the lighter tier, as the channel colors do: error
+    # falls under 4.5:1 on a card, and a lighter error would dim the white mark on a failed-frame badge.
     error: str = "#D32F2F"
-
-    slider_height_compact: int = 18
-    header_padding: int = 10
+    error_text: str = "#FF5A5A"
 
     # Spacing scale (px)
     space_xs: int = 2
@@ -78,10 +83,13 @@ class ThemeConfig:
     # Surface overlay tokens (rgba). Integer alpha where a widget sheet reads it.
     surface_scrim: str = "rgba(5, 5, 5, 115)"
     surface_pill: str = "rgba(0, 0, 0, 140)"
-    surface_hover_faint: str = "rgba(255, 255, 255, 12)"
-    surface_overlay: str = "rgba(13,13,13,0.88)"
-    surface_overlay_strong: str = "rgba(26,26,26,0.82)"
-    surface_overlay_hover: str = "rgba(34,34,34,0.88)"
+    surface_reveal_flash: str = "rgba(118, 66, 66, 0.35)"  # border_checked_hover, faint
+    surface_hover_faint: str = "#0CFFFFFF"  # #AARRGGBB: QColor reads it, not rgba()
+    surface_overlay: str = "rgba(37,37,37,0.88)"
+    # A card header over its chart: light enough for the chart to read through.
+    header_veil: str = "rgba(50,50,50,0.55)"
+    header_veil_hover: str = "rgba(58,58,58,0.62)"
+    surface_overlay_hover: str = "rgba(58,58,58,0.88)"
     # Canvas toast / loading chip plate. Integer alpha: QSS float alpha is not reliably parsed.
     surface_toast: str = "rgba(10, 10, 10, 225)"
     border_toast: str = "rgba(255, 255, 255, 55)"
@@ -107,9 +115,6 @@ class ThemeConfig:
     # Dodge & Burn: the same amber and blue on the overlay, the mask list and the printing notes.
     dodge: str = "#E8C84A"
     burn: str = "#4A8FE8"
-    # Clipping and paper-limit warnings drawn on charts and the zone overlay.
-    clip_warning: str = "#DC5050"
-    clip_shadow: str = "#508CDC"
     # Contrast Mask band on the Analysis chart.
     chart_mask: str = "#AF8CFF"
     # Film-mode chips: orange mask, silver grey, slide blue.
@@ -121,7 +126,8 @@ class ThemeConfig:
     canvas_bg_black: str = "#050505"
     canvas_bg_dark_grey: str = "#1C1C1C"
     canvas_bg_mid_grey: str = "#404040"
-    canvas_bg_white: str = "#FFFFFF"
+    canvas_bg_light_grey: str = "#A0A0A0"
+    canvas_bg_white: str = "#E6E6E6"
 
     # Status semantic
     status_success: str = "#1D9E75"
@@ -130,7 +136,7 @@ class ThemeConfig:
         default_factory=lambda: {
             "analysis": True,
             "baseline": True,
-            "process": True,
+            "process": False,
             "color": True,
             "tone": True,
             "paper": True,
@@ -145,7 +151,7 @@ class ThemeConfig:
 
 
 THEME = ThemeConfig()
-# Scene marks cycle through existing tokens; red is left out because it means selected/armed.
+# Scene marks cycle through existing tokens; red is left out because it reads as an error or the selection mat.
 SCENE_COLORS = (THEME.channel_blue, THEME.status_success, THEME.warn_amber, THEME.filter_magenta, THEME.filter_cyan, THEME.mode_c41)
 
 
