@@ -5,12 +5,14 @@ from negpy.domain.interfaces import PipelineContext
 from negpy.domain.types import ImageBuffer
 from negpy.features.lab.logic import (
     apply_chroma_denoise,
+    chroma_denoise_radius,
     apply_glow_and_halation,
-    apply_usm_sharpening,
-    apply_rl_sharpening,
+    apply_lab_sharpening,
     apply_saturation,
+    auto_masking,
 )
-from negpy.features.lab.models import LabConfig, SharpenMethod
+from negpy.features.lab.models import LabConfig
+from negpy.features.process.models import ProcessMode
 
 
 class PhotoLabProcessor:
@@ -23,22 +25,25 @@ class PhotoLabProcessor:
         """
         img = image
 
-        if self.config.chroma_denoise > 0:
-            img = apply_chroma_denoise(img, self.config.chroma_denoise, context.scale_factor)
+        chroma_radius = chroma_denoise_radius(self.config.chroma_denoise, context.process_mode)
+        if chroma_radius > 0:
+            img = apply_chroma_denoise(img, chroma_radius, context.scale_factor)
 
         if self.config.saturation != 1.0 or self.config.skin_protection > 0:
             img = apply_saturation(img, self.config.saturation, self.config.skin_protection)
 
         if self.config.sharpen > 0:
-            sharpen = apply_rl_sharpening if self.config.sharpen_method == SharpenMethod.RL else apply_usm_sharpening
-            img = sharpen(
-                img,
-                self.config.sharpen,
-                radius=self.config.sharpen_radius,
-                masking=self.config.sharpen_masking,
-            )
+            auto = auto_masking(img, self.config)
+            if auto is not None:
+                context.metrics["auto_masking"] = auto
+            img = apply_lab_sharpening(img, self.config, auto)
 
         if self.config.glow_amount > 0 or self.config.halation_strength > 0:
-            img = apply_glow_and_halation(img, self.config.glow_amount, self.config.halation_strength, context.scale_factor)
+            img = apply_glow_and_halation(
+                img,
+                self.config.glow_amount,
+                self.config.halation_strength,
+                bw=context.process_mode == ProcessMode.BW,
+            )
 
         return negpy_core.clip01(np.ascontiguousarray(img, dtype=np.float32))

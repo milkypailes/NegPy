@@ -24,6 +24,7 @@ def _sidebar(adopt=True):
     ctrl = MagicMock()
     ctrl.session.repo.get_global_setting.return_value = {}
     w = ScanlightSidebar(ctrl)
+    w._exposure_chosen = True  # these tests are not about metering; the unmetered tests clear it
     if adopt:  # every built-in in the dropdown, as a user who picked them all under +
         w._settings = replace(w._settings, adopted_presets=tuple(_BUILTIN_PRESETS))
         w._reload_presets()
@@ -2821,3 +2822,194 @@ def test_a_scan_that_ends_dark_shows_the_light_off():
     w._on_light_set(25, 12, 11, 0)
     _finish_scan(w)
     assert not w.light_btn.isChecked()
+
+
+def _unmetered_camera_sidebar(tmp_path, monkeypatch, answers):
+    """A camera-only sidebar with no exposure chosen; the confirmation answers from `answers`."""
+    w = _sidebar()
+    w.output.folder_edit.setText(str(tmp_path))
+    w._camera_verified = True
+    w._set_rgb_mode(False)
+    w._exposure_chosen = False
+    asked = []
+    monkeypatch.setattr("negpy.desktop.view.sidebar.scanlight.confirm_unmetered_scan", lambda *_a: asked.append(1) or answers.pop(0))
+    return w, asked
+
+
+def test_an_unmetered_scan_asks_first_and_cancel_shoots_nothing(tmp_path, monkeypatch):
+    w, asked = _unmetered_camera_sidebar(tmp_path, monkeypatch, [False])
+
+    w._start_capture(retake=False)
+
+    assert asked == [1]
+    w.controller.start_capture.assert_not_called()
+
+
+def test_an_unmetered_scan_asks_once_per_camera_connection(tmp_path, monkeypatch):
+    w, asked = _unmetered_camera_sidebar(tmp_path, monkeypatch, [True, True])
+
+    w._start_capture(retake=False)
+    w.set_scanning(False)
+    w._start_capture(retake=False)
+    assert asked == [1] and w.controller.start_capture.call_count == 2
+
+    w._on_poll_status(_poll(usb_ok=False, light_ok=False))
+    w._on_poll_status(_poll(usb_ok=True, usb_model="D3300", light_ok=False))
+    w.set_scanning(False)
+    w._start_capture(retake=False)
+    assert asked == [1, 1]
+
+
+def test_a_preset_shutter_scans_without_asking(tmp_path, monkeypatch):
+    w, asked = _unmetered_camera_sidebar(tmp_path, monkeypatch, [])
+    w._set_rgb_mode(True)
+    w._settings = replace(w._settings, white_mode=False, shutter_r="1/60", shutter_g="1/60", shutter_b="1/60")
+
+    assert not w._scan_uses_camera_exposure()
+    w._settings = replace(w._settings, white_mode=True, shutter_w="")
+    assert w._scan_uses_camera_exposure()
+    assert asked == []
+
+
+def test_a_clipped_capture_pins_a_retake_advice():
+    w = _sidebar()
+
+    w._on_clipped("/scans/Roll01_Frame010.NEF", 0.356)
+
+    assert "Frame 010" in w.status_strip.message() and "36%" in w.status_strip.message()
+    assert w._status_pinned
+
+
+@pytest.mark.parametrize("single", [False, True])
+def test_a_calibrated_preset_scans_without_asking(tmp_path, monkeypatch, single):
+    w, asked = _unmetered_camera_sidebar(tmp_path, monkeypatch, [])
+    w._set_rgb_mode(True)
+    w._light_verified = True
+    w._apply_preset(ScanlightPreset(r_level=200, g_level=150, b_level=255, shutter_r="1/60", iso="100", single_capture=single))
+    monkeypatch.setattr(w, "_preset_selected", lambda: True)
+
+    w._start_capture(retake=False)
+
+    assert asked == []
+    req = w.controller.start_capture.call_args[0][0]
+    assert req.shutters == ("1/60", "1/60", "1/60")
+
+
+def _dock_poll(**fields):
+    return {**_poll(usb_ok=True, usb_model="ILCE-7M4", light_detail="Lento Dock 35 (fw 1.0.224)"), "light_moves_film": True, **fields}
+
+
+def _dock_sidebar(transport="off", strip_flat=False):
+    w = _sidebar()
+    w._on_poll_status(_dock_poll())
+    w._exposure_chosen = True  # the poll found a new camera, which asks about metering again
+    w.film_choice.setCurrentIndex(w.film_choice.findData(transport))
+    w.strip_flat_btn.setChecked(strip_flat)
+    return w
+
+
+def _scan(w, tmp_path, retake=False):
+    w.output.folder_edit.setText(str(tmp_path))
+    w.output.roll_edit.setText("Roll001")
+    w._start_capture(retake=retake)
+    return w.controller.start_capture.call_args[0][0]
+
+
+def test_the_film_controls_show_only_with_a_light_that_moves_film():
+    w = _sidebar()
+    assert w.dock_body.isHidden()
+    w._on_poll_status(_dock_poll())
+    assert not w.dock_body.isHidden()
+    w._on_poll_status(_poll(usb_ok=True, usb_model="ILCE-7M4"))  # a Scanlight
+    assert w.dock_body.isHidden()
+    w._on_poll_status(_dock_poll())
+    w._set_rgb_mode(False)
+    assert w.dock_body.isHidden()
+
+
+def test_shoot_flat_field_shows_only_for_a_whole_strip():
+    w = _dock_sidebar()
+    assert w.strip_flat_btn.isHidden()
+    w.film_choice.setCurrentIndex(w.film_choice.findData("strip"))
+    assert not w.strip_flat_btn.isHidden()
+    w.film_choice.setCurrentIndex(w.film_choice.findData("next"))
+    assert w.strip_flat_btn.isHidden()
+
+
+def test_the_film_settings_are_saved_and_restored():
+    w = _dock_sidebar("strip", strip_flat=True)
+    key, saved = w.controller.session.repo.save_global_setting.call_args[0]
+    assert key == "scanlight_settings" and saved["film_transport"] == "strip" and saved["strip_flat"] is True
+
+    ctrl = MagicMock()
+    ctrl.session.repo.get_global_setting.return_value = saved
+    restored = ScanlightSidebar(ctrl)
+    assert restored.film_choice.currentData() == "strip" and restored.strip_flat_btn.isChecked()
+
+
+@pytest.mark.parametrize(
+    ("transport", "strip_flat", "expected"),
+    [
+        ("off", False, (False, False, False)),
+        ("next", False, (True, False, False)),
+        ("strip", False, (False, True, False)),
+        ("strip", True, (False, True, True)),
+        ("next", True, (True, False, False)),  # Shoot Flat Field belongs to a whole strip
+    ],
+)
+def test_a_scan_asks_for_what_the_film_choice_says(tmp_path, transport, strip_flat, expected):
+    req = _scan(_dock_sidebar(transport, strip_flat), tmp_path)
+    assert (req.advance_film, req.whole_strip, req.strip_flat) == expected
+
+
+def test_a_retake_never_runs_a_strip(tmp_path):
+    req = _scan(_dock_sidebar("strip", strip_flat=True), tmp_path, retake=True)
+    assert not req.whole_strip and not req.strip_flat
+
+
+def test_a_scanlight_ignores_a_saved_film_choice(tmp_path):
+    w = _dock_sidebar("strip", strip_flat=True)
+    w._on_poll_status(_poll(usb_ok=True, usb_model="ILCE-7M4"))  # the dock was swapped for a Scanlight
+    req = _scan(w, tmp_path)
+    assert not (req.advance_film or req.whole_strip or req.strip_flat)
+
+
+def test_scan_stays_stop_until_the_strip_ends(tmp_path):
+    w = _dock_sidebar("strip")
+    _scan(w, tmp_path)
+    assert w._scanning
+    w._on_finished(["/roll/Roll001_Frame001.ARW"])
+    assert w._scanning  # one frame of the strip, not the strip
+    w._on_strip_finished(6, True)
+    assert not w._scanning
+    assert "6 frames" in w.status_strip.message()
+
+
+def test_stop_during_a_strip_ends_it(tmp_path):
+    w = _dock_sidebar("strip")
+    _scan(w, tmp_path)
+    w._on_cancelled()
+    assert not w._scanning and not w._strip_running
+
+
+def test_eject_asks_the_controller_and_waits_for_the_scan():
+    w = _dock_sidebar()
+    w.eject_btn.click()
+    w.controller.eject_film.assert_called_once()
+    w.set_scanning(True)
+    assert not w.eject_btn.isEnabled()
+
+
+def test_the_docks_scan_button_works_as_scan(monkeypatch):
+    w = _dock_sidebar()
+    started = []
+    monkeypatch.setattr(w, "_start_capture", lambda retake: started.append(retake))
+    w.scan_btn.setEnabled(False)  # not ready to scan
+    w._on_light_scan_button()
+    assert started == []
+    w.scan_btn.setEnabled(True)
+    w._on_light_scan_button()
+    assert started == [False]
+    w._scanning = True
+    w._on_light_scan_button()
+    w.controller.cancel_capture.assert_called_once()

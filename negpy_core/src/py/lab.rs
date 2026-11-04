@@ -87,16 +87,17 @@ fn chroma_denoise<'py>(
     Ok(out)
 }
 
-type BloomArgs = Option<(f32, usize, f64, f64)>;
+type SpreadArgs = ((f32, f32, f32), Vec<(f32, f64)>);
 
-/// `apply_glow_and_halation` of an HxWx3 float32 image. Each bloom is `(amount, ksize, sigma,
-/// threshold)` or None when off; `lum` is the luminance row, `inv_gamma` the working TRC's.
+/// `apply_glow_and_halation` of an HxWx3 float32 image. A spread is `((r, g, b) amounts,
+/// [(weight, sigma)])`, glow `(spread, threshold)`, each None when off; `lum` is the luminance
+/// row, `inv_gamma` the working TRC's.
 #[pyfunction]
 fn glow_and_halation<'py>(
     py: Python<'py>,
     img: PyReadonlyArrayDyn<'py, f32>,
-    glow: BloomArgs,
-    halation: BloomArgs,
+    glow: Option<(SpreadArgs, f64)>,
+    halation: Option<SpreadArgs>,
     lum: (f32, f32, f32),
     inv_gamma: f32,
 ) -> PyResult<Bound<'py, PyArrayDyn<f32>>> {
@@ -106,15 +107,12 @@ fn glow_and_halation<'py>(
     let src = img
         .as_slice()
         .map_err(|_| PyValueError::new_err("needs a contiguous image"))?;
-    let bloom = |b: BloomArgs| {
-        b.map(|(amount, ksize, sigma, threshold)| lab::Bloom {
-            amount,
-            ksize,
-            sigma,
-            threshold,
-        })
+    let spread = |(a, psf): SpreadArgs| lab::Spread {
+        amounts: a.into(),
+        psf,
     };
-    let (glow, halation) = (bloom(glow), bloom(halation));
+    let glow = glow.map(|(s, threshold)| (spread(s), threshold));
+    let halation = halation.map(spread);
     let out = PyArrayDyn::<f32>::zeros(py, img.shape(), false);
     {
         let mut rw = out.readwrite();
@@ -124,7 +122,7 @@ fn glow_and_halation<'py>(
         super::detach(py, dst.len(), || {
             lab::glow_and_halation(src, (h, w), (glow, halation), (lum.into(), inv_gamma), dst)
         })
-        .ok_or_else(|| PyValueError::new_err("a bloom needs an odd kernel size"))?;
+        .ok_or_else(|| PyValueError::new_err("a blur failed"))?;
     }
     Ok(out)
 }
@@ -207,6 +205,24 @@ fn rl_sharpen<'py>(
     Ok(out)
 }
 
+/// `sharpen_grain` of an HxWx3 float32 linear image with the luminance row `lum`.
+#[pyfunction]
+fn sharpen_grain<'py>(
+    py: Python<'py>,
+    img: PyReadonlyArrayDyn<'py, f32>,
+    lum: (f32, f32, f32),
+) -> PyResult<Option<f32>> {
+    let [h, w, 3] = img.shape()[..] else {
+        return Err(PyValueError::new_err("needs an HxWx3 image"));
+    };
+    let src = img
+        .as_slice()
+        .map_err(|_| PyValueError::new_err("needs contiguous arrays"))?;
+    Ok(super::detach(py, src.len(), || {
+        lab::sharpen_grain(src, (h, w), lum.into())
+    }))
+}
+
 /// `apply_split_toning` of an HxWx3 float32 image: each tint is (cos, sin) of its hue times 20
 /// times its strength, or None when off; then the working Lab constants.
 #[pyfunction]
@@ -283,6 +299,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(hue_trim, m)?)?;
     m.add_function(wrap_pyfunction!(split_toning, m)?)?;
     m.add_function(wrap_pyfunction!(rl_sharpen, m)?)?;
+    m.add_function(wrap_pyfunction!(sharpen_grain, m)?)?;
     m.add_function(wrap_pyfunction!(clahe, m)?)?;
     m.add_function(wrap_pyfunction!(glow_and_halation, m)?)?;
     m.add_function(wrap_pyfunction!(usm_sharpen, m)?)?;

@@ -443,6 +443,54 @@ fn normalize_log_image<'py>(
     Ok(out)
 }
 
+/// `unmix_log_image(img_log, matrix)` of an HxWx3 float32 log image.
+#[pyfunction]
+fn unmix_log<'py>(
+    py: Python<'py>,
+    img: PyReadonlyArrayDyn<'py, f32>,
+    m: numpy::PyReadonlyArray2<'py, f32>,
+) -> PyResult<Bound<'py, PyArrayDyn<f32>>> {
+    let shape = img.shape().to_vec();
+    if shape.len() != 3 || shape[2] != 3 {
+        return Err(PyValueError::new_err("unmix_log needs an HxWx3 array"));
+    }
+    let m = super::sensor::matrix(&m)?;
+    let data = slice(&img)?;
+    let out = empty::<f32>(py, &shape, "float32")?;
+    {
+        let mut rw = out.readwrite();
+        let dst = rw
+            .as_slice_mut()
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        super::detach(py, dst.len(), || analysis::unmix_log(data, m, dst));
+    }
+    Ok(out)
+}
+
+/// `relog_matrix_image(img_log, matrix)` of an HxWx3 float32 log image.
+#[pyfunction]
+fn relog_matrix<'py>(
+    py: Python<'py>,
+    img: PyReadonlyArrayDyn<'py, f32>,
+    m: numpy::PyReadonlyArray2<'py, f32>,
+) -> PyResult<Bound<'py, PyArrayDyn<f32>>> {
+    let shape = img.shape().to_vec();
+    if shape.len() != 3 || shape[2] != 3 {
+        return Err(PyValueError::new_err("relog_matrix needs an HxWx3 array"));
+    }
+    let m = super::sensor::matrix(&m)?;
+    let data = slice(&img)?;
+    let out = empty::<f32>(py, &shape, "float32")?;
+    {
+        let mut rw = out.readwrite();
+        let dst = rw
+            .as_slice_mut()
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        super::detach(py, dst.len(), || analysis::relog_matrix(data, m, dst));
+    }
+    Ok(out)
+}
+
 /// `_block_median_grid` of an HxWxC float32 image in `b` x `b` blocks.
 #[pyfunction]
 fn block_median_grid<'py>(
@@ -750,12 +798,12 @@ fn contrast_mask_stops<'py>(
 fn diffusion_tail<'py>(
     py: Python<'py>,
     unmixed: PyReadonlyArrayDyn<'py, f32>,
-    sigma: f64,
+    psf: Vec<(f32, f64)>,
 ) -> PyResult<Bound<'py, PyArrayDyn<f32>>> {
     let (h, w) = rgb_dims(&unmixed, "diffusion_tail")?;
     let data = slice(&unmixed)?;
     filled_f32(py, &[h, w, 3], data.len(), |dst| {
-        analysis::diffusion_tail(data, h, w, sigma, dst)
+        analysis::diffusion_tail(data, h, w, &psf, dst)
     })
 }
 
@@ -782,6 +830,8 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(luminance, m)?)?;
     m.add_function(wrap_pyfunction!(to_log_density, m)?)?;
     m.add_function(wrap_pyfunction!(log_density_open, m)?)?;
+    m.add_function(wrap_pyfunction!(unmix_log, m)?)?;
+    m.add_function(wrap_pyfunction!(relog_matrix, m)?)?;
     m.add_function(wrap_pyfunction!(normalize_to_uint8, m)?)?;
     m.add_function(wrap_pyfunction!(detection_luma, m)?)?;
     m.add_function(wrap_pyfunction!(base_blocks, m)?)?;

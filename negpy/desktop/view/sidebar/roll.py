@@ -3,11 +3,12 @@ from typing import Optional
 
 from PyQt6.QtWidgets import QHBoxLayout, QLineEdit, QVBoxLayout, QWidget
 
+from negpy.desktop.controller import ROLL_ANALYSIS_NEEDS_A_ROLL
 from negpy.desktop.view.confirm import prompt_delete_scene
 from negpy.desktop.view.sidebar.base import BaseSidebar
 from negpy.desktop.view.styles.templates import (
     field_label,
-    header_row,
+    header_actions,
     hint_label,
     labeled_action,
     section_subheader,
@@ -49,11 +50,23 @@ class RollAnalysisSidebar(BaseSidebar):
     """
 
     def _init_ui(self) -> None:
+        # With no roll open the body grays out under one hint; the hint stays readable outside it.
+        outer = self.layout
+        self.no_roll_hint = hint_label(ROLL_ANALYSIS_NEEDS_A_ROLL)
+        outer.addWidget(self.no_roll_hint)
+        self.body = QWidget()
+        # Nested in a card body, so it takes the body's transparent rule, not the global QWidget fill.
+        self.body.setObjectName("collapsible_content_body")
+        self.layout = QVBoxLayout(self.body)
+        self.layout.setContentsMargins(0, 0, 0, 0)
+        self.layout.setSpacing(outer.spacing())
+        outer.addWidget(self.body)
+
         self.roll_combo = SearchableGearCombo(placeholder=tr("Search rolls…"))
         self.roll_combo.setToolTip(wrap_tooltip(tr("Picking a roll loads its saved baseline onto the loaded files.")))
-        self.reanalyze_btn = self._icon_action("fa5s.tachometer-alt", BATCH_ANALYSIS_TOOLTIP)
-        self.from_frame_btn = self._icon_action("fa5s.crosshairs", FROM_FRAME_TOOLTIP)
-        self.layout.addLayout(header_row(section_subheader(tr("ROLLS")), self.reanalyze_btn, self.from_frame_btn))
+        self.reanalyze_btn = self._labeled_action("fa5s.tachometer-alt", tr("Reanalyze"), BATCH_ANALYSIS_TOOLTIP)
+        self.from_frame_btn = self._labeled_action("fa5s.crosshairs", tr("Use Frame"), FROM_FRAME_TOOLTIP)
+        self.layout.addLayout(header_actions(section_subheader(tr("ROLLS")), self.reanalyze_btn, self.from_frame_btn))
         self.layout.addWidget(hint_label(tr("Roll Analysis first crops the frames that wait for Auto Crop."), "muted"))
         self.layout.addWidget(self.roll_combo)
 
@@ -61,8 +74,8 @@ class RollAnalysisSidebar(BaseSidebar):
         self.layout.addWidget(self.roll_status_hint)
 
         self.scenes_header = section_subheader(tr("SCENES"))
-        self.detect_scenes_btn = self._icon_action("mdi6.lightbulb-group-outline", DETECT_SCENES_TOOLTIP)
-        self.layout.addLayout(header_row(self.scenes_header, self.detect_scenes_btn))
+        self.detect_scenes_btn = self._labeled_action("mdi6.lightbulb-group-outline", tr("Detect"), DETECT_SCENES_TOOLTIP)
+        self.layout.addLayout(header_actions(self.scenes_header, self.detect_scenes_btn))
         self.scene_rows = QWidget()
         self._scene_rows_layout = QVBoxLayout(self.scene_rows)
         self._scene_rows_layout.setContentsMargins(0, 0, 0, 0)
@@ -100,6 +113,7 @@ class RollAnalysisSidebar(BaseSidebar):
         self._found_sync_key: Optional[str] = None
         self._refresh_rolls(force=True)
         self.layout.addStretch()
+        self.layout = outer
 
     def _connect_signals(self) -> None:
         self.roll_combo.selection_changed.connect(self._on_roll_picked)
@@ -145,7 +159,12 @@ class RollAnalysisSidebar(BaseSidebar):
         stale = {rid for rid, entry in listed if rolls.baseline_stale(entry.get("normalization"))}
         conf = self.state.config.process
         selected = active_id or ""
-        if conf.roll_name:
+        kind, _, ref = conf.baseline_source.partition(":")
+        if kind == "roll":
+            if any(rid == ref for rid, _entry in listed):
+                selected = ref
+        elif not conf.baseline_source and conf.roll_name:
+            # A baseline saved before sources were recorded names only its roll.
             matching = next((rid for rid, entry in listed if entry.get("name") == conf.roll_name), None)
             if matching:
                 selected = matching
@@ -280,7 +299,7 @@ class RollAnalysisSidebar(BaseSidebar):
             (self.from_frame_btn, FROM_FRAME_TOOLTIP, FROM_FRAME_DISABLED_TOOLTIP),
         ):
             btn.setEnabled(is_active)
-            btn.setToolTip(wrap_tooltip(on if is_active else off))
+            btn.setToolTip(wrap_tooltip(on if is_active else off if active_id else ROLL_ANALYSIS_NEEDS_A_ROLL))
 
     def sync_ui(self) -> None:
         self.block_signals(True)
@@ -289,6 +308,9 @@ class RollAnalysisSidebar(BaseSidebar):
             self._refresh_scenes()
         finally:
             self.block_signals(False)
+        has_roll = bool(self.controller.state.active_roll_id)
+        self.no_roll_hint.setVisible(not has_roll)
+        self.body.setEnabled(has_roll)
 
     def block_signals(self, blocked: bool) -> None:
         """

@@ -1,7 +1,7 @@
-"""Roll membership: a Roll is a named, navigable group of frames -- either a real
-library folder recognized as a roll, or a virtual roll built by hand from whatever the
-Film Strip currently holds (a search result, a hand-picked selection, extras added to a
-folder roll that are not physically in that folder).
+"""Roll membership: a Roll is a named, navigable group of frames: either a folder roll,
+the image files of one library folder minus those removed from it, or a virtual roll, a
+fixed list of frames saved from whatever the Film Strip held (a search result, a
+hand-picked selection).
 
 Edits are not stored here and are not scoped by roll by default: they stay in the edits
 DB under each frame's own content hash, exactly as if no Roll existed. A Roll only
@@ -13,22 +13,25 @@ a handful of film, rig and scanning facts that describe the roll rather than one
 frame's own look.
 """
 
+import copy
 import os
 import re
 import time
 import uuid
 from dataclasses import replace
 from fnmatch import fnmatchcase
-from typing import TYPE_CHECKING, Any, Callable, Collection, Dict, List, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Collection, Dict, List, Optional, Sequence, Tuple
 
 from negpy.features.exposure.normalization import BOUNDS_VERSION
 from negpy.features.metadata.models import GEAR_FIELDS, PROCESS_FIELDS, SCANNING_FIELDS
 from negpy.features.process.models import neutral_axis_tuple, with_film_fields
-from negpy.services.assets.library import folder_counts
+from negpy.services.assets.library import folder_counts, folder_image_paths
 
 if TYPE_CHECKING:
     from negpy.domain.models import WorkspaceConfig
 
+# A folder roll is the image files in its folder minus its "excluded_paths". Nothing reads a record's
+# "extra_paths"; a new folder roll keeps an empty one for older versions, which read it without a default.
 ROLLS_KEY = "rolls_by_id"
 IMPORT_SOURCES_KEY = "roll_import_sources"
 DISMISSED_FOLDERS_KEY = "dismissed_folder_rolls"
@@ -113,10 +116,7 @@ def next_roll_name(name: str, taken: Callable[[str], bool]) -> str:
 def recognize_folder(repo: Any, path: str, name: str = "") -> str:
     """Mark *path* as a recognized folder roll. Idempotent: returns the existing id
     when the folder is already recognized, without touching its stored name."""
-    dismissed = _dismissed_folders(repo)
-    kept = [p for p in dismissed if _folder_key(p) != _folder_key(path)]
-    if kept != dismissed:
-        repo.save_global_setting(DISMISSED_FOLDERS_KEY, kept)
+    _undismiss(repo, path)
     existing = folder_roll_id_for_path(repo, path)
     if existing:
         return existing
@@ -124,13 +124,61 @@ def recognize_folder(repo: Any, path: str, name: str = "") -> str:
     roll_id = uuid.uuid4().hex
     store[roll_id] = {
         "kind": "folder",
-        "name": name or _import_name(repo, path) or path.rstrip("/\\").replace("\\", "/").rsplit("/", 1)[-1] or path,
+        "name": name or folder_roll_name(repo, path),
         "folder_path": path,
         "extra_paths": [],
         "created_at": time.time(),
     }
     _write(repo, store)
     return roll_id
+
+
+def _undismiss(repo: Any, path: str) -> None:
+    dismissed = _dismissed_folders(repo)
+    kept = [p for p in dismissed if _folder_key(p) != _folder_key(path)]
+    if kept != dismissed:
+        repo.save_global_setting(DISMISSED_FOLDERS_KEY, kept)
+
+
+def folder_roll_name(repo: Any, path: str) -> str:
+    """The name a folder roll of *path* takes: its path from the import source, else the folder's name."""
+    return _import_name(repo, path) or path.rstrip("/\\").replace("\\", "/").rsplit("/", 1)[-1] or path
+
+
+def folder_scope(paths: Collection[str]) -> tuple[Optional[str], List[str]]:
+    """The one folder every one of *paths* sits directly in, or None, and that folder's image files
+    not among *paths*."""
+    folders = {_folder_key(os.path.dirname(p)): os.path.dirname(p) for p in paths}
+    if len(folders) != 1:
+        return None, []
+    folder = next(iter(folders.values()))
+    have = {_folder_key(p) for p in paths}
+    return folder, [p for p in folder_image_paths(folder) if _folder_key(p) not in have]
+
+
+def create_folder_roll(repo: Any, path: str, excluded: Sequence[str] = ()) -> str:
+    """A new folder roll of *path* that leaves out *excluded*; *path* must have no folder roll yet."""
+    roll_id = recognize_folder(repo, path)
+    if excluded:
+        store = _read(repo)
+        store[roll_id]["excluded_paths"] = list(excluded)
+        _write(repo, store)
+    return roll_id
+
+
+def convert_to_folder_roll(repo: Any, roll_id: str, folder: str, excluded: Sequence[str]) -> str:
+    """Make virtual roll *roll_id* the folder roll of *folder* in place, leaving out *excluded*.
+    The id, and every record keyed by it, stays. Returns the roll's new name."""
+    store = _read(repo)
+    entry = store.get(roll_id)
+    if entry is None or entry.get("kind") != "virtual":
+        return ""
+    _undismiss(repo, folder)
+    name = folder_roll_name(repo, folder)
+    entry.pop("member_paths", None)
+    entry.update(kind="folder", name=name, folder_path=folder, extra_paths=[], excluded_paths=list(excluded))
+    _write(repo, store)
+    return name
 
 
 def _import_name(repo: Any, path: str) -> str:
@@ -239,18 +287,18 @@ def prune_filtered_rolls(repo: Any) -> int:
     return len(dropped)
 
 
-def delete_folder_rolls(repo: Any, folder: str) -> None:
-    """Delete every folder roll at or under *folder*, and forget import sources there."""
-    key = _folder_key(folder)
-    ids = [
-        roll_id
-        for roll_id, entry in _view(repo).items()
-        if entry.get("kind") == "folder" and _under(_folder_key(entry.get("folder_path") or ""), key)
-    ]
-    for roll_id in ids:
-        delete_roll(repo, roll_id)
+def forget_import_sources(repo: Any, folders: List[str]) -> None:
+    """Forget every import source at or under one of *folders* that no remaining folder roll
+    sits under: Refresh still walks a source for the rolls it keeps."""
+    keys = [_folder_key(folder) for folder in folders]
+    remaining = [_folder_key(entry.get("folder_path") or "") for entry in _view(repo).values() if entry.get("kind") == "folder"]
+
+    def forget(source: str) -> bool:
+        key = _folder_key(source)
+        return any(_under(key, folder) for folder in keys) and not any(_under(roll, key) for roll in remaining)
+
     sources = import_sources(repo)
-    kept = [p for p in sources if not _under(_folder_key(p), key)]
+    kept = [p for p in sources if not forget(p)]
     if kept != sources:
         repo.save_global_setting(IMPORT_SOURCES_KEY, kept)
 
@@ -268,27 +316,39 @@ def create_virtual_roll(repo: Any, name: str, member_paths: List[str]) -> str:
     return roll_id
 
 
-def add_extra_members(repo: Any, roll_id: str, paths: List[str], parts: Sequence[str] = ()) -> None:
-    """Extend a roll's membership, in one write: a folder roll's extra_paths, or a virtual
-    roll's member_paths. Skips an unknown roll id, paths already members and files the
-    folder's own walk already finds. *parts* (a composite's or triplet's other files) leave
-    excluded_paths with *paths* but never join the membership."""
+def add_members(repo: Any, roll_id: str, paths: List[str], parts: Sequence[str] = ()) -> List[str]:
+    """Add *paths* to a roll, in one write. A virtual roll gains them in member_paths. A folder
+    roll holds only its folder's files, so *paths* and *parts* (a composite's or triplet's other
+    files) only leave its excluded_paths. Returns the *paths* that left excluded_paths."""
     store = _read(repo)
     entry = store.get(roll_id)
     if entry is None:
-        return
-    key = "extra_paths" if entry["kind"] == "folder" else "member_paths"
-    known = set(entry[key])
-    folder = _folder_key(entry["folder_path"]) if entry["kind"] == "folder" else None
-    new = [p for p in dict.fromkeys(paths) if p not in known and _folder_key(os.path.dirname(p)) != folder]
+        return []
+    if entry["kind"] == "folder":
+        new = []
+    else:
+        known = set(entry["member_paths"])
+        new = [p for p in dict.fromkeys(paths) if p not in known]
     added = {_folder_key(p) for p in (*paths, *parts)}
     excluded = entry.get("excluded_paths", [])
     kept = [p for p in excluded if _folder_key(p) not in added]
+    if new:
+        entry["member_paths"] = [*entry["member_paths"], *new]
+    if kept != excluded:
+        entry["excluded_paths"] = kept
     if new or kept != excluded:
-        entry[key] = [*entry[key], *new]
-        if kept != excluded:
-            entry["excluded_paths"] = kept
         _write(repo, store)
+    lifted = {_folder_key(p) for p in excluded} - {_folder_key(p) for p in kept}
+    return [p for p in dict.fromkeys(paths) if _folder_key(p) in lifted]
+
+
+def outside_folder(repo: Any, roll_id: str, paths: List[str]) -> List[str]:
+    """The *paths* a folder roll cannot hold: those not directly in its folder. [] for a virtual roll."""
+    entry = _view(repo).get(roll_id)
+    if entry is None or entry.get("kind") != "folder":
+        return []
+    folder = _folder_key(entry.get("folder_path") or "")
+    return [p for p in paths if _folder_key(os.path.dirname(p)) != folder]
 
 
 def remove_members(repo: Any, roll_id: str, paths: List[str], hashes: List[str]) -> List[str]:
@@ -301,9 +361,8 @@ def remove_members(repo: Any, roll_id: str, paths: List[str], hashes: List[str])
     if entry is None:
         return []
     gone = {_folder_key(p) for p in paths}
-    for key in ("extra_paths", "member_paths"):
-        if key in entry:
-            entry[key] = [p for p in entry[key] if _folder_key(p) not in gone]
+    if "member_paths" in entry:
+        entry["member_paths"] = [p for p in entry["member_paths"] if _folder_key(p) not in gone]
     if entry["kind"] == "folder":
         folder = _folder_key(entry["folder_path"])
         own = [p for p in dict.fromkeys(paths) if _folder_key(os.path.dirname(p)) == folder]
@@ -338,6 +397,26 @@ def excluded_paths(repo: Any, folders: Sequence[str]) -> frozenset:
 
 def is_excluded_key(path: str, excluded: Collection[str]) -> bool:
     return _folder_key(path) in excluded
+
+
+def removed_paths(repo: Any, roll_id: str) -> List[str]:
+    """The files Remove from Roll took out of a folder roll that are still on disk."""
+    entry = _view(repo).get(roll_id)
+    if entry is None or entry.get("kind") != "folder":
+        return []
+    return [p for p in entry.get("excluded_paths", ()) if os.path.isfile(p)]
+
+
+def restore_removed(repo: Any, roll_id: str) -> List[str]:
+    """Empty a folder roll's excluded_paths, in one write. Returns the files still on disk."""
+    store = _read(repo)
+    entry = store.get(roll_id)
+    if entry is None or entry.get("kind") != "folder" or not entry.get("excluded_paths"):
+        return []
+    back = [p for p in entry["excluded_paths"] if os.path.isfile(p)]
+    entry["excluded_paths"] = []
+    _write(repo, store)
+    return back
 
 
 def roll_edit_hash(from_hash: str, roll_id: str) -> str:
@@ -405,6 +484,27 @@ def unfork_edit(repo: Any, roll_id: str, from_hash: str) -> None:
     repo.delete_file_settings(roll_edit_hash(from_hash, roll_id))
 
 
+def home_roll_lookup(repo: Any) -> Callable[[str], Optional[str]]:
+    """`home_roll` for many paths from one read of the store; a folder *path* answers the roll
+    of that folder. A folder roll wins over a virtual one, the first in store order."""
+    folders: Dict[str, str] = {}
+    members: Dict[str, str] = {}
+    for roll_id, entry in _view(repo).items():
+        if entry.get("kind") == "folder":
+            if entry.get("folder_path"):
+                folders.setdefault(_folder_key(entry["folder_path"]), roll_id)
+        else:
+            for member in entry.get("member_paths", ()):
+                members.setdefault(member, roll_id)
+
+    def lookup(path: str) -> Optional[str]:
+        if os.path.isdir(path):
+            return folders.get(_folder_key(path))
+        return folders.get(_folder_key(os.path.dirname(os.path.abspath(path)))) or members.get(path)
+
+    return lookup
+
+
 def home_roll(repo: Any, path: str) -> Optional[str]:
     """The roll *path* belongs to when none is active: a folder roll wins over a virtual
     one, being the file's physical home and the likeliest place its facts were set."""
@@ -423,20 +523,16 @@ def frame_roll(repo: Any, active_roll_id: Optional[str], asset: dict) -> Optiona
 
 
 def rolls_containing_path(repo: Any, path: str) -> List[str]:
-    """Every roll *path* belongs to: under a folder roll's own folder or in its
-    extra_paths, or listed in a virtual roll's member_paths. A cheap path comparison
-    against the small rolls store, not a disk walk -- good enough to decide whether
-    forking a path is meaningful (it is shared with at least one other roll)."""
-    norm = os.path.normcase(os.path.abspath(path))
+    """Every roll *path* belongs to: directly in a folder roll's folder (not a subfolder, which
+    its walk never opens) and not removed from it, or listed in a virtual roll's member_paths.
+    A cheap path comparison against the small rolls store, not a disk walk."""
+    parent = os.path.normcase(os.path.dirname(os.path.abspath(path)))
     out = []
     for roll_id, entry in _view(repo).items():
         if entry.get("kind") == "folder":
             folder = entry.get("folder_path", "")
-            folder_norm = os.path.normcase(os.path.abspath(folder)) if folder else ""
-            in_folder = bool(folder_norm) and norm.startswith(folder_norm + os.sep)
-            if in_folder and _folder_key(path) in {_folder_key(p) for p in entry.get("excluded_paths", ())}:
-                continue
-            if in_folder or path in entry.get("extra_paths", []):
+            in_folder = bool(folder) and os.path.normcase(os.path.abspath(folder)) == parent
+            if in_folder and _folder_key(path) not in {_folder_key(p) for p in entry.get("excluded_paths", ())}:
                 out.append(roll_id)
         elif path in entry.get("member_paths", []):
             out.append(roll_id)
@@ -460,12 +556,11 @@ def adopt_replacement(
     gone = set(dropped_paths)
     forked_in = []
     for roll_id, entry in store.items():
-        for key in ("extra_paths", "member_paths"):
-            if key in entry:
-                paths = [p for p in entry[key] if p not in gone]
-                if old_path in paths:
-                    paths = [*paths, new_path] if keep_source else [new_path if p == old_path else p for p in paths]
-                entry[key] = list(dict.fromkeys(paths))
+        if "member_paths" in entry:
+            paths = [p for p in entry["member_paths"] if p not in gone]
+            if old_path in paths:
+                paths = [*paths, new_path] if keep_source else [new_path if p == old_path else p for p in paths]
+            entry["member_paths"] = list(dict.fromkeys(paths))
         overrides = entry.get("frame_overrides", {})
         if old_hash in overrides and new_hash not in overrides:
             entry["frame_overrides"] = {**overrides, new_hash: list(overrides[old_hash])}
@@ -564,7 +659,7 @@ def rehome_paths(repo: Any, move: Callable[[str], str]) -> None:
     for entry in store.values():
         if entry.get("folder_path"):
             entry["folder_path"] = move(entry["folder_path"])
-        for key in ("member_paths", "extra_paths", "excluded_paths"):
+        for key in ("member_paths", "excluded_paths"):
             if key in entry:
                 entry[key] = [move(p) for p in entry[key]]
     _write(repo, store)
@@ -607,7 +702,7 @@ ROLL_DEFAULT_FIELDS: Dict[str, tuple] = {
     # edited and locked away from the roll exactly like every other card here, even
     # though a roll being one film type, scanned one way, means the common case is
     # every frame following it.
-    "film": ("process", ("process_mode", "positive_source")),
+    "film": ("process", ("process_mode", "positive_source", "source_encoding")),
     "sensor": (
         "process",
         (
@@ -623,6 +718,12 @@ ROLL_DEFAULT_FIELDS: Dict[str, tuple] = {
             "crosstalk_process",
             "hue_trim",
         ),
+    ),
+    # A roll's slides usually faded alike, so one Estimate or hand-tuned survival serves them
+    # all; its own card, so a per-frame Estimate never locks the crosstalk.
+    "fade": (
+        "process",
+        ("fade_ratio_r", "fade_ratio_g", "fade_ratio_b", "fade_white_anchor", "fade_white_r", "fade_white_g", "fade_white_b"),
     ),
     # How the roll's camera RAWs decode: white balance, demosaic and highlight recovery.
     "demosaic": ("process", ("linear_raw", "demosaic_preview", "demosaic_export", "highlight_reconstruction")),
@@ -725,6 +826,24 @@ def restore_roll_fields(repo: Any, roll_id: str, snapshot: Dict[str, Any]) -> No
         else:
             defaults[name] = value
     entry["defaults"] = defaults
+    _write(repo, store)
+
+
+def copy_roll_settings(repo: Any, from_id: str, to_id: str, file_hashes: Collection[str]) -> None:
+    """Give roll *to_id* the roll-level settings of *from_id* (its defaults, frame seed and
+    card pushes) and the card locks of *file_hashes* (unforked), in one write. A lock is
+    what keeps a frame's own value against the copied defaults. Scenes, forks and the
+    baseline stay behind. No-op for an unknown id."""
+    store = _read(repo)
+    source, target = store.get(from_id), store.get(to_id)
+    if source is None or target is None:
+        return
+    for key in ("defaults", "frame_seed", "section_pushes"):
+        if source.get(key):
+            target[key] = copy.deepcopy(source[key])
+    locks = {h: list(cards) for h, cards in source.get("frame_overrides", {}).items() if h in file_hashes and cards}
+    if locks:
+        target["frame_overrides"] = locks
     _write(repo, store)
 
 
@@ -861,7 +980,8 @@ def move_section_push_fields(repo: Any, section_key: str, to_key: str, fields: C
 
 def roll_normalization(repo: Any, roll_id: str) -> Optional[Dict[str, Optional[tuple]]]:
     """The roll's saved Roll Analysis baseline (floors, ceils, cast, the pooled neutral
-    ``axis`` or None, and the hashes of the frames that keep their own bounds, ``outliers``), or None if it
+    ``axis`` or None, the hashes of the frames that keep their own bounds, ``outliers``, and of
+    the frames measured, ``frames``, None before frames were recorded), or None if it
     has never been analyzed. Unlike roll_defaults, this is written only by Batch
     Analysis itself -- a metering run over the roll's files, not a per-frame edit --
     so a frame's own Use Luma/Color Average axes borrow it directly rather than
@@ -876,6 +996,7 @@ def roll_normalization(repo: Any, roll_id: str) -> Optional[Dict[str, Optional[t
         "cast": tuple(saved["cast"]),
         "axis": _saved_axis(saved),
         "outliers": tuple(saved.get("outliers", ())),
+        "frames": tuple(saved["frames"]) if "frames" in saved else None,
     }
 
 
@@ -893,6 +1014,7 @@ def set_roll_normalization(
     outliers: tuple = (),
     axis: Optional[tuple] = None,
     bounds_version: int = BOUNDS_VERSION,
+    frames: Optional[tuple] = None,
 ) -> None:
     """Records a Roll Analysis result as the roll's own baseline, overwriting
     whatever was there. No-op for an unknown roll id."""
@@ -908,6 +1030,8 @@ def set_roll_normalization(
         "axis": axis,
         "bounds_version": bounds_version,
     }
+    if frames is not None:
+        entry["normalization"]["frames"] = list(frames)
     _write(repo, store)
 
 
@@ -929,6 +1053,22 @@ def frame_baseline_stale(repo: Any, process: Any) -> bool:
             if scene:
                 return baseline_stale(scene.get("normalization"))
     return False
+
+
+def frame_is_outlier(repo: Any, process: Any, file_hash: str) -> bool:
+    """Whether the roll or scene baseline a frame rides measured it as far from the pooled color."""
+    kind, _, ref = process.baseline_source.partition(":")
+    saved: Optional[dict] = None
+    if kind == "roll":
+        entry = roll_for_id(repo, ref)
+        saved = entry.get("normalization") if entry else None
+    elif kind == "scene":
+        for entry in _view(repo).values():
+            scene = entry.get("scenes", {}).get(ref)
+            if scene:
+                saved = scene.get("normalization")
+                break
+    return bool(saved) and bool({file_hash, unforked_hash(file_hash)} & set(saved.get("outliers", ())))
 
 
 def roll_film_base(repo: Any, roll_id: Optional[str]) -> Optional[tuple]:
@@ -1027,7 +1167,8 @@ def delete_scene(repo: Any, roll_id: str, scene_id: str) -> None:
 
 
 def scene_normalization(repo: Any, roll_id: str, scene_id: str) -> Optional[Dict[str, Optional[tuple]]]:
-    """The scene's saved Scene Analysis baseline (floors, ceils, axis, outliers), or None before one."""
+    """The scene's saved Scene Analysis baseline (floors, ceils, axis, outliers, and the ``frames``
+    measured, None before frames were recorded), or None before one."""
     saved = dict(roll_scenes(repo, roll_id)).get(scene_id, {}).get("normalization")
     if not saved:
         return None
@@ -1036,11 +1177,19 @@ def scene_normalization(repo: Any, roll_id: str, scene_id: str) -> Optional[Dict
         "ceils": tuple(saved["ceils"]),
         "axis": _saved_axis(saved),
         "outliers": tuple(saved.get("outliers", ())),
+        "frames": tuple(saved["frames"]) if "frames" in saved else None,
     }
 
 
 def set_scene_normalization(
-    repo: Any, roll_id: str, scene_id: str, floors: tuple, ceils: tuple, outliers: tuple = (), axis: Optional[tuple] = None
+    repo: Any,
+    roll_id: str,
+    scene_id: str,
+    floors: tuple,
+    ceils: tuple,
+    outliers: tuple = (),
+    axis: Optional[tuple] = None,
+    frames: Optional[tuple] = None,
 ) -> None:
     def edit(scenes: Dict[str, dict]) -> None:
         if scene_id in scenes:
@@ -1051,6 +1200,8 @@ def set_scene_normalization(
                 "axis": axis,
                 "bounds_version": BOUNDS_VERSION,
             }
+            if frames is not None:
+                saved["frames"] = list(frames)
             scenes[scene_id] = {**scenes[scene_id], "normalization": saved}
 
     _edit_scenes(repo, roll_id, edit)
@@ -1084,11 +1235,10 @@ def resolve_roll_baseline(repo: Any, roll_id: str, file_hash: str, config: "Work
     process = config.process
     if process.lock_bounds or process.is_locked_initialized or not (process.use_luma_average or process.use_color_average):
         return config
-    scene = scene_by_hash(repo, roll_id).get(file_hash)
-    saved = scene_normalization(repo, roll_id, scene[1]) if scene else roll_normalization(repo, roll_id)
-    if not saved:
+    found = frame_saved_baseline(repo, roll_id, file_hash)
+    if found is None:
         return config
-    source = f"scene:{scene[1]}" if scene else f"roll:{roll_id}"
+    saved, source = found
     return replace(
         config,
         process=replace(
@@ -1101,10 +1251,34 @@ def resolve_roll_baseline(repo: Any, roll_id: str, file_hash: str, config: "Work
     )
 
 
+def average_scope(process: Any) -> Optional[str]:
+    """``"roll"`` for a frame that chose the roll's average over its scene's, else None."""
+    return "roll" if process.baseline_source.startswith("roll:") else None
+
+
+def frame_saved_baseline(repo: Any, roll_id: Optional[str], file_hash: str, scope: Optional[str] = None) -> Optional[Tuple[dict, str]]:
+    """The baseline a frame's Use Average reads, its scene's else its roll's (always the roll's
+    with *scope* ``"roll"``), with its ``baseline_source``; None before that baseline is measured."""
+    if roll_id is None:
+        return None
+    scene = None if scope == "roll" else scene_by_hash(repo, roll_id).get(unforked_hash(file_hash))
+    saved = scene_normalization(repo, roll_id, scene[1]) if scene else roll_normalization(repo, roll_id)
+    if not saved:
+        return None
+    return saved, f"scene:{scene[1]}" if scene else f"roll:{roll_id}"
+
+
 def baseline_label(repo: Any, process: Any) -> str:
     """What a frame's locked baseline was taken from, for display: “Roll …”, “Scene …” or
     “Frame …”. A baseline saved before sources were recorded names its roll_name, if any."""
-    kind, _, ref = process.baseline_source.partition(":")
+    if not process.baseline_source:
+        return f"Roll “{process.roll_name}”" if process.roll_name else "a saved baseline"
+    return source_label(repo, process.baseline_source)
+
+
+def source_label(repo: Any, source: str) -> str:
+    """A ``baseline_source`` for display: “Roll …”, “Scene …” or “Frame …”."""
+    kind, _, ref = source.partition(":")
     if kind == "roll":
         entry = roll_for_id(repo, ref)
         return f"Roll “{entry['name']}”" if entry else "a deleted roll"
@@ -1116,4 +1290,4 @@ def baseline_label(repo: Any, process: Any) -> str:
         return "a deleted scene"
     if kind == "frame":
         return f"Frame “{ref}”"
-    return f"Roll “{process.roll_name}”" if process.roll_name else "a saved baseline"
+    return "a saved baseline"

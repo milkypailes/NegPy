@@ -34,6 +34,7 @@ def _filled(fill):
 _LAB = (_IMG3 * np.array([100.0, 160.0, 160.0], np.float32) - np.array([0.0, 80.0, 80.0], np.float32)).astype(np.float32)
 
 _CASES = {
+    "chroma_spread": lambda: np.array(negpy_core.chroma_spread(_IMG3, 4, 0.003, 0.97, 0.1)),
     "percentiles": lambda: np.array(negpy_core.percentiles(_IMG1.ravel(), [0.5, 1.0, 37.0, 50.0, 99.0]), np.float32),
     "resize_area_general": lambda: negpy_core.resize_area(_IMG3, (47, 31)),
     "resize_linear_up": lambda: negpy_core.resize_linear(_IMG3, (300, 177)),
@@ -53,6 +54,14 @@ _CASES = {
     ),
     "morph_close_u8": lambda: negpy_core.morphology_ex((_IMG1 > 0.5).astype(np.uint8) * 255, 3, np.ones((9, 7), np.uint8), 2),
     "to_log_density": lambda: negpy_core.to_log_density(np.ascontiguousarray(_IMG1 * _IMG1)),
+    "unmix_log": lambda: negpy_core.unmix_log(
+        np.ascontiguousarray(_IMG3 * np.float32(-3.0)),
+        np.array([[1.3, -0.2, -0.1], [-0.05, 1.4, -0.35], [0.0, -0.3, 1.3]], np.float32),
+    ),
+    "relog_matrix": lambda: negpy_core.relog_matrix(
+        np.ascontiguousarray(_IMG3 * np.float32(-3.0)),
+        np.array([[0.7152, 0.2848, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0411, 0.9589]], np.float32),
+    ),
     "oetf_encode": lambda: negpy_core.oetf_encode(_IMG3, np.float32(256.0 / 563.0)),
     "rgb_to_lab": lambda: negpy_core.rgb_to_lab(
         _IMG3, _M, np.array([0.95047, 1.0, 1.08883], np.float32), np.float32(0.008856), np.float32(7.787)
@@ -95,6 +104,10 @@ _CASES = {
     "usm_sharpen": lambda: negpy_core.usm_sharpen(
         _IMG3, np.float32(2.0), 0.4, np.array([0.0625, 0.25, 0.375, 0.25, 0.0625], np.float32), *WORKING_LAB
     ),
+    "sharpen_grain": lambda: np.array(
+        [negpy_core.sharpen_grain(negpy_core.gaussian_blur(_IMG3, (0, 0), 2.0) * np.float32(0.4), (0.2973769, 0.6273491, 0.0752741))],
+        np.float32,
+    ),
     "sabattier": lambda: negpy_core.sabattier(
         _IMG3,
         (np.float32(0.9), np.float32(0.08), np.float32(0.1), np.float32(1.3), np.float32(2.0)),
@@ -131,6 +144,7 @@ _CASES = {
 }
 
 _HASHES = {
+    "chroma_spread": "aae81d8aac0dbd96fc0285f75e75588281672804262ab7aaf65e8e0bc5ec66f3",
     "percentiles": "0874152b6e9f91bd3a3b73e15a9d083d15b6e8c7c6f6a9279d9241df10a88464",
     "resize_area_general": "dbe0fb9e51b0e8bee54cc2bb35756bbf0934077b458c1a44ea27c2e5dd96a16f",
     "resize_linear_up": "9e6c1200f4f4f05bf46bbba858c67501044e514e47ce1afb50ac5a0e3e7cabee",
@@ -148,6 +162,8 @@ _HASHES = {
     "find_external_contours": "ebb4302dd2bc7226a7ed24fbb5e16e14f407d5693ce47128a649cee9e4a098be",
     "morph_close_u8": "4be9a2976881ff83eb0b92a8ec484e048c61612324afbde73b6e0c89aa92865e",
     "to_log_density": "cc4d2086edf051826619f024a4f5d28c80d28528291d9df4610c1d3854144038",
+    "unmix_log": "73edc03deb7e068718e77264608858efaec4b64776f64645da9f4aef54ec23b4",
+    "relog_matrix": "e79e7bbb62aa68e9248c9b92d9875cbb5779b640a93b8f8e45a648b5009547be",
     "oetf_encode": "44508d28673c678fc0ec7b5262a06d0053ea6b4bed4bead7bc49556bc60eb070",
     "rgb_to_lab": "02c583bf1f5fe9723e2cb0a3e1f34759d6b0778d3644e8e2cff2251e756b68f2",
     "lab_to_rgb": "34016e7f9aebcfdf780b67b96b128041c6ba1ac2a427f4e87b5413dcc7345eef",
@@ -164,6 +180,7 @@ _HASHES = {
     "flat_curve": "e47f6084a58e19119c6e3364ebf017dfc7f039ec6c73e0eea8e942519021bf0b",
     "transfer_curve": "afdb5891162dca5abe4530bd098469b26a0be16a41df32f4f2928ddb8d37b943",
     "usm_sharpen": "7267d2a3976c9381eadde01fe11ea60d46345b4747283e6ac68a2aa4a025d0a8",
+    "sharpen_grain": "4dcdc651f4aa9dca4a8678ad0e3db727332b8fa7b4ede77889b88d506df6e506",
     "sabattier": "f8956f67786c7c1d0e628af4b82fb12b6dde42e70da2504585f5bf20e7fbb461",
     "lith": "98dc05c62e191da2ad00c1f2327c48beff5af7e882be64cac5302cb0ea5099e5",
     "carrier": "97c9d045201ba345010f91b09ea07699fecc4e009d7738dc8591295b59e6081c",

@@ -2,6 +2,7 @@
 scope or duplicate the edits themselves, with one exception: roll-wide defaults for a
 handful of film, rig and scanning facts (see TestRollDefaults below)."""
 
+import os
 from dataclasses import replace
 from unittest.mock import MagicMock
 
@@ -22,14 +23,15 @@ from negpy.services.assets.rolls import (
     scene_by_hash,
     scene_normalization,
     set_scene_normalization,
-    add_extra_members,
+    ROLLS_KEY,
+    add_members,
     all_rolls_sorted,
     create_virtual_roll,
     delete_roll,
     fork_edit,
     folder_roll_id_for_path,
     frame_override_cards,
-    delete_folder_rolls,
+    forget_import_sources,
     discovery_filters,
     import_sources,
     matches_discovery_filter,
@@ -39,6 +41,7 @@ from negpy.services.assets.rolls import (
     is_forked,
     recognize_folder,
     next_roll_name,
+    outside_folder,
     roll_folder_name,
     rename_folder_roll_disk,
     rename_roll,
@@ -55,6 +58,7 @@ from negpy.services.assets.rolls import (
     set_frame_override,
     set_roll_defaults,
     set_roll_normalization,
+    frame_is_outlier,
     unfork_edit,
     unforked_hash,
     virtual_rolls,
@@ -129,18 +133,75 @@ def test_create_virtual_roll_stores_the_exact_member_list():
     assert entry["member_paths"] == ["/a.nef", "/b.nef"]
 
 
-def test_add_extra_member_extends_a_folder_rolls_extra_paths():
+def test_a_folder_roll_gains_no_file_from_another_folder():
     repo = _repo()
     roll_id = recognize_folder(repo, "/scans/roll_a")
-    add_extra_members(repo, roll_id, ["/elsewhere/c.nef"])
-    assert roll_for_id(repo, roll_id)["extra_paths"] == ["/elsewhere/c.nef"]
+    assert add_members(repo, roll_id, ["/scans/roll_a/1.tif", "/scans/roll_a/sub/2.tif", "/elsewhere/c.nef"]) == []
+    entry = roll_for_id(repo, roll_id)
+    assert entry["extra_paths"] == []
+    assert "member_paths" not in entry
 
 
-def test_add_extra_member_skips_files_the_folder_walk_finds():
+def test_folder_scope_finds_the_one_folder_and_the_files_it_lacks(tmp_path):
+    from negpy.services.assets.rolls import folder_scope
+
+    folder = tmp_path / "500T"
+    (folder / "sub").mkdir(parents=True)
+    for name in ("a1.tif", "a2.tif", "a3.tif", "a3_IR.tif"):
+        (folder / name).write_bytes(b"1")
+    (folder / "sub" / "s.tif").write_bytes(b"1")
+    a1, a2 = str(folder / "a1.tif"), str(folder / "a2.tif")
+
+    found, missing = folder_scope([a1, a2])
+    assert os.path.normcase(found) == os.path.normcase(str(folder))
+    assert [os.path.basename(p) for p in missing] == ["a3.tif"], "an IR sidecar and a subfolder are not the folder's files"
+    assert folder_scope([a1, str(folder / "sub" / "s.tif")]) == (None, [])
+    assert folder_scope([]) == (None, [])
+
+
+def test_create_folder_roll_names_it_after_its_folder_and_leaves_out_the_rest(tmp_path):
+    from negpy.services.assets.rolls import DISMISSED_FOLDERS_KEY, create_folder_roll
+
+    repo = _repo()
+    folder = str(tmp_path / "500T")
+    repo.save_global_setting(DISMISSED_FOLDERS_KEY, [folder])
+    roll_id = create_folder_roll(repo, folder, [folder + "/a3.tif"])
+    entry = roll_for_id(repo, roll_id)
+    assert (entry["kind"], entry["name"], entry["excluded_paths"]) == ("folder", "500T", [folder + "/a3.tif"])
+    assert repo.get_global_setting(DISMISSED_FOLDERS_KEY) == []
+
+
+def test_convert_to_folder_roll_keeps_the_id_and_every_record_keyed_by_it(tmp_path):
+    from negpy.services.assets.rolls import DISMISSED_FOLDERS_KEY, convert_to_folder_roll, create_scene
+
+    repo = _repo()
+    folder = str(tmp_path / "500T")
+    roll_id = create_virtual_roll(repo, "Picks", [folder + "/a1.tif"])
+    set_roll_defaults(repo, roll_id, film_stock_id="portra400")
+    set_frame_override(repo, roll_id, "h1", "film", True)
+    scene = create_scene(repo, roll_id, "Beach", ["h1"])
+    repo.save_global_setting(DISMISSED_FOLDERS_KEY, [folder])
+    before = roll_for_id(repo, roll_id)
+
+    assert convert_to_folder_roll(repo, roll_id, folder, [folder + "/a2.tif"]) == "500T"
+
+    entry = roll_for_id(repo, roll_id)
+    assert (entry["kind"], entry["name"], entry["folder_path"]) == ("folder", "500T", folder)
+    assert entry["excluded_paths"] == [folder + "/a2.tif"] and "member_paths" not in entry
+    for key in ("defaults", "frame_overrides", "scenes", "created_at"):
+        assert entry[key] == before[key]
+    assert scene in entry["scenes"]
+    assert folder_roll_id_for_path(repo, folder) == roll_id
+    assert repo.get_global_setting(DISMISSED_FOLDERS_KEY) == []
+    assert convert_to_folder_roll(repo, roll_id, folder, []) == "", "a folder roll is not converted again"
+
+
+def test_outside_folder_names_the_files_a_folder_roll_cannot_hold():
     repo = _repo()
     roll_id = recognize_folder(repo, "/scans/roll_a")
-    add_extra_members(repo, roll_id, ["/scans/roll_a/1.tif", "/scans/roll_a/sub/2.tif", "/elsewhere/c.nef"])
-    assert roll_for_id(repo, roll_id)["extra_paths"] == ["/scans/roll_a/sub/2.tif", "/elsewhere/c.nef"]
+    paths = ["/scans/roll_a/1.tif", "/scans/roll_a/sub/2.tif", "/elsewhere/c.nef"]
+    assert outside_folder(repo, roll_id, paths) == ["/scans/roll_a/sub/2.tif", "/elsewhere/c.nef"]
+    assert outside_folder(repo, create_virtual_roll(repo, "Picks", []), paths) == []
 
 
 @pytest.mark.parametrize(
@@ -150,23 +211,23 @@ def test_roll_folder_name(text, name):
     assert roll_folder_name(text) == name
 
 
-def test_add_extra_member_extends_a_virtual_rolls_member_paths():
+def test_add_members_extends_a_virtual_rolls_member_paths():
     repo = _repo()
     roll_id = create_virtual_roll(repo, "Portra", ["/a.nef"])
-    add_extra_members(repo, roll_id, ["/b.nef"])
+    add_members(repo, roll_id, ["/b.nef"])
     assert roll_for_id(repo, roll_id)["member_paths"] == ["/a.nef", "/b.nef"]
 
 
-def test_add_extra_member_does_not_duplicate():
+def test_add_members_does_not_duplicate():
     repo = _repo()
     roll_id = create_virtual_roll(repo, "Portra", ["/a.nef"])
-    add_extra_members(repo, roll_id, ["/a.nef"])
+    add_members(repo, roll_id, ["/a.nef"])
     assert roll_for_id(repo, roll_id)["member_paths"] == ["/a.nef"]
 
 
-def test_add_extra_member_on_unknown_roll_is_a_noop():
+def test_add_members_on_unknown_roll_is_a_noop():
     repo = _repo()
-    add_extra_members(repo, "not-a-real-id", ["/a.nef"])
+    add_members(repo, "not-a-real-id", ["/a.nef"])
     assert saved_rolls(repo) == {}
 
 
@@ -409,7 +470,7 @@ def test_unfork_edit_reverses_fork_edit():
     repo.delete_file_settings.assert_called_once_with(forked)
 
 
-def test_rolls_containing_path_finds_a_folder_roll_by_prefix(tmp_path):
+def test_rolls_containing_path_finds_a_file_directly_in_a_folder_roll(tmp_path):
     repo = _repo()
     folder = tmp_path / "roll_a"
     folder.mkdir()
@@ -417,11 +478,26 @@ def test_rolls_containing_path_finds_a_folder_roll_by_prefix(tmp_path):
     assert rolls_containing_path(repo, str(folder / "frame001.tif")) == [roll_id]
 
 
-def test_rolls_containing_path_finds_a_folder_rolls_extra_member():
+def test_rolls_containing_path_leaves_out_a_subfolders_file(tmp_path):
+    """The walk of a folder roll never opens a subfolder, so its files are not members."""
+    repo = _repo()
+    folder = tmp_path / "roll_a"
+    (folder / "picks").mkdir(parents=True)
+    parent = recognize_folder(repo, str(folder))
+    assert rolls_containing_path(repo, str(folder / "picks" / "p1.tif")) == []
+    picks = recognize_folder(repo, str(folder / "picks"))
+    assert rolls_containing_path(repo, str(folder / "picks" / "p1.tif")) == [picks]
+    assert rolls_containing_path(repo, str(folder / "a1.tif")) == [parent]
+
+
+def test_rolls_containing_path_ignores_an_old_extra_path():
+    """A folder roll holds only its folder's files, whatever an older version stored in extra_paths."""
     repo = _repo()
     roll_id = recognize_folder(repo, "/scans/roll_a")
-    add_extra_members(repo, roll_id, ["/elsewhere/c.nef"])
-    assert rolls_containing_path(repo, "/elsewhere/c.nef") == [roll_id]
+    store = dict(saved_rolls(repo))
+    store[roll_id] = {**store[roll_id], "extra_paths": ["/elsewhere/c.nef"]}
+    repo.save_global_setting(ROLLS_KEY, store)
+    assert rolls_containing_path(repo, "/elsewhere/c.nef") == []
 
 
 def test_rolls_containing_path_finds_a_virtual_rolls_member():
@@ -598,6 +674,21 @@ class TestRollDefaults:
         set_frame_override(repo, roll_id, "h1", "flatfield", locked=True)
         assert resolve_roll_config(repo, roll_id, "h1", WorkspaceConfig()).flatfield.profile_id == ""
 
+    def test_the_fade_survivals_follow_the_roll_on_their_own_card(self):
+        """The survivals are their own "fade" card, so a frame can keep its own Estimate
+        while it still takes the roll's crosstalk, and the other way round."""
+        repo = _repo()
+        roll_id = create_virtual_roll(repo, "Velvia", [])
+        set_roll_defaults(repo, roll_id, fade_ratio_g=0.5, fade_ratio_r=0.5, crosstalk_strength=0.4)
+        frame = WorkspaceConfig(process=ProcessConfig(fade_ratio_g=0.8))
+
+        resolved = resolve_roll_config(repo, roll_id, "h1", frame).process
+        assert resolved.fade_ratio_g == 0.5 and resolved.fade_ratio_r == 0.5
+
+        set_frame_override(repo, roll_id, "h1", "fade", locked=True)
+        own = resolve_roll_config(repo, roll_id, "h1", frame).process
+        assert own.fade_ratio_g == 0.8 and own.fade_ratio_r == 1.0 and own.crosstalk_strength == 0.4
+
     def test_positive_source_can_be_locked_away_on_the_film_card(self):
         repo = _repo()
         roll_id = create_virtual_roll(repo, "Portra", [])
@@ -664,7 +755,46 @@ class TestRollNormalization:
 
         data = roll_normalization(repo, roll_id)
 
-        assert data == {"floors": (0.1, 0.1, 0.1), "ceils": (0.9, 0.9, 0.9), "cast": (0.01, 0.0, -0.01), "axis": None, "outliers": ()}
+        assert data == {
+            "floors": (0.1, 0.1, 0.1),
+            "ceils": (0.9, 0.9, 0.9),
+            "cast": (0.01, 0.0, -0.01),
+            "axis": None,
+            "outliers": (),
+            "frames": None,
+        }
+
+    def test_records_the_measured_frames(self):
+        repo = _repo()
+        roll_id = create_virtual_roll(repo, "Portra", [])
+        set_roll_normalization(repo, roll_id, (0.1,) * 3, (0.9,) * 3, frames=("h1", "h2"))
+
+        assert roll_normalization(repo, roll_id)["frames"] == ("h1", "h2")
+
+    def test_an_outlier_riding_the_roll_baseline_reads_as_one(self):
+        repo = _repo()
+        roll_id = create_virtual_roll(repo, "Portra", [])
+        set_roll_normalization(repo, roll_id, (0.1,) * 3, (0.9,) * 3, outliers=("h1",))
+        process = ProcessConfig(baseline_source=f"roll:{roll_id}")
+
+        assert frame_is_outlier(repo, process, "h1")
+        assert frame_is_outlier(repo, process, "h1#roll:x")
+        assert not frame_is_outlier(repo, process, "h2")
+        assert not frame_is_outlier(repo, ProcessConfig(baseline_source="frame:a.tif"), "h1")
+
+    def test_a_scene_frame_reads_its_scene_unless_it_chose_the_roll(self):
+        from negpy.services.assets.rolls import average_scope, frame_saved_baseline
+
+        repo = _repo()
+        roll_id = create_virtual_roll(repo, "Portra", [])
+        sid = create_scene(repo, roll_id, "Woods", ["h1"])
+        set_roll_normalization(repo, roll_id, (0.1,) * 3, (0.9,) * 3)
+        set_scene_normalization(repo, roll_id, sid, (0.2,) * 3, (0.8,) * 3)
+
+        assert frame_saved_baseline(repo, roll_id, "h1")[1] == f"scene:{sid}"
+        assert frame_saved_baseline(repo, roll_id, "h1", "roll")[1] == f"roll:{roll_id}"
+        assert average_scope(ProcessConfig(baseline_source=f"roll:{roll_id}")) == "roll"
+        assert average_scope(ProcessConfig(baseline_source=f"scene:{sid}")) is None
 
     def test_defaults_cast_to_zero(self):
         repo = _repo()
@@ -762,8 +892,11 @@ class TestScenes:
             "ceils": (0.7, 0.8, 0.9),
             "axis": axis,
             "outliers": ("a",),
+            "frames": None,
         }
         assert roll_normalization(repo, roll_id) is None
+        set_scene_normalization(repo, roll_id, sid, (0.1, 0.2, 0.3), (0.7, 0.8, 0.9), frames=("a",))
+        assert scene_normalization(repo, roll_id, sid)["frames"] == ("a",)
 
     def test_roll_record_keeps_its_outliers_and_an_old_record_has_none(self):
         repo, roll_id = self._roll()
@@ -865,13 +998,13 @@ class TestBaselineLabel:
         assert resolve_roll_baseline(repo, roll_id, "h2", cfg).process.baseline_source == f"roll:{roll_id}"
 
 
-def test_add_extra_members_writes_many_paths_once():
+def test_add_members_writes_many_paths_once():
     repo = _repo()
     roll_id = create_virtual_roll(repo, "Portra", ["/a.nef"])
     writes = []
     real = repo.save_global_setting
     repo.save_global_setting = lambda k, v: writes.append(k) or real(k, v)
-    add_extra_members(repo, roll_id, ["/b.nef", "/a.nef", "/c.nef", "/b.nef"])
+    add_members(repo, roll_id, ["/b.nef", "/a.nef", "/c.nef", "/b.nef"])
     assert roll_for_id(repo, roll_id)["member_paths"] == ["/a.nef", "/b.nef", "/c.nef"]
     assert len(writes) == 1
 
@@ -959,17 +1092,20 @@ def test_prune_filtered_rolls_leaves_rolls_outside_import_sources(tmp_path):
     assert prune_filtered_rolls(repo) == 0
 
 
-def test_delete_folder_rolls_forgets_rolls_and_the_source_under_it(tmp_path):
-    _roll_dir(tmp_path / "day" / "roll_a")
-    _roll_dir(tmp_path / "day" / "roll_b")
+def test_forget_import_sources_keeps_a_source_a_remaining_roll_sits_under(tmp_path):
+    for source in ("a/day", "b/day", "c/day"):
+        _roll_dir(tmp_path / source / "roll")
     repo = _repo()
-    other = recognize_folder(repo, str(_roll_dir(tmp_path / "elsewhere")))
-    import_subfolders_as_rolls(repo, str(tmp_path / "day"))
+    for source in ("a/day", "b/day", "c/day"):
+        import_subfolders_as_rolls(repo, str(tmp_path / source))
 
-    delete_folder_rolls(repo, str(tmp_path / "day"))
+    for roll_id, entry in saved_rolls(repo).items():
+        if not entry["folder_path"].startswith(str(tmp_path / "c")):
+            delete_roll(repo, roll_id)
 
-    assert list(saved_rolls(repo)) == [other]
-    assert import_sources(repo) == []
+    forget_import_sources(repo, [str(tmp_path / "a"), str(tmp_path / "b" / "day"), str(tmp_path / "c")])
+
+    assert import_sources(repo) == [os.path.normpath(str(tmp_path / "c" / "day"))]
 
 
 @pytest.mark.parametrize(
@@ -1009,3 +1145,40 @@ def test_a_baseline_from_an_older_analysis_is_stale_for_the_frames_that_ride_it(
 
     monkeypatch.setattr(rolls, "BOUNDS_VERSION", rolls.BOUNDS_VERSION + 1)
     assert [rolls.frame_baseline_stale(repo, ProcessConfig(baseline_source=s)) for s in sources] == [True, True, False, False]
+
+
+def test_copy_roll_settings_takes_the_roll_level_parts_and_the_named_locks():
+    from negpy.services.assets.rolls import add_frame_seed, copy_roll_settings, set_frame_override, set_roll_defaults
+
+    repo = _repo()
+    source = recognize_folder(repo, "/scans/portra")
+    target = create_virtual_roll(repo, "Picks", ["/scans/portra/1.tif"])
+    set_roll_defaults(repo, source, film_stock_id="portra400")
+    add_frame_seed(repo, source, cast_removal_strength=0.5)
+    set_frame_override(repo, source, "h1", "film", True)
+    set_frame_override(repo, source, "h2", "film", True)
+
+    copy_roll_settings(repo, source, target, {"h1"})
+    set_roll_defaults(repo, source, film_stock_id="hp5")
+
+    entry = roll_for_id(repo, target)
+    assert entry["defaults"] == {"film_stock_id": "portra400"}
+    assert entry["frame_seed"] == {"cast_removal_strength": 0.5}
+    assert entry["frame_overrides"] == {"h1": ["film"]}
+    assert entry["member_paths"] == ["/scans/portra/1.tif"]
+    copy_roll_settings(repo, "not-a-roll", target, {"h1"})
+    assert roll_for_id(repo, target) == entry
+
+
+def test_home_roll_lookup_answers_as_home_roll(tmp_path):
+    from negpy.services.assets.rolls import home_roll, home_roll_lookup
+
+    repo = _repo()
+    folder = tmp_path / "roll_a"
+    folder.mkdir()
+    folder_id = recognize_folder(repo, str(folder))
+    create_virtual_roll(repo, "Picks", [str(folder / "1.tif"), "/elsewhere/2.tif"])
+    lookup = home_roll_lookup(repo)
+    for path in (str(folder / "1.tif"), "/elsewhere/2.tif", "/nowhere/3.tif", str(folder / "sub" / "4.tif")):
+        assert lookup(path) == home_roll(repo, path), path
+    assert lookup(str(folder)) == folder_id

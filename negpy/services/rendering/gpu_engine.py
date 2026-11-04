@@ -37,8 +37,8 @@ from negpy.features.exposure.normalization import (
     measure_anchor_from_log,
     measure_clip_fractions,
     measure_neutral_axis_from_log,
-    effective_crosstalk_matrix,
     unmix_log_image,
+    relog_matrix_image,
     measure_highlight_point_from_log,
     measure_shadow_point_from_log,
     measure_textural_range_from_log,
@@ -58,7 +58,16 @@ from negpy.features.geometry.logic import (
     get_manual_rect_coords,
 )
 from negpy.features.geometry.models import GeometryConfig, crops_frame
-from negpy.features.lab.logic import chroma_denoise_sigma, gaussian_kernel_1d, rl_iterations
+from negpy.features.lab.logic import (
+    GLOW_AMOUNT_MAX,
+    chroma_denoise_radius,
+    chroma_denoise_sigma,
+    gaussian_kernel_1d,
+    glow_reach_px,
+    halation_amounts,
+    halation_reach_px,
+    rl_iterations,
+)
 from negpy.features.lab.models import SharpenMethod
 from negpy.features.altprocess.models import AltProcess
 from negpy.features.cyanotype.logic import CYANOTYPE_CONSTANTS, sensitizer_constants
@@ -70,18 +79,23 @@ from negpy.features.exposure.placement import limited_mask_params
 from negpy.features.local.logic import compute_local_maps, limited_masks
 from negpy.features.local.models import MAX_KEYED_MASKS
 from negpy.features.transparency.logic import (
+    density_stage_matrices,
+    source_channels_first,
     TRANSFER_CONSTANTS,
     ZONE_BLACK_TAPER,
     TRANSFER_DENSITY_RANGE,
+    measure_transfer_neutral_axis,
     transfer_assumed_anchor,
     transfer_auto_terms,
     transfer_bounds,
+    transfer_cast_affine,
     transfer_point_offsets,
     transfer_curve_params,
     transfer_widths,
     wb_split_geometry,
     zone_geometry,
 )
+from negpy.features.process.fade import fade_white_target, unmix_with_fade
 from negpy.features.process.capture_color import apply_camera_matrix, camera_to_working_matrix
 from negpy.features.process.logic import should_fold_camera_wb
 from negpy.features.exposure.bw_filter import collapse_weights, plane_weights, printed_exposure
@@ -143,7 +157,9 @@ _METRICS_DENSITY_PARADE_BASE = _METRICS_PARADE_BASE + _METRICS_PARADE_WORDS
 _METRICS_DENSITY_PARADE_WORDS = 3 * WAVEFORM_BINS * WAVEFORM_COLS
 _METRICS_FULL_SCALE_BASE = _METRICS_DENSITY_PARADE_BASE + _METRICS_DENSITY_PARADE_WORDS
 _METRICS_FULL_SCALE_WORDS = 3 * WAVEFORM_COLS
-METRICS_BUFFER_SIZE = (_METRICS_FULL_SCALE_BASE + _METRICS_FULL_SCALE_WORDS) * 4
+# Auto Masking's share, the f32 bits of the auto_mask buffer's word 1.
+_METRICS_AUTO_MASK_BASE = _METRICS_FULL_SCALE_BASE + _METRICS_FULL_SCALE_WORDS
+METRICS_BUFFER_SIZE = (_METRICS_AUTO_MASK_BASE + 1) * 4
 
 # Per-frame metrics clear; write_buffer copies at call time, so sharing is safe.
 _METRICS_ZEROS = np.zeros(METRICS_BUFFER_SIZE // 4, dtype=np.uint32)
@@ -233,6 +249,7 @@ def _analysis_cache_key(settings: WorkspaceConfig, analysis_source_hash: str, fi
         analysis_source_hash,
         film_base,
         p.process_mode,
+        p.positive_source,
         p.analysis_buffer,
         p.analysis_rect,
         p.meter_rect,
@@ -244,11 +261,20 @@ def _analysis_cache_key(settings: WorkspaceConfig, analysis_source_hash: str, fi
         p.locked_ceils,
         p.local_floors,
         p.local_ceils,
+        p.manual_dmin,
+        p.manual_dmax,
         p.crosstalk_strength,
         p.crosstalk_matrix,
         p.crosstalk_process,
         p.use_cast_average,
         p.locked_neutral_axis,
+        p.fade_ratio_r,
+        p.fade_ratio_g,
+        p.fade_ratio_b,
+        p.fade_white_anchor,
+        p.fade_white_r,
+        p.fade_white_g,
+        p.fade_white_b,
         g.rotation,
         g.flip_horizontal,
         g.flip_vertical,
@@ -323,6 +349,8 @@ class GPUEngine:
             "clahe_apply": get_resource_path(os.path.join("negpy", "features", "lab", "shaders", "clahe_apply.wgsl")),
             "lab_sharpen_h": get_resource_path(os.path.join("negpy", "features", "lab", "shaders", "lab_sharpen_h.wgsl")),
             "lab_sharpen_v": get_resource_path(os.path.join("negpy", "features", "lab", "shaders", "lab_sharpen_v.wgsl")),
+            "sharpen_grain_hist": get_resource_path(os.path.join("negpy", "features", "lab", "shaders", "sharpen_grain_hist.wgsl")),
+            "sharpen_grain_pick": get_resource_path(os.path.join("negpy", "features", "lab", "shaders", "sharpen_grain_pick.wgsl")),
             "chroma_lowpass_h": get_resource_path(os.path.join("negpy", "features", "lab", "shaders", "chroma_lowpass_h.wgsl")),
             "chroma_lowpass_v": get_resource_path(os.path.join("negpy", "features", "lab", "shaders", "chroma_lowpass_v.wgsl")),
             "rl_init": get_resource_path(os.path.join("negpy", "features", "lab", "shaders", "rl_init.wgsl")),
@@ -375,7 +403,7 @@ class GPUEngine:
         # alignment (exposure) occupies multiple aligned slots.
         self._uniform_sizes = {
             "geometry": 64,
-            "normalization": 160,
+            "normalization": 208,
             "exposure": 480,
             "transfer": 224,
             "clahe_u": 32,
@@ -611,6 +639,9 @@ class GPUEngine:
         )
         # Sharpen blur taps (gaussian_kernel_1d): 1024 f32 covers radius <= 511.
         self._buffers["sharpen_k"] = GPUBuffer(4096, wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST)
+        # Auto Masking: the gradient histogram, then (masking, auto share) for the lab pass.
+        self._buffers["grain_hist"] = GPUBuffer(4096, wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST)
+        self._buffers["auto_mask"] = GPUBuffer(256, wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC)
         # Chroma Denoise low-pass taps, the same helper's.
         self._buffers["chroma_k"] = GPUBuffer(4096, wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST)
         # Curves tables: 256 vec4<f32> over (global, red, green, blue), re-baked
@@ -819,7 +850,7 @@ class GPUEngine:
         sorted_grid = None
         scan_clip_fractions = None
         analysis_source = None
-        unmix_m = effective_crosstalk_matrix(settings.process, settings.process.process_mode)
+        unmix_m = unmix_with_fade(settings.process, settings.process.process_mode)
         # The transparency curve reads working space, so its meter must too: the same
         # camera matrix TransparencyBaseProcessor applies, on the grid.
         cam_m = camera_to_working_matrix(cam_xyz, camera_wb if should_fold_camera_wb(settings.process) else None) if transfer else None
@@ -852,7 +883,16 @@ class GPUEngine:
                     p.crosstalk_strength,
                     p.crosstalk_matrix,
                     p.crosstalk_process,
+                    p.fade_ratio_r,
+                    p.fade_ratio_g,
+                    p.fade_ratio_b,
+                    p.fade_white_anchor,
+                    p.fade_white_r,
+                    p.fade_white_g,
+                    p.fade_white_b,
                     p.process_mode,
+                    p.positive_source,
+                    source_channels_first(p, cam_xyz),
                     None if cam_m is None else tuple(np.asarray(cam_m).ravel().tolist()),
                 )
                 if analysis_source_hash is not None and not tiling_mode
@@ -881,11 +921,15 @@ class GPUEngine:
                 if transfer:
                     # No camera matrix (a scanner TIFF) means the buffer is already in
                     # working space, so the shared grid is the working-space grid.
-                    cam_prefiltered = (
-                        prefiltered
-                        if cam_m is None
-                        else unmix_log_image(prefilter_log_grid(apply_camera_matrix(analysis_source, cam_m), None, an_buffer), unmix_m)
-                    )
+                    pre_m, post_m = density_stage_matrices(settings.process, cam_xyz, cam_m, unmix_m)
+                    if cam_m is None:
+                        cam_prefiltered = prefiltered
+                    elif post_m is not None:
+                        cam_prefiltered = relog_matrix_image(prefiltered, post_m)
+                    else:
+                        cam_prefiltered = unmix_log_image(
+                            prefilter_log_grid(apply_camera_matrix(analysis_source, pre_m), None, an_buffer), unmix_m
+                        )
                 if prefilter_key is not None:
                     self._prefilter_cache = (prefilter_key, prefiltered, scan_clip_fractions, None, cam_prefiltered)
             if analysis_key is not None:
@@ -933,20 +977,20 @@ class GPUEngine:
                 density_above_base_value = density_above_base(source_base_log, bounds, prefiltered, unmix_m)
 
         # Neutral axis for the two-point Cast Removal; normalized at consumption. The
-        # transparency curve renders through the fixed window, so the axis is measured
-        # against it and on the working-space grid the curve consumes.
+        # transparency path measures it on the working-space grid the curve consumes.
         neutral_axis_refs = neutral_axis_override
         axis_grid = cam_prefiltered if transfer else prefiltered
         if needs_axis and axis_grid is not None:
-            axis_bounds = LogNegativeBounds(*transfer_bounds()) if transfer else bounds
-            neutral_axis_refs = measure_neutral_axis_from_log(axis_grid, axis_bounds, None, 0.0, exclude_subjects=not transfer)
+            if transfer:
+                neutral_axis_refs = measure_transfer_neutral_axis(axis_grid, render_path(settings.process) is RenderPath.POSITIVE)
+            else:
+                neutral_axis_refs = measure_neutral_axis_from_log(axis_grid, bounds, None, 0.0)
             pooled_axis = pooled_neutral_axis(settings.process)
             if pooled_axis is not None:
                 neutral_axis_refs = blend_neutral_axis(neutral_axis_refs, pooled_axis)
 
         # Auto Density/Auto Grade meter the working-space grid against the fixed window on
-        # a Positive frame, exactly like the neutral axis just above; both read the
-        # regular per-frame grid/bounds everywhere else.
+        # the transparency path, and the regular per-frame grid/bounds everywhere else.
         meter_grid = cam_prefiltered if transfer else prefiltered
         meter_bounds = LogNegativeBounds(*transfer_bounds()) if transfer else anchor_bounds
         meter_assumed = transfer_assumed_anchor() if transfer else None
@@ -1407,8 +1451,18 @@ class GPUEngine:
                     )
             else:
                 tex_sharpen_v = self._get_intermediate_texture(1, 1, usage, "sharpen_v")
+            if settings.lab.sharpen > 0 and settings.lab.sharpen_auto_masking:
+                enc.clear_buffer(self._buffers["grain_hist"].buffer)
+                self._dispatch_pass(
+                    enc, "sharpen_grain_hist", [(0, tex_sharpen_v.view), (1, self._buffers["grain_hist"]), (2, lab_u)], w_rot, h_rot
+                )
+                self._dispatch_pass(
+                    enc, "sharpen_grain_pick", [(0, self._buffers["grain_hist"]), (1, self._buffers["auto_mask"]), (2, lab_u)], 1, 1
+                )
             # The Chroma Denoise low-pass reads only its input and sigma, so a lab-only change reuses it too.
-            chroma_sigma = chroma_denoise_sigma(settings.lab.chroma_denoise, scale_factor)
+            chroma_sigma = chroma_denoise_sigma(
+                chroma_denoise_radius(settings.lab.chroma_denoise, settings.process.process_mode), scale_factor
+            )
             if chroma_sigma > 0.0:
                 tex_chroma_h = self._get_intermediate_texture(w_rot, h_rot, usage, "chroma_h")
                 tex_chroma_v = self._get_intermediate_texture(w_rot, h_rot, usage, "chroma_v")
@@ -1433,6 +1487,7 @@ class GPUEngine:
                     (2, lab_u),
                     (3, tex_sharpen_v.view),
                     (4, tex_chroma_v.view),
+                    (5, self._buffers["auto_mask"]),
                 ],
                 w_rot,
                 h_rot,
@@ -1547,6 +1602,7 @@ class GPUEngine:
 
         if not tiling_mode and readback_metrics:
             device.queue.write_buffer(self._buffers["metrics"].buffer, 0, _METRICS_ZEROS)
+            enc.copy_buffer_to_buffer(self._buffers["auto_mask"].buffer, 4, self._buffers["metrics"].buffer, _METRICS_AUTO_MASK_BASE * 4, 4)
             # Always compute metrics on the content image (tex_toning) before any
             # border/layout pass so that border pixels don't skew the histogram.
             self._dispatch_pass(
@@ -1803,6 +1859,8 @@ class GPUEngine:
                 .reshape((3, WAVEFORM_COLS))
                 .astype(np.float64)
             )
+            if settings.lab.sharpen > 0 and settings.lab.sharpen_auto_masking:
+                metrics["auto_masking"] = float(raw_metrics[_METRICS_AUTO_MASK_BASE : _METRICS_AUTO_MASK_BASE + 1].view(np.float32)[0])
             metrics["vectorscope"] = (
                 raw_metrics[_METRICS_SCOPE_BASE : _METRICS_SCOPE_BASE + _METRICS_SCOPE_WORDS]
                 .reshape((SCOPE_HUE_BINS, SCOPE_CHROMA_BINS))
@@ -1922,9 +1980,11 @@ class GPUEngine:
             adj_ceils = (t_ceils[0] + bp3[0], t_ceils[1] + bp3[1], t_ceils[2] + bp3[2])
 
         # Capture-side dye-unmix rows, resolved once per frame by the caller and shared
-        # with NormalizationProcessor. Identity when off.
+        # with NormalizationProcessor. Identity when off; a (3, 4) affine packs its offset in w.
+        unmix_or_none = unmix
         if unmix is None:
             unmix = np.eye(3)
+        unmix_w = unmix[:, 3] if unmix.shape[1] == 4 else (0.0, 0.0, 0.0)
 
         # Working-space-from-camera rows, identity when the source carries no matrix. The
         # shader reads them only on the transfer path.
@@ -1932,9 +1992,19 @@ class GPUEngine:
         # and the render stops depending on which decode produced the buffer — unless the
         # capture is narrowband, where an as-shot WB estimate has no scene to describe and
         # never folds (see should_fold_camera_wb).
-        cam = camera_to_working_matrix(cam_xyz, camera_wb if should_fold_camera_wb(settings.process) else None)
+        cam, post = density_stage_matrices(
+            settings.process,
+            cam_xyz,
+            camera_to_working_matrix(cam_xyz, camera_wb if should_fold_camera_wb(settings.process) else None),
+            unmix_or_none,
+        )
         if cam is None:
             cam = np.eye(3, dtype=np.float32)
+        # After the density matrix, a Positive source's primaries (density_stage_matrices); the
+        # w lane of the first row turns the conversion on.
+        post_on = 1.0 if post is not None else 0.0
+        if post is None:
+            post = np.eye(3, dtype=np.float32)
 
         n_data = (
             struct.pack("ffff", adj_floors[0], adj_floors[1], adj_floors[2], 0.0)
@@ -1946,12 +2016,15 @@ class GPUEngine:
                 0.0,
                 0.0,
             )
-            + struct.pack("ffff", unmix[0, 0], unmix[0, 1], unmix[0, 2], 0.0)
-            + struct.pack("ffff", unmix[1, 0], unmix[1, 1], unmix[1, 2], 0.0)
-            + struct.pack("ffff", unmix[2, 0], unmix[2, 1], unmix[2, 2], 0.0)
+            + struct.pack("ffff", unmix[0, 0], unmix[0, 1], unmix[0, 2], unmix_w[0])
+            + struct.pack("ffff", unmix[1, 0], unmix[1, 1], unmix[1, 2], unmix_w[1])
+            + struct.pack("ffff", unmix[2, 0], unmix[2, 1], unmix[2, 2], unmix_w[2])
             + struct.pack("ffff", float(cam[0, 0]), float(cam[0, 1]), float(cam[0, 2]), 0.0)
             + struct.pack("ffff", float(cam[1, 0]), float(cam[1, 1]), float(cam[1, 2]), 0.0)
             + struct.pack("ffff", float(cam[2, 0]), float(cam[2, 1]), float(cam[2, 2]), 0.0)
+            + struct.pack("ffff", float(post[0, 0]), float(post[0, 1]), float(post[0, 2]), post_on)
+            + struct.pack("ffff", float(post[1, 0]), float(post[1, 1]), float(post[1, 2]), 0.0)
+            + struct.pack("ffff", float(post[2, 0]), float(post[2, 1]), float(post[2, 2]), 0.0)
         )
 
         from negpy.features.exposure.logic import (
@@ -1959,7 +2032,6 @@ class GPUEngine:
             cast_solve_inputs,
             contrast_mask_coeffs,
             filtration_offsets,
-            neutral_axis_affine,
             per_channel_dye_separation,
             per_channel_toe_shoulder,
             grade_coupled_shape,
@@ -1996,12 +2068,12 @@ class GPUEngine:
         t_cmy_m = EXPOSURE_CONSTANTS["cmy_max_density"]
         # Cast Removal on the transparency curve: a per-channel affine on density, since
         # this curve has no per-channel slope to re-solve. Identity when there is no axis.
-        t_strength, t_axis = cast_solve_inputs(
+        t_cast_gain, t_cast_off = transfer_cast_affine(
             LogNegativeBounds(adj_floors, adj_ceils),
             neutral_axis_refs,
             settings.exposure.cast_removal_strength,
+            fade_white_target(settings.process),
         )
-        t_cast_gain, t_cast_off = neutral_axis_affine(t_axis, t_strength)
         # A finished positive skips the baseline gain, and the zone_taper.y lane below tells
         # the shader to skip display_rendering too. Matches transparency/logic.py.
         t_positive_source = bool(settings.process.positive_source)
@@ -2339,19 +2411,20 @@ class GPUEngine:
                 self._buffers["sharpen_k"].upload(kernel)
                 self._sharpen_kernel_key = kernel_key
         chroma_radius_px = 0
-        chroma_sigma = chroma_denoise_sigma(lab.chroma_denoise, scale_factor)
+        chroma_sigma = chroma_denoise_sigma(chroma_denoise_radius(lab.chroma_denoise, settings.process.process_mode), scale_factor)
         if chroma_sigma > 0.0:
             chroma_kernel = gaussian_kernel_1d(chroma_sigma)
             chroma_radius_px = len(chroma_kernel) // 2
             if self._chroma_kernel_key != chroma_sigma:
                 self._buffers["chroma_k"].upload(chroma_kernel)
                 self._chroma_kernel_key = chroma_sigma
+        hal_amounts = halation_amounts(lab.halation_strength, settings.process.process_mode == ProcessMode.BW)
         l_data = struct.pack(
-            "ffffffffffff",
+            "ffffffffffffffff",
             float(lab.sharpen),
             float(lab.chroma_denoise),
             float(lab.saturation),
-            float(lab.glow_amount),
+            GLOW_AMOUNT_MAX * float(lab.glow_amount),
             float(lab.halation_strength),
             # Chroma Denoise's sigma is chroma_denoise * scale_factor, as on the CPU.
             float(scale_factor),
@@ -2360,7 +2433,9 @@ class GPUEngine:
             1.0 if lab.sharpen_method == SharpenMethod.RL else 0.0,
             float(lab.skin_protection),
             float(chroma_radius_px),
-            0.0,
+            1.0 if lab.sharpen_auto_masking else 0.0,
+            *hal_amounts,
+            float(min(h_rot, w_rot)),
         )
 
         is_bw = 1 if settings.process.process_mode == ProcessMode.BW else 0
@@ -2994,7 +3069,7 @@ class GPUEngine:
 
         # Unmixed like the non-tiled path, lazily: skipped when bounds are locked and no
         # auto refs, anchor or textural range need it.
-        unmix_m = effective_crosstalk_matrix(settings.process, settings.process.process_mode)
+        unmix_m = unmix_with_fade(settings.process, settings.process.process_mode)
         prefiltered_cache: Optional[np.ndarray] = None
         sorted_cache: Optional[np.ndarray] = None
 
@@ -3037,19 +3112,25 @@ class GPUEngine:
                 return _prefiltered()
             if transfer_grid is None:
                 cam_m = camera_to_working_matrix(cam_xyz, camera_wb if should_fold_camera_wb(settings.process) else None)
-                transfer_grid = (
-                    _prefiltered()
-                    if cam_m is None
-                    else unmix_log_image(prefilter_log_grid(apply_camera_matrix(_analysis_img(), cam_m), meter_roi, meter_buffer), unmix_m)
-                )
+                pre_m, post_m = density_stage_matrices(settings.process, cam_xyz, cam_m, unmix_m)
+                if cam_m is None:
+                    transfer_grid = _prefiltered()
+                elif post_m is not None:
+                    transfer_grid = relog_matrix_image(_prefiltered(), post_m)
+                else:
+                    transfer_grid = unmix_log_image(
+                        prefilter_log_grid(apply_camera_matrix(_analysis_img(), pre_m), meter_roi, meter_buffer), unmix_m
+                    )
             return transfer_grid
 
         meter_bounds = LogNegativeBounds(*transfer_bounds()) if transfer else global_anchor_bounds
 
         global_neutral_axis = None
         if settings.exposure.cast_removal_strength > 0.0 and settings.process.process_mode != ProcessMode.BW:
-            axis_bounds = meter_bounds if transfer else global_bounds
-            global_neutral_axis = measure_neutral_axis_from_log(_meter_grid(), axis_bounds, None, 0.0, exclude_subjects=not transfer)
+            if transfer:
+                global_neutral_axis = measure_transfer_neutral_axis(_meter_grid(), render_path(settings.process) is RenderPath.POSITIVE)
+            else:
+                global_neutral_axis = measure_neutral_axis_from_log(_meter_grid(), global_bounds, None, 0.0)
             pooled_axis = pooled_neutral_axis(settings.process)
             if pooled_axis is not None:
                 global_neutral_axis = blend_neutral_axis(global_neutral_axis, pooled_axis)
@@ -3113,14 +3194,14 @@ class GPUEngine:
             k_radius = len(gaussian_kernel_1d(settings.lab.sharpen_radius)) // 2
             mult = 6 if settings.lab.sharpen_method == SharpenMethod.RL else 1
             halo = max(halo, k_radius * mult)
-        # Glow/halation taps reach up to their radius (max(., . * scale_factor) in
-        # lab.wgsl). Without this the bloom seams at tile edges on big exports.
+        # Glow/halation taps reach up to their radius (lab.wgsl). Without this the bloom
+        # seams at tile edges on big exports.
         if settings.lab.glow_amount > 0.0:
-            halo = max(halo, int(np.ceil(max(3.0, 15.0 * scale_factor))))
+            halo = max(halo, glow_reach_px((h_rot, w_rot)) + 1)
         if settings.lab.halation_strength > 0.0:
-            halo = max(halo, int(np.ceil(max(5.0, 25.0 * scale_factor))))
+            halo = max(halo, halation_reach_px((h_rot, w_rot)) + 1)
         # Chroma Denoise reads its low-pass kernel's half-width, plus one for the edge test's neighbors.
-        chroma_sigma = chroma_denoise_sigma(settings.lab.chroma_denoise, scale_factor)
+        chroma_sigma = chroma_denoise_sigma(chroma_denoise_radius(settings.lab.chroma_denoise, settings.process.process_mode), scale_factor)
         if chroma_sigma > 0.0:
             halo = max(halo, len(gaussian_kernel_1d(chroma_sigma)) // 2 + 2)
         # The Mackie-line blur reads its kernel's half-width each side, sigma from the whole

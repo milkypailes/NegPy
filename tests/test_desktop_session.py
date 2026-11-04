@@ -53,6 +53,21 @@ class TestDesktopSessionSync(unittest.TestCase):
         # A scoped apply reads the visible set, which a real load always builds.
         self.session.asset_model.refresh()
 
+    def test_a_frame_in_no_roll_drops_an_average_nothing_saved_backs(self):
+        """With no roll there is no roll baseline: carried or saved averages go off unless a baseline backs them."""
+        base = WorkspaceConfig()
+        averages = replace(base.process, use_luma_average=True, use_color_average=True, use_cast_average=True)
+        unbacked = replace(base, process=averages)
+        backed = replace(
+            base, process=replace(averages, locked_floors=(-1.0, -1.0, -1.0), locked_neutral_axis=((0.1, 0.1, 0.1), (0.2, 0.2, 0.2), None))
+        )
+        self.session.state.active_roll_id = None
+        asset = {"name": "a.tif", "path": "/loose/a.tif", "hash": "h9"}
+        for saved, expected in ((unbacked, (False, False, False)), (backed, (True, True, True))):
+            with self.subTest(backed=saved is backed), patch("negpy.desktop.session.load_or_promote", return_value=saved):
+                proc = self.session.config_for_asset(asset).process
+                self.assertEqual((proc.use_luma_average, proc.use_color_average, proc.use_cast_average), expected)
+
     def test_found_scenes_mark_their_frames_after_the_scenes_and_drop_with_their_roll(self):
         from negpy.services.assets import rolls
 
@@ -72,6 +87,25 @@ class TestDesktopSessionSync(unittest.TestCase):
 
         self.assertEqual(self.session.state.found_scenes, [])
         self.assertNotIn("found_scene", self.session.state.uploaded_files[1])
+
+    def test_frames_on_the_roll_average_carry_a_mark_and_an_outlier_is_flagged(self):
+        from negpy.services.assets import rolls
+
+        base = WorkspaceConfig()
+        riding = replace(base, process=replace(base.process, use_luma_average=True, baseline_source="roll:roll-1"))
+        self.session.state.active_roll_id = "roll-1"
+        self.mock_repo.load_file_settings_many.return_value = {"hash1": riding, "hash2": base}
+        heard = []
+        self.session.files_changed.connect(lambda: heard.append(1))
+        with (
+            patch.object(rolls, "roll_defaults", return_value={}),
+            patch.object(rolls, "frame_is_outlier", side_effect=lambda _repo, _p, h: h == "hash1"),
+        ):
+            self.session.refresh_average_marks()
+            first, second = self.session.state.uploaded_files
+            self.assertEqual((first.get("average"), second.get("average")), ("outlier", None))
+            self.session.refresh_average_marks()
+        self.assertEqual(heard, [1])
 
     def test_a_color_vision_choice_is_saved_and_announced(self):
         heard = []
@@ -1277,7 +1311,7 @@ class TestDesktopSessionSync(unittest.TestCase):
         self.session.reset_section("process")
 
         self.assertEqual(self.session.state.config.process.process_mode, ProcessMode.C41)
-        self.assertEqual(self.session.state.config.exposure.cast_removal_strength, 1.0)
+        self.assertEqual(self.session.state.config.exposure.cast_removal_strength, 0.5)
 
     def test_reset_settings_is_recorded_not_wiping(self):
         self.session.select_file(0)
@@ -1644,6 +1678,13 @@ class TestDesktopSessionSync(unittest.TestCase):
         paths, active = self._last_session_manifest()
         self.assertEqual(paths, ["path1", "path2"])
         self.assertEqual(active, "path2")
+
+    def test_the_manifest_records_the_open_roll(self):
+        for roll_id, saved in (("roll1", "roll1"), (None, "")):
+            self.session.state.active_roll_id = roll_id
+            self.session.persist_session()
+            last = {c.args[0]: c.args[1] for c in self.mock_repo.save_global_setting.call_args_list}
+            self.assertEqual(last["session_active_roll"], saved)
 
     def test_active_file_changing_snapshots_outgoing_when_dirty(self):
         # Fires before state mutates to the new file, carrying the outgoing identity.

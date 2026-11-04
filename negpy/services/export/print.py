@@ -81,11 +81,11 @@ class PrintService:
 
     @staticmethod
     def fit_content(img_w: int, img_h: int, max_w: int, max_h: int) -> tuple[int, int]:
-        """The largest image size inside max_w x max_h; one formula for every engine's layout."""
-        aspect = img_w / img_h
-        if aspect > max_w / max_h:
-            return max_w, int(max_w / aspect)
-        return int(max_h * aspect), max_h
+        """The largest image size inside max_w x max_h; one formula for every engine's layout.
+        Integer math: a float aspect round trip gives 907.999... for a side that is exactly 908."""
+        if img_w * max_h > max_w * img_h:
+            return max_w, max_w * img_h // img_w
+        return max_h * img_w // img_h, max_h
 
     @staticmethod
     def effective_border_color(finish: FinishConfig, toning: ToningConfig) -> str:
@@ -166,9 +166,9 @@ class PrintService:
         """Paper dims in pixels given a paper long edge and aspect ratio."""
         if aspect_ratio_str == AspectRatio.ORIGINAL:
             if img_w >= img_h:
-                return long_edge_px, int(long_edge_px * (img_h / img_w))
+                return long_edge_px, long_edge_px * img_h // img_w
             else:
-                return int(long_edge_px * (img_w / img_h)), long_edge_px
+                return long_edge_px * img_w // img_h, long_edge_px
 
         try:
             w_r, h_r = map(float, aspect_ratio_str.split(":"))

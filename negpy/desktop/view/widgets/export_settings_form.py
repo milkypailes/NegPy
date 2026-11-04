@@ -18,7 +18,15 @@ from PyQt6.QtWidgets import (
 )
 
 from negpy.desktop.view.widgets.segmented_choice import SegmentedChoice
-from negpy.desktop.view.styles.templates import field_row, header_row, hint_label, icon_button, section_subheader, tool_toggle
+from negpy.desktop.view.styles.templates import (
+    field_row,
+    header_actions,
+    hint_label,
+    icon_button,
+    labeled_action,
+    section_subheader,
+    tool_toggle,
+)
 from negpy.desktop.view.styles.theme import THEME
 from negpy.desktop.view.widgets.sliders import CompactSlider, SliderGroup, align_slider_columns
 from negpy.desktop.view.widgets.step_combo import StepCombo
@@ -252,12 +260,14 @@ class ExportSettingsForm(QWidget):
         self.size_input.setValue(30.0)
         self.size_input.setSuffix(" cm")
         self.size_input.setLocale(QLocale.c())
+        self.size_input.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
         self.size_input.setToolTip(tr("Long edge of the print"))
         self.size_input.valueChanged.connect(self._on_changed)
         print_inner.addLayout(field_row(tr("Size"), self.size_input))
         self.dpi_input = QSpinBox()
         self.dpi_input.setRange(72, 4800)
         self.dpi_input.setValue(300)
+        self.dpi_input.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
         self.dpi_input.setToolTip(tr("Print resolution in dots per inch"))
         self.dpi_input.valueChanged.connect(self._on_changed)
         print_inner.addLayout(field_row(tr("DPI"), self.dpi_input))
@@ -276,17 +286,15 @@ class ExportSettingsForm(QWidget):
         self.target_px_input = QSpinBox()
         self.target_px_input.setRange(256, 32768)
         self.target_px_input.setValue(2000)
+        self.target_px_input.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
         self.target_px_input.setSuffix(" px")
         self.target_px_input.setToolTip(tr("Size of the selected edge of the exported image"))
         self.target_px_input.valueChanged.connect(self._on_changed)
         target_px_inner.addLayout(field_row(tr("Size"), self.target_px_input))
-        self.output_sharpen_slider = CompactSlider(tr("Sharpening"), 0.0, 1.0, 0.0)
-        self.output_sharpen_slider.setToolTip(tr("Sharpen the export at its final size, on top of the Lab Sharpening."))
-        self.output_sharpen_slider.valueChanged.connect(self._on_changed)
         options = QWidget()
         options_box = QVBoxLayout(options)
         options_box.setContentsMargins(0, 0, 0, 0)
-        for row in (self._print_container, self._target_px_container, self.output_sharpen_slider):
+        for row in (self._print_container, self._target_px_container):
             options_box.addWidget(row)
         self._size_rail = SliderGroup(options)
         root.addWidget(self._size_rail)
@@ -299,6 +307,11 @@ class ExportSettingsForm(QWidget):
         self.ratio_combo.currentTextChanged.connect(self._on_changed)
         self._ratio_row_widget = self._row_widget(field_row(tr("Paper ratio"), self.ratio_combo))
         root.addWidget(self._ratio_row_widget)
+        self._size_box = root
+
+    def add_size_row(self, widget: QWidget) -> None:
+        """A row above Paper ratio, for a control the presets dialog has no use for."""
+        self._size_box.insertLayout(self._size_box.indexOf(self._ratio_row_widget), field_row("", widget))
 
     # --- COLOR ---------------------------------------------------------------
 
@@ -309,11 +322,11 @@ class ExportSettingsForm(QWidget):
         root.setSpacing(10)
         parent.addWidget(self._color_section)
 
-        self.icc_import_btn = icon_button(
-            "fa5s.folder-open", tr("Import an ICC profile into {user_icc_dir}", user_icc_dir=APP_CONFIG.user_icc_dir)
+        self.icc_import_btn = labeled_action(
+            "fa5s.folder-open", tr("Import"), tr("Import an ICC profile into {user_icc_dir}", user_icc_dir=APP_CONFIG.user_icc_dir)
         )
         self.icc_import_btn.clicked.connect(self._import_icc)
-        root.addLayout(header_row(section_subheader(tr("COLOR MANAGEMENT")), self.icc_import_btn))
+        root.addLayout(header_actions(section_subheader(tr("COLOR MANAGEMENT")), self.icc_import_btn))
 
         self.input_combo = StepCombo()
         constrain_combo(self.input_combo)
@@ -608,7 +621,6 @@ class ExportSettingsForm(QWidget):
         self.fmt_combo.blockSignals(False)
         self._on_fmt_changed()
         self._update_ratio_visibility()
-        self.output_sharpen_slider.setVisible(not enabled)
 
     def flat_mode(self) -> bool:
         return self._flat_mode
@@ -689,7 +701,6 @@ class ExportSettingsForm(QWidget):
             edge_idx = self.target_edge_btn.findData(v.get("export_target_edge", ExportTargetEdge.LONG))
             self.target_edge_btn.setCurrentIndex(edge_idx if edge_idx >= 0 else 0)
             self.target_px_input.setValue(v["export_target_edge_px"])
-            self.output_sharpen_slider.setValue(v.get("output_sharpen", 0.0))
             _select_data(self.ratio_combo, str(v["paper_aspect_ratio"]))
 
             self._export_space = v["export_color_space"]
@@ -737,7 +748,6 @@ class ExportSettingsForm(QWidget):
             "export_dpi": self.dpi_input.value(),
             "export_target_edge": self.target_edge_btn.currentData(),
             "export_target_edge_px": self.target_px_input.value(),
-            "output_sharpen": self.output_sharpen_slider.value(),
             "output_mode": self.output_mode_combo.currentData() or ExportPresetOutputMode.ABSOLUTE,
             "output_subfolder": self.subfolder_edit.text(),
             "output_path": self.abspath_edit.text(),

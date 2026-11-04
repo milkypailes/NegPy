@@ -1,5 +1,6 @@
 import unittest
 import numpy as np
+import pytest
 import cv2
 from negpy.kernel.image.logic import _skin_weight, lab_to_rgb_working, rgb_to_lab_working, skin_chroma_rein
 from negpy.features.lab.models import LabConfig
@@ -9,6 +10,8 @@ from negpy.features.lab.logic import (
     apply_glow_and_halation,
     apply_usm_sharpening,
     apply_rl_sharpening,
+    auto_masking,
+    effective_masking,
     sharpen_shadow_gain,
     apply_saturation,
     gaussian_kernel_1d,
@@ -337,6 +340,23 @@ class TestLabLogic(unittest.TestCase):
         np.testing.assert_array_almost_equal(lab[:, :, 0], res_lab[:, :, 0], decimal=0)
         self.assertLess(float(np.var(res_lab[:, :, 1])), float(np.var(lab[:, :, 1])))
 
+    def test_chroma_denoise_runs_on_color_film_only(self) -> None:
+        from negpy.domain.interfaces import PipelineContext
+        from negpy.features.lab.processor import PhotoLabProcessor
+        from negpy.features.process.models import ProcessMode
+
+        lab = rgb_to_lab_working(np.full((64, 64, 3), 0.5, dtype=np.float32))
+        lab[..., 1] += np.random.default_rng(0).normal(0, 5, (64, 64)).astype(np.float32)
+        img = np.clip(lab_to_rgb_working(lab), 0.0, 1.0).astype(np.float32)
+        proc = PhotoLabProcessor(LabConfig(saturation=1.0, skin_protection=0.0, sharpen=0.0))
+
+        def render(mode: ProcessMode) -> np.ndarray:
+            return proc.process(img.copy(), PipelineContext(original_size=(64, 64), scale_factor=1.0, process_mode=mode))
+
+        np.testing.assert_array_equal(render(ProcessMode.BW), np.clip(img, 0.0, 1.0))
+        for mode in (ProcessMode.C41, ProcessMode.E6):
+            self.assertGreater(float(np.abs(render(mode) - img).max()), 1e-3)
+
     def test_chroma_denoise_does_not_bleed_across_edge(self) -> None:
         """A saturated region must not tint its neighbours — an isotropic blur haloed."""
         rng = np.random.default_rng(0)
@@ -536,63 +556,72 @@ class TestGlowAndHalation(unittest.TestCase):
             self.assertLessEqual(float(res.max()), 1.0)
 
     def test_glow_brightens_dark_area_near_highlight(self) -> None:
-        """Glow should increase brightness in the dark area neighbouring the highlight."""
-        img = self._highlight_image()
+        img = self._large_highlight_image()
         res = apply_glow_and_halation(img, glow_amount=1.0, halation_strength=0.0)
-        # Dark border just outside the bright spot should be brighter after glow
-        dark_before = float(img[35, 35, 0])
-        dark_after = float(res[35, 35, 0])
-        self.assertGreater(dark_after, dark_before)
+        self.assertGreater(float(res[380, 500, 0]), float(img[380, 500, 0]))
 
     def test_glow_all_channels_equally(self) -> None:
-        """Glow bloom should be approximately equal across R, G, B channels."""
-        img = self._highlight_image()
+        img = self._large_highlight_image()
+        delta = apply_glow_and_halation(img, glow_amount=1.0, halation_strength=0.0)[380, 500] - img[380, 500]
+        self.assertAlmostEqual(float(delta[0]), float(delta[1]), places=6)
+        self.assertAlmostEqual(float(delta[1]), float(delta[2]), places=6)
+
+    def test_glow_keeps_flat_areas(self) -> None:
+        for v in (0.3, 1.0):
+            img = np.full((64, 64, 3), v, dtype=np.float32)
+            np.testing.assert_allclose(apply_glow_and_halation(img, 1.0, 0.0), img, atol=1e-6)
+
+    def test_glow_conserves_light(self) -> None:
+        img = self._large_highlight_image()
         res = apply_glow_and_halation(img, glow_amount=1.0, halation_strength=0.0)
-        # Check a dark pixel near the highlight
-        delta = res[30, 50] - img[30, 50]
-        # All three channels should have gained roughly the same amount
-        self.assertAlmostEqual(float(delta[0]), float(delta[1]), delta=0.05)
-        self.assertAlmostEqual(float(delta[1]), float(delta[2]), delta=0.05)
+        np.testing.assert_allclose(res.sum(axis=(0, 1), dtype=np.float64), img.sum(axis=(0, 1), dtype=np.float64), rtol=1e-6)
+        self.assertLess(float(res[401, 500, 0]), 1.0)
+
+    def test_glow_spread_follows_the_frame_size(self) -> None:
+        small, large = np.full((500, 500, 3), 0.05, dtype=np.float32), self._large_highlight_image()
+        small[200:300, 200:300, :] = 1.0
+        res_small = apply_glow_and_halation(small, 1.0, 0.0)
+        res_large = apply_glow_and_halation(large, 1.0, 0.0)
+        self.assertAlmostEqual(float(res_small[190, 250, 0]), float(res_large[380, 500, 0]), delta=2e-3)
+
+    def _large_highlight_image(self) -> np.ndarray:
+        img = np.full((1000, 1000, 3), 0.05, dtype=np.float32)
+        img[400:600, 400:600, :] = 1.0
+        return img
 
     def test_halation_red_dominant(self) -> None:
-        """Halation scatter should add more red than blue to dark pixels near highlights."""
-        img = self._highlight_image()
+        img = self._large_highlight_image()
         res = apply_glow_and_halation(img, glow_amount=0.0, halation_strength=1.0)
-        delta = res[30, 50] - img[30, 50]
+        delta = res[396, 500] - img[396, 500]
+        self.assertGreater(float(delta[0]), 0.0)
         self.assertGreater(float(delta[0]), float(delta[2]))
 
-    def test_scale_factor_affects_spread(self) -> None:
-        """A larger scale factor should spread the bloom further from the highlight."""
-        img = self._highlight_image()
-        res_small = apply_glow_and_halation(img, glow_amount=1.0, halation_strength=0.0, scale_factor=0.5)
-        res_large = apply_glow_and_halation(img, glow_amount=1.0, halation_strength=0.0, scale_factor=2.0)
-        # scale=0.5 → kernel radius ~7px; scale=2.0 → kernel radius ~30px.
-        # Pixel at row 28 is ~12px above the highlight edge (row 40), so it should
-        # receive bloom with scale=2.0 but not with scale=0.5.
-        far_small = float(res_small[28, 50, 0])
-        far_large = float(res_large[28, 50, 0])
-        self.assertGreater(far_large, far_small)
+    def test_halation_on_bw_is_neutral(self) -> None:
+        img = self._large_highlight_image()
+        res = apply_glow_and_halation(img, glow_amount=0.0, halation_strength=1.0, bw=True)
+        delta = res[396, 500] - img[396, 500]
+        self.assertGreater(float(delta[0]), 0.0)
+        self.assertAlmostEqual(float(delta[0]), float(delta[1]), places=6)
+        self.assertAlmostEqual(float(delta[1]), float(delta[2]), places=6)
 
-    def test_halation_ignores_midtones(self) -> None:
-        """Mid-gray (0.5 linear) must not halate: the mask thresholds linear
-        reflectance (0.65), not display code — the old encoded-domain mask lit up
-        anything above ~0.29 linear and moved with grade/density."""
+    def test_halation_spread_follows_the_frame_size(self) -> None:
+        small, large = np.full((500, 500, 3), 0.05, dtype=np.float32), self._large_highlight_image()
+        small[200:300, 200:300, :] = 1.0
+        res_small = apply_glow_and_halation(small, 0.0, 1.0)
+        res_large = apply_glow_and_halation(large, 0.0, 1.0)
+        self.assertAlmostEqual(float(res_small[196, 250, 0]), float(res_large[392, 500, 0]), delta=2e-3)
+
+    def test_halation_keeps_a_flat_area(self) -> None:
         img = np.full((64, 64, 3), 0.5, dtype=np.float32)
         res = apply_glow_and_halation(img, glow_amount=0.0, halation_strength=1.0)
         np.testing.assert_allclose(res, img, atol=1e-6)
 
-    def test_halation_energy_conserving(self) -> None:
-        """Additive scatter cannot add more light than the masked highlight source."""
-        from negpy.features.lab.logic import HALATION_THRESHOLD_LINEAR as t
-
-        img = self._highlight_image()
+    def test_halation_conserves_light(self) -> None:
+        img = self._large_highlight_image()
         res = apply_glow_and_halation(img, glow_amount=0.0, halation_strength=1.0)
-        lin_luma = img[:, :, 0] * 0.2126 + img[:, :, 1] * 0.7152 + img[:, :, 2] * 0.0722
-        mask = np.clip((lin_luma - t) / (1.0 - t), 0.0, 1.0) ** 2
-        source_energy = float(np.sum(img[:, :, 0] * mask)) * (1.0 + 0.3 + 0.05)
-        added = float(np.sum(res - img))
-        self.assertLessEqual(added, source_energy + 1e-3)
-        self.assertGreater(added, 0.0)
+        np.testing.assert_allclose(res.sum(axis=(0, 1), dtype=np.float64), img.sum(axis=(0, 1), dtype=np.float64), rtol=1e-6)
+        self.assertLess(float(res[500, 500, 0]), 1.0 + 1e-6)
+        self.assertLess(float(res[401, 500, 0]), float(img[401, 500, 0]))
 
     def test_combined_brighter_than_individual(self) -> None:
         """Applying both glow and halation should be at least as bright as either alone."""
@@ -679,3 +708,30 @@ class TestSharpenShadowGain(unittest.TestCase):
         light = _l_contrast_gain(apply_rl_sharpening, _textured_patch(60.0), radius=1.0)
         self.assertGreater(light, 1.15)
         self.assertLess((dark - 1.0) / (light - 1.0), 0.6)
+
+
+def _grainy(sigma: float, seed: int = 0) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    return np.clip(0.25 + sigma * rng.standard_normal((200, 300, 3)), 0.0, 1.0).astype(np.float32)
+
+
+def test_auto_masking_rises_with_grain() -> None:
+    on = LabConfig(sharpen_auto_masking=True)
+    fine, coarse = auto_masking(_grainy(0.005), on), auto_masking(_grainy(0.02), on)
+    assert fine is not None and coarse is not None
+    assert 0.0 < fine < coarse <= 1.0
+
+
+def test_auto_masking_off_or_unmeasured() -> None:
+    assert auto_masking(_grainy(0.02), LabConfig()) is None
+    # No midtone pixels to measure: the neutral masking.
+    black = np.zeros((50, 50, 3), dtype=np.float32)
+    assert auto_masking(black, LabConfig(sharpen_auto_masking=True)) == LabConfig().sharpen_masking
+
+
+def test_effective_masking_is_an_offset_on_the_auto_value() -> None:
+    assert effective_masking(LabConfig(sharpen_masking=0.3), None) == 0.3
+    assert effective_masking(LabConfig(), 0.4) == 0.4
+    assert effective_masking(LabConfig(sharpen_masking=0.2), 0.4) == pytest.approx(0.5)
+    assert effective_masking(LabConfig(sharpen_masking=-0.5), 0.2) == 0.0
+    assert effective_masking(LabConfig(sharpen_masking=0.9), 0.6) == 1.0

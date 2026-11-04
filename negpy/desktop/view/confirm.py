@@ -38,6 +38,34 @@ def confirm_load_roll(parent, repo, image_count: int, label: str) -> bool:
     return True
 
 
+def confirm_unmetered_scan(parent, repo) -> bool:
+    """Ask before a scan shoots at the camera's own exposure with no Meter reading and no exposure
+    set in NegPy. Skippable via "Do Not Ask Again", persisted."""
+    if repo.get_global_setting("scan_unmetered_confirm_dismissed", False):
+        return True
+    box = QMessageBox(parent)
+    box.setIcon(QMessageBox.Icon.Warning)
+    box.setWindowTitle(tr("Scan"))
+    box.setText(tr("Scan without metering?"))
+    box.setInformativeText(
+        tr(
+            "The scan uses the exposure set on the camera. If the film base clips, the shadows of the print turn solid black. "
+            "Click Cancel, then click Meter."
+        )
+    )
+    remember = box_toggle(tr("Do Not Ask Again"))
+    box.setCheckBox(remember)
+    scan = box.addButton(tr("Scan"), QMessageBox.ButtonRole.AcceptRole)
+    cancel = box.addButton(tr("Cancel"), QMessageBox.ButtonRole.RejectRole)
+    box.setDefaultButton(cancel)
+    box.exec()
+    if box.clickedButton() is not scan:
+        return False
+    if remember.isChecked():
+        repo.save_global_setting("scan_unmetered_confirm_dismissed", True)
+    return True
+
+
 def warn_targets_affect_unbaked(parent, repo) -> None:
     """On a confirmed target change, advise that unbaked frames move with the new targets, and
     that baking a frame first keeps it fixed. Skippable via "Don't show again", persisted so a
@@ -58,30 +86,22 @@ def warn_targets_affect_unbaked(parent, repo) -> None:
         repo.save_global_setting("exposure_targets_warn_dismissed", True)
 
 
-def confirm_close_roll(parent, roll_name: str | None) -> bool:
-    informative = tr("Your saved edits stay in the database. The roll stays in the Library.")
+def confirm_unload_all(parent, roll_name: str | None) -> bool:
+    """Ask before the Film Strip empties; *roll_name* is the open roll, which stays in the Library."""
     if roll_name is None:
-        return confirm_action(
-            parent, tr("Unload All"), tr("Unload all frames from the Film Strip?"), tr("Unload"), informative, destructive=False
-        )
-    return confirm_action(
-        parent, tr("Close Roll"), tr("Close “{roll_name}”?", roll_name=roll_name), tr("Close"), informative, destructive=False
-    )
+        text = tr("Unload all frames from the Film Strip?")
+        informative = tr("Your saved edits stay in the database.")
+    else:
+        text = tr("Unload all frames of “{roll_name}” from the Film Strip?", roll_name=roll_name)
+        informative = tr("Your saved edits stay in the database. The roll stays in the Library.")
+    return confirm_action(parent, tr("Unload All"), text, tr("Unload"), informative, destructive=False)
 
 
-def confirm_unload(parent, *, clear_all: bool = False, count: int = 1) -> bool:
-    """Ask the user to confirm removing image(s) from the session.
-
-    Unloading only drops the frames from the current list — saved edits stay in the
-    database keyed by content hash — but re-adding a large roll is tedious, and an
-    accidental Clear All is destructive to the working set, so we gate it behind a
-    prompt. Enter confirms (default button); Esc cancels.
-    """
+def confirm_unload(parent, *, count: int = 1) -> bool:
+    """Ask before frames leave the session. Saved edits stay in the database, but a large
+    roll is slow to add again. Enter confirms; Esc cancels."""
     verb = tr("Unload")
-    if clear_all:
-        title, verb = tr("Clear All"), tr("Clear")
-        text = tr("Remove all loaded images from the session?")
-    elif count > 1:
+    if count > 1:
         title = tr("Unload Selected")
         text = tr("Unload the {value} from the session?", value=count_of(count, tr("selected image")))
     else:
@@ -93,10 +113,8 @@ def confirm_unload(parent, *, clear_all: bool = False, count: int = 1) -> bool:
 
 
 def confirm_delete_named(parent, kind: str, name: str, *, informative: str = "") -> bool:
-    """Ask before deleting a named, user-created item — a work print, a roll, a
-    flat-field profile. None of them are undoable and none can be re-derived from the
-    frame, so each one is gated like Clear All. Enter confirms; Esc cancels.
-    """
+    """Ask before deleting a named item the user made: a work print, a roll, a flat-field
+    profile. No undo brings one back, and the frame cannot rebuild it. Enter confirms; Esc cancels."""
     return confirm_action(
         parent,
         tr("Delete {kind}", kind=kind),
@@ -133,11 +151,8 @@ def confirm_delete_mask(parent) -> bool:
 
 
 def confirm_reset_frames(parent, count: int, *, roll: bool = False) -> bool:
-    """Ask before resetting several frames to their defaults at once.
-
-    Each frame's reset is still an ordinary undo step, but reverting many frames at
-    once in the wrong roll or selection is disruptive, so it is gated like Clear All.
-    """
+    """Ask before several frames reset to their defaults. Each reset is an undo step, but
+    undoing many frames one by one is slow."""
     if roll:
         title = tr("Reset Roll to Defaults")
         text = tr("Reset all {value} in this roll to their default settings?", value=count_of(count, "frame"))
@@ -159,11 +174,8 @@ def confirm_reset_tab(parent, tab: str, count: int) -> bool:
 
 
 def confirm_clear_heals(parent, count: int) -> bool:
-    """Ask before wiping every manual heal/scratch on the frame.
-
-    Unlike single-heal undo this is not step-recoverable, so gate it like the
-    session Clear All. Enter confirms (default button); Esc cancels.
-    """
+    """Ask before every manual heal and scratch on the frame goes. No undo step brings them
+    back. Enter confirms; Esc cancels."""
     return confirm_action(
         parent,
         tr("Clear All Heals"),
@@ -286,6 +298,17 @@ def confirm_remove_from_roll(parent, count: int, roll_name: str) -> bool:
         text,
         tr("Remove"),
         tr("The files and their edits stay. Their scene, card locks and own edit in this roll are deleted."),
+    )
+
+
+def confirm_restore_removed(parent, count: int, roll_name: str) -> bool:
+    """Ask before the frames removed from a folder roll come back."""
+    return confirm_action(
+        parent,
+        tr("Restore Removed Frames"),
+        tr("Bring back the {value} removed from “{roll_name}”?", value=count_of(count, "frame"), roll_name=roll_name),
+        tr("Restore"),
+        tr("They return to the roll with their edits."),
     )
 
 

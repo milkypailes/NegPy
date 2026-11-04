@@ -143,6 +143,33 @@ fn log_density_open_block(src: &[f32], dst: &mut [f32]) {
     }
 }
 
+/// `unmix_log_image`: a 3x3 matrix on each pixel of an HxWx3 log image, no clip (log densities
+/// are negative). Each row is float32 products summed in channel order, the order `np.einsum`
+/// sums them in, with no `mul_add`.
+pub fn unmix_log(img: &[f32], m: [[f32; 3]; 3], dst: &mut [f32]) {
+    crate::par_zip(
+        dst.as_chunks_mut::<3>().0,
+        img.as_chunks::<3>().0,
+        move |d, p| *d = m.map(|r| p[0] * r[0] + p[1] * r[1] + p[2] * r[2]),
+    );
+}
+
+/// `relog_matrix_image`: a 3x3 matrix on each pixel of an HxWx3 log image, in linear light. Each
+/// value goes to 10^v, each row is float32 products summed in channel order with no `mul_add`, and
+/// the log clamps below at 1e-6 as `log_density_open` does.
+pub fn relog_matrix(img: &[f32], m: [[f32; 3]; 3], dst: &mut [f32]) {
+    crate::par_zip(
+        dst.as_chunks_mut::<3>().0,
+        img.as_chunks::<3>().0,
+        move |d, p| {
+            let lin = p.map(|v| crate::mathf::exp10_f64(v as f64) as f32);
+            *d = m.map(|r| {
+                crate::mathf::log10f((lin[0] * r[0] + lin[1] * r[1] + lin[2] * r[2]).max(1e-6))
+            });
+        },
+    );
+}
+
 /// `normalize_log_image`: `(v - floor) / (ceil - floor)` per channel of an HxWx3 log image,
 /// unclamped. A span under 1e-6 divides by +-1e-6, by the span's sign.
 pub fn normalize_log_image(img: &[f32], floors: [f32; 3], ceils: [f32; 3], dst: &mut [f32]) {
@@ -1748,27 +1775,32 @@ pub fn contrast_mask_stops(plane: &[f32], dst: &mut [f32], k: [f32; 7]) {
     });
 }
 
-/// `diffusion_grid` after the unmix: 10^x of an HxWx3 log plane, blurred by `sigma` with a
-/// replicated border, back to log10.
+/// `diffusion_grid` after the unmix: 10^x of an HxWx3 log plane, blurred by the sum of
+/// `(weight, sigma)` Gaussians with a replicated border, back to log10. Components add in order.
 pub fn diffusion_tail(
     unmixed: &[f32],
     h: usize,
     w: usize,
-    sigma: f64,
+    psf: &[(f32, f64)],
     dst: &mut [f32],
 ) -> Option<()> {
     let mut light = vec![0f32; unmixed.len()];
     crate::par_zip(&mut light, unmixed, move |d, &v| {
         *d = crate::mathf::exp10_f64(v as f64) as f32;
     });
-    crate::filter::gaussian_blur(
-        &light,
-        dst,
-        (h, w, 3),
-        (0, 0),
-        (sigma, 0.0),
-        Border::Replicate,
-    )?;
+    let mut part = vec![0f32; unmixed.len()];
+    dst.fill(0.0);
+    for &(weight, sigma) in psf {
+        crate::filter::gaussian_blur(
+            &light,
+            &mut part,
+            (h, w, 3),
+            (0, 0),
+            (sigma, 0.0),
+            Border::Replicate,
+        )?;
+        crate::par_zip(dst, &part, move |d, &p| *d += weight * p);
+    }
     dst.par_chunks_mut(1 << 14).for_each(|d| {
         for v in d {
             *v = crate::mathf::log10f(*v);
@@ -1780,6 +1812,18 @@ pub fn diffusion_tail(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unmix_log_keeps_negative_densities_and_sums_in_channel_order() {
+        let m = [[1.0f32, 0.5, 0.0], [0.0, 1.0, 0.0], [-1e8, 1e8, -3.0]];
+        let img = [-1.0f32, -1.0, -1.0];
+        let mut out = [0f32; 3];
+        unmix_log(&img, m, &mut out);
+        assert_eq!(out[0], -1.5);
+        assert_eq!(out[1], -1.0);
+        // (1e8 - 1e8) + 3 in float32; summed right to left, the 3 is lost in -1e8 + 3.
+        assert_eq!(out[2], 3.0);
+    }
 
     #[test]
     fn contrast_mask_stops_burns_below_and_dodges_above() {

@@ -153,7 +153,7 @@ def test_the_card_count_in_bw_is_the_filter_alone(qapp):
     controller.active_diptych.return_value = None
     panel = ControlsPanel(controller)
     base = WorkspaceConfig()
-    leftover = replace(base.exposure, wb_cyan=0.3, cast_removal_strength=0.5, bw_filter=BwFilter.RED_25)
+    leftover = replace(base.exposure, wb_cyan=0.3, cast_removal_strength=0.25, bw_filter=BwFilter.RED_25)
     counts = {}
     for mode in (ProcessMode.C41, ProcessMode.BW):
         controller.state.config = replace(base, process=replace(base.process, process_mode=mode, source_color=True), exposure=leftover)

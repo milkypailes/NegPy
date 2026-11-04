@@ -164,11 +164,10 @@ _SPLIT_HANDLE_PX = 11.0  # drawn knob radius
 _PROBE_OFFSET_PX = 18.0  # chip corner from the pointer
 _PROBE_TOOLS = (ToolMode.NONE, ToolMode.WB_PICK, ToolMode.ZONE_PLACE)
 
-_LOUPE_RADIUS_PX = 128.0
-# Device px per buffer px inside the glass. At fit-zoom the canvas already shows most of a
-# device px per buffer px, so a literal 1:1 loupe barely magnifies. 2x always out-magnifies
+_LOUPE_RADIUS_PX = 200.0
+# Device px per canvas px while the export render is not there yet. 2x always out-magnifies
 # the canvas below 200% zoom.
-_LOUPE_MAG = 2.0
+_LOUPE_PREVIEW_MAG = 2.0
 _LOUPE_BADGE_H = 22.0
 
 
@@ -193,6 +192,28 @@ def draw_view_badge(painter: QPainter, text: str, x: float, y: float, width: Opt
         left += _BADGE_DOT_PX + THEME.space_md
     painter.setPen(with_alpha(THEME.mark_photo, 245))
     painter.drawText(badge.adjusted(left, 0, -THEME.space_lg, 0), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, text)
+
+
+def draw_point_mark(painter: QPainter, p: QPointF, label: str, color: QColor, radius: float = _PIN_RADIUS_PX) -> None:
+    """A probed spot on the photo: a ring on a mark_shadow edge, a center dot and a caption to its right."""
+    shadow = with_alpha(THEME.mark_shadow, 160)
+    painter.save()
+    painter.setFont(_overlay_label_font(painter))
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    for pen_color, width in ((shadow, 3.5), (color, 1.5)):
+        pen = QPen(pen_color, width)
+        pen.setCosmetic(True)
+        painter.setPen(pen)
+        painter.drawEllipse(p, radius, radius)
+        # Centre dot: the ring alone leaves the probed pixel to guesswork.
+        painter.drawEllipse(p, width * 0.25, width * 0.25)
+    box = QRectF(p.x() + radius + 4.0, p.y() - 11.0, 140.0, 22.0)
+    align = Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft
+    painter.setPen(shadow)
+    painter.drawText(box.translated(1.0, 1.0), align, label)
+    painter.setPen(color)
+    painter.drawText(box, align, label)
+    painter.restore()
 
 
 def probe_lines(reading: Any) -> Tuple[str, str]:
@@ -260,6 +281,15 @@ def loupe_src_rect(buf_w: int, buf_h: int, cx: float, cy: float, side: float) ->
     x = min(max(cx - side / 2.0, 0.0), max(buf_w - side, 0.0))
     y = min(max(cy - side / 2.0, 0.0), max(buf_h - side, 0.0))
     return QRectF(x, y, side, side)
+
+
+def export_loupe_center(
+    nx: float, ny: float, content_rect: Optional[Tuple[int, int, int, int]], buf_w: int, buf_h: int
+) -> Tuple[float, float]:
+    """A content-normalized canvas point on the export buffer, inside the rect its picture
+    fills (the whole buffer when None)."""
+    x, y, w, h = content_rect or (0, 0, buf_w, buf_h)
+    return x + nx * w, y + ny * h
 
 
 def zone_pin_caption(index: int, pin: Any) -> str:
@@ -1149,6 +1179,9 @@ class CanvasOverlay(QWidget):
         if self._tool_mode == ToolMode.ANALYSIS_DRAW:
             self._draw_analysis_tool(painter)
 
+        if self._tool_mode in (ToolMode.DMIN_PICK, ToolMode.DMAX_PICK):
+            self._draw_bounds_picks(painter)
+
         if (
             self._buffer_overlay_visible
             and self._buffer_overlay_ratio > 1e-4
@@ -1263,7 +1296,13 @@ class CanvasOverlay(QWidget):
             self._draw_compare_split(painter)
 
         # Exclusive with the split above, so the two badges cannot land on each other.
-        if self.state.negative_peek or self.state.embedded_peek or self.state.flat_peek or self.state.flatfield_peek:
+        if (
+            self.state.negative_peek
+            or self.state.embedded_peek
+            or self.state.flat_peek
+            or self.state.flatfield_peek
+            or self.state.export_size_view
+        ):
             self._draw_peek_badge(painter)
 
         # Last: the glass sits over everything else and claims no content rect, so it stays out
@@ -1414,6 +1453,8 @@ class CanvasOverlay(QWidget):
             text = tr("EMBEDDED")
         elif self.state.flatfield_peek:
             text = tr("FLAT FIELD")
+        elif self.state.export_size_view:
+            text = tr("EXPORT SIZE") if self.state.canvas_value("export_view") else tr("EXPORT SIZE · RENDERING")
         else:
             text = tr("FLAT SCAN")
         rect = self._content_view_rect()
@@ -1879,60 +1920,61 @@ class CanvasOverlay(QWidget):
 
     def _draw_zone_pins(self, painter: QPainter) -> None:
         """Zone-placement pins: a numbered ring per probed spot with its caption."""
-        shadow = with_alpha(THEME.mark_shadow, 160)
-        painter.save()
-        painter.setFont(_overlay_label_font(painter))
-        painter.setBrush(Qt.BrushStyle.NoBrush)
         for i, (pin, p) in enumerate(zip(self.state.zone_pins, self._zone_pin_screen_points())):
             color = QColor(PIN_COLORS[i]) if i < len(PIN_COLORS) else with_alpha(THEME.mark_photo, 230)
             radius = _PIN_RADIUS_PX + (2.0 if i == self._pin_drag_index else 0.0)
-            for pen_color, width in ((shadow, 3.5), (color, 1.5)):
-                pen = QPen(pen_color, width)
-                pen.setCosmetic(True)
-                painter.setPen(pen)
-                painter.drawEllipse(p, radius, radius)
-                # Centre dot: the ring alone leaves the probed pixel to guesswork.
-                painter.drawEllipse(p, width * 0.25, width * 0.25)
-            label = zone_pin_caption(i, pin)
-            tr = QRectF(p.x() + radius + 4.0, p.y() - 11.0, 140.0, 22.0)
-            align = Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft
-            painter.setPen(shadow)
-            painter.drawText(tr.translated(1.0, 1.0), align, label)
-            painter.setPen(color)
-            painter.drawText(tr, align, label)
-        painter.restore()
+            draw_point_mark(painter, p, zone_pin_caption(i, pin), color, radius)
+
+    def _draw_bounds_picks(self, painter: QPainter) -> None:
+        """Where Dmin and Dmax were picked, while either pick tool shows the uncropped frame."""
+        proc, rect = self.state.config.process, self._content_view_rect()
+        for at, label in ((proc.manual_dmin_at, tr("Dmin")), (proc.manual_dmax_at, tr("Dmax"))):
+            if at is not None and not rect.isEmpty():
+                p = QPointF(rect.x() + at[0] * rect.width(), rect.y() + at[1] * rect.height())
+                draw_point_mark(painter, p, label, QColor(THEME.mark_photo))
 
     def _draw_grain_loupe(self, painter: QPainter) -> None:
-        """The darkroom grain magnifier: a circular window at the cursor showing the frame's own
-        pixels at `_LOUPE_MAG`, with an acutance figure so sharpness is a number.
+        """The darkroom grain magnifier: a circular window at the cursor showing the frame's
+        export pixels 1:1 on device pixels, with an acutance figure so sharpness is a number.
 
-        Samples the frame under the canvas's own display transform, applied exactly once —
-        a second pass would double-proof it.
-
-        ponytail: magnifies whatever the canvas holds — a 1600 px frame off a half-size demosaic
-        unless HQ preview is on — so the acutance figure is comparative below HQ, not absolute,
-        and the badge says which. A true 1:1-of-scan loupe needs a full-res ROI render path;
-        RenderTask renders whole frames only.
+        Samples under the canvas's own display transform, applied exactly once: a second pass
+        would double-proof it. Until the export render for this edit lands, it magnifies the
+        canvas frame at `_LOUPE_PREVIEW_MAG` and the badge says so.
         """
-        img = self._host_qimage()
-        if img is None:
-            return
         rect = self._content_view_rect()
         if rect.isEmpty() or not self._view_rect.contains(self._mouse_pos):
             return
-
-        # Buffer px per screen px: the loupe works in buffer space, not content space.
-        scale = img.width() / self._view_rect.width()
-        cx = (self._mouse_pos.x() - self._view_rect.x()) * scale
-        cy = (self._mouse_pos.y() - self._view_rect.y()) * scale
-        side = 2.0 * _LOUPE_RADIUS_PX / _LOUPE_MAG
-        src = loupe_src_rect(img.width(), img.height(), cx, cy, side)
-        dest = QRectF(
-            self._mouse_pos.x() - _LOUPE_RADIUS_PX,
-            self._mouse_pos.y() - _LOUPE_RADIUS_PX,
-            2.0 * _LOUPE_RADIUS_PX,
-            2.0 * _LOUPE_RADIUS_PX,
-        )
+        mx, my = self._mouse_pos.x(), self._mouse_pos.y()
+        export_side = 2.0 * _LOUPE_RADIUS_PX * self.devicePixelRatioF()
+        view = self.state.export_view
+        # Export pixels stand in only for the print: a peek or the uncropped tool view is another frame.
+        on_print = self.state.peek_frame is None and not self.state.canvas_value("crop_preview_full")
+        shows_export = bool(self.state.canvas_value("export_view"))
+        if shows_export or view is None or not on_print:
+            img, buf = self._host_qimage(), self._host_buffer()
+            if img is None:
+                return
+            if shows_export:
+                side, tail = export_side, tr("export {width} × {height} px", width=img.width(), height=img.height())
+            else:
+                side = 2.0 * _LOUPE_RADIUS_PX / _LOUPE_PREVIEW_MAG
+                tail = tr("rendering export…") if on_print else tr("preview res")
+            # Buffer px per screen px: the loupe works in buffer space, not content space.
+            scale = img.width() / self._view_rect.width()
+            cx, cy = (mx - self._view_rect.x()) * scale, (my - self._view_rect.y()) * scale
+            src = loupe_src_rect(img.width(), img.height(), cx, cy, side)
+        else:
+            buf = view["buffer"]
+            h, w = buf.shape[:2]
+            cx, cy = export_loupe_center((mx - rect.x()) / rect.width(), (my - rect.y()) / rect.height(), view["content_rect"], w, h)
+            src = loupe_src_rect(w, h, cx, cy, export_side)
+            x0, y0 = int(src.x()), int(src.y())
+            patch = np.ascontiguousarray(buf[y0 : y0 + int(src.height()), x0 : x0 + int(src.width())])
+            img = ImageConverter.to_qimage(patch, self._display_cs, self._monitor_icc_bytes, self._proof)
+            src = QRectF(0.0, 0.0, img.width(), img.height())
+            buf = patch
+            tail = tr("export {width} × {height} px", width=w, height=h)
+        dest = QRectF(mx - _LOUPE_RADIUS_PX, my - _LOUPE_RADIUS_PX, 2.0 * _LOUPE_RADIUS_PX, 2.0 * _LOUPE_RADIUS_PX)
 
         painter.save()
         clip = QPainterPath()
@@ -1951,18 +1993,13 @@ class CanvasOverlay(QWidget):
         painter.drawEllipse(dest)
 
         acutance = 0.0
-        host = self._host_buffer()
-        if host is not None:
+        if buf is not None:
             x0, y0 = int(src.x()), int(src.y())
-            x1, y1 = int(src.right()), int(src.bottom())
-            acutance = loupe_acutance(host[y0:y1, x0:x1])
-        label = (
-            tr("acutance {acutance:.1f} · full res", acutance=acutance)
-            if self.state.hq_preview
-            else tr("acutance {acutance:.1f} · preview res", acutance=acutance)
-        )
+            acutance = loupe_acutance(buf[y0 : y0 + int(src.height()), x0 : x0 + int(src.width())])
+        label = tr("acutance {acutance:.1f} · {detail}", acutance=acutance, detail=tail)
 
-        badge = QRectF(dest.center().x() - 96.0, dest.bottom() + 6.0, 192.0, _LOUPE_BADGE_H)
+        badge_w = painter.fontMetrics().horizontalAdvance(label) + 2 * THEME.space_lg
+        badge = QRectF(dest.center().x() - badge_w / 2.0, dest.bottom() + 6.0, badge_w, _LOUPE_BADGE_H)
         painter.setBrush(with_alpha(THEME.mark_shadow, 170))
         painter.setPen(Qt.PenStyle.NoPen)
         painter.drawRoundedRect(badge, THEME.radius_md, THEME.radius_md)
@@ -2882,11 +2919,12 @@ class CanvasOverlay(QWidget):
         path = self.state.current_file_path
         return os.path.basename(path) if path else ""
 
-    def _recipe_lines(self) -> List[str]:
+    def recipe(self, *, brief: bool = False, with_frame: bool = True) -> List[str]:
+        """The print recipe with the metered values the sliders show."""
         conf = self.state.config
         meters = self.state.auto_meters.get(self.state.current_file_hash or "", {})
         exposure = replace(printed_exposure(conf.process, conf.exposure), **shown_values(conf, meters))
-        return recipe_lines(exposure, conf.local, conf.finish, frame=self._frame_name())
+        return recipe_lines(exposure, conf.local, conf.finish, frame=self._frame_name() if with_frame else "", brief=brief)
 
     def _draw_printing_notes(self, painter: QPainter) -> None:
         """The printer's marked-up work print: hatched burns, open dodges, ±stop badges,
@@ -2900,7 +2938,7 @@ class CanvasOverlay(QWidget):
             if mask.enabled and len(ctrl) >= min_points(mask.shape)
         ]
         paint_map(painter, polys, palette_for(self.state.color_vision).dodge_burn)
-        paint_card(painter, QPointF(rect.x() + _NOTES_CARD_INSET_PX, rect.y() + _NOTES_CARD_TOP_PX), self._recipe_lines())
+        paint_card(painter, QPointF(rect.x() + _NOTES_CARD_INSET_PX, rect.y() + _NOTES_CARD_TOP_PX), self.recipe())
 
     def printing_notes_sheet(self) -> Optional[QImage]:
         """The exportable notes sheet: the frame the canvas rendered, the map baked on
@@ -2920,7 +2958,7 @@ class CanvasOverlay(QWidget):
             self._content_rect,
             self.state.config.local,
             uv_grid,
-            self._recipe_lines(),
+            self.recipe(),
             palette_for(self.state.color_vision).dodge_burn,
             self.state.config.exposure.grade,
         )

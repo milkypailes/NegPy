@@ -45,6 +45,7 @@ Actions with no default key are not listed; every one of them can still be bound
 | `Ctrl + R` | Toggle analysis region draw |
 | `M` | Peek flat scan (digital intermediate); hold to peek only while down |
 | `N` | Peek negative (source as loaded); hold to peek only while down |
+| `U` | Peek the roll average; hold to peek only while down |
 | `P` | Peek the camera's embedded preview; hold to peek only while down |
 | `Shift + Z` | Adams zone overlay |
 | `Shift + T` | Density × grade test strip |
@@ -107,6 +108,16 @@ Actions with no default key are not listed; every one of them can still be bound
 | `Alt + P` / `Alt + Shift + P` | Increase / decrease **White Point** (default step 0.01) |
 | `Alt + O` / `Alt + Shift + O` | Increase / decrease **Black Point** (default step 0.01) |
 
+## Lab
+| Key | Action |
+|-----|--------|
+| `Alt + 2` / `Alt + Shift + 2` | Increase / decrease **Chroma Denoise** (default step 0.01) |
+| `Alt + 3` / `Alt + Shift + 3` | Increase / decrease **Chroma** (default step 0.01) |
+| `Alt + 5` / `Alt + Shift + 5` | Increase / decrease **CLAHE** (default step 0.01) |
+| `Alt + 6` / `Alt + Shift + 6` | Increase / decrease **Sharpening** (default step 0.01) |
+| `Alt + 7` / `Alt + Shift + 7` | Increase / decrease **Glow** (default step 0.01) |
+| `Alt + 8` / `Alt + Shift + 8` | Increase / decrease **Halation** (default step 0.01) |
+
 ## Actions
 | Key | Action |
 |-----|--------|
@@ -127,16 +138,6 @@ Actions with no default key are not listed; every one of them can still be bound
 | `Alt + N` / `Alt + Shift + N` | Increase / decrease **Luma Range Clip** (default step 1) |
 | `Alt + E` / `Alt + Shift + E` | Increase / decrease **Color Clip** (default step 1) |
 | `Alt + 1` / `Alt + Shift + 1` | Increase / decrease **Crosstalk** (default step 0.01) |
-
-## Lab
-| Key | Action |
-|-----|--------|
-| `Alt + 2` / `Alt + Shift + 2` | Increase / decrease **Chroma Denoise** (default step 0.01) |
-| `Alt + 3` / `Alt + Shift + 3` | Increase / decrease **Chroma** (default step 0.01) |
-| `Alt + 5` / `Alt + Shift + 5` | Increase / decrease **CLAHE** (default step 0.01) |
-| `Alt + 6` / `Alt + Shift + 6` | Increase / decrease **Sharpening** (default step 0.01) |
-| `Alt + 7` / `Alt + Shift + 7` | Increase / decrease **Glow** (default step 0.01) |
-| `Alt + 8` / `Alt + Shift + 8` | Increase / decrease **Halation** (default step 0.01) |
 
 ## Toning
 | Key | Action |

@@ -77,7 +77,13 @@ HEADER_HEIGHT = 40
 TOOLBAR_BUTTON_HEIGHT = 28
 TOOLBAR_ICON_SIZE = 16
 # The canvas bar under the picture, the app's main toolbar: larger than a section toolbar.
+# Every box on the bar is this tall: a track, a field, a segmented control, a primary button.
 BAR_BUTTON_HEIGHT = 36
+# A track's edge sits this far outside the buttons it groups, as a segmented chip sits inside its track.
+BAR_TRACK_PAD = THEME.space_xs + 0.5
+BAR_TRACK_BUTTON_HEIGHT = BAR_BUTTON_HEIGHT - int(2 * BAR_TRACK_PAD)
+# The canvas strip and the controls panel's Find row share one height, so their edges line up.
+TOP_ROW_HEIGHT = BAR_BUTTON_HEIGHT + 2 * THEME.space_sm
 BAR_ICON_SIZE = 18
 
 _default_btn_height: int | None = None
@@ -259,6 +265,14 @@ def labeled_toggle(icon_name: str, label: str, checked: bool, tooltip: str) -> Q
     return btn
 
 
+def set_toggle_suggested(btn: QPushButton, icon_name: str, suggested: bool) -> None:
+    """Paints an off toggle's icon `warn_amber` while the panel suggests turning it on; on, it is
+    `text_primary` as usual."""
+    color = THEME.warn_amber if suggested else THEME.text_hint
+    btn.setIcon(qta.icon(icon_name, color=color, color_on=THEME.text_primary, color_disabled=THEME.text_muted))
+    btn.setProperty("suggested", suggested)
+
+
 def box_toggle(label: str, checked: bool = False, tooltip: str = "") -> QCheckBox:
     """A labeled toggle for QMessageBox.setCheckBox, which takes only a QCheckBox; the QSS draws
     it as a toggle (QCheckBox#box_toggle). Everywhere else a toggle is labeled_toggle."""
@@ -299,6 +313,7 @@ def icon_button(icon_name: str, tooltip: str, width: int | None = ICON_BUTTON_WI
         btn.setFixedWidth(width)
     btn.setFixedHeight(default_button_height())
     btn.setToolTip(wrap_tooltip(tooltip))
+    btn.plain_tooltip = tooltip
     return btn
 
 
@@ -314,6 +329,14 @@ class Sweep:
 # Each sweep shows what its tool changes or paints.
 # Red to green to blue, for a tool that works on the whole image at once (Pick Better).
 RGB_SWEEP = Sweep((THEME.channel_red_text, THEME.channel_green_text, THEME.channel_blue_text))
+
+
+def channel_markup(parts: Iterable[str]) -> str:
+    """Rich text for an R · G · B readout, each part in its channel's text color."""
+    colors = (THEME.channel_red_text, THEME.channel_green_text, THEME.channel_blue_text)
+    return " · ".join(f'<span style="color:{color}">{part}</span>' for color, part in zip(colors, parts))
+
+
 # The two filters a ring-around varies.
 RING_AROUND_SWEEP = Sweep((THEME.filter_magenta, THEME.filter_yellow))
 # Light to dark on the diagonal: a test strip's density runs across it and its grade down it.
@@ -431,7 +454,7 @@ class _HintLabel(QLabel):
 
     def paintEvent(self, event) -> None:
         super().paintEvent(event)
-        if self._icon is None:
+        if self._icon is None or not self.text():
             return
         fm, size = self.fontMetrics(), self.fontMetrics().ascent()
         flags = int(self.alignment().value) | (int(Qt.TextFlag.TextWordWrap.value) if self.wordWrap() else 0)
@@ -469,17 +492,6 @@ def caption_label(text: str) -> QLabel:
         f"color: {THEME.text_on_accent}; font-size: {THEME.font_size_small}px; font-weight: {THEME.weight_bold}; border: none;"
     )
     return lbl
-
-
-def toast_qss(kind: str = "info") -> str:
-    """Canvas toast and loading chip: title type on a solid dark plate that reads over any canvas.
-    kind: "info" | "warning" | "error" picks the text colour, the same three as hint_label."""
-    color = {"warning": THEME.warn_amber, "error": THEME.channel_red}.get(kind, THEME.text_primary)
-    return (
-        f"color: {color}; font-size: {THEME.font_size_title}px; font-weight: {THEME.weight_semibold}; "
-        f"background-color: {THEME.surface_toast}; border: 1px solid {THEME.border_toast}; "
-        f"border-radius: {THEME.radius_lg}px; padding: 7px 18px;"
-    )
 
 
 def pane_header_qss() -> str:
@@ -628,13 +640,29 @@ def header_row(header: QLabel, *buttons: QWidget) -> QHBoxLayout:
     return row
 
 
+def header_actions(header: QLabel, *buttons: QPushButton) -> QHBoxLayout:
+    """header_row for labeled actions (labeled_action, labeled_toggle): a pair shares the row's
+    right half and a lone action takes a quarter, in line with a pair above it."""
+    row = header_row(header)
+    row.setStretch(0, 2 * max(len(buttons), 2) - len(buttons))
+    # Never narrower than the longest label: a _LabeledButton below its size hint drops its text.
+    widest = max(btn.sizeHint().width() for btn in buttons)
+    for btn in buttons:
+        # Ignored: the stretch alone sets the width, so every action in a card lines up.
+        btn.setSizePolicy(QSizePolicy.Policy.Ignored, btn.sizePolicy().verticalPolicy())
+        btn.setMinimumWidth(widest)
+        row.addWidget(btn, 1)
+    return row
+
+
 def section_subheader(text: str) -> QLabel:
-    """Small all-caps label for section grouping in sidebars; wraps in a panel too narrow for it."""
+    """All-caps label for section grouping in sidebars; wraps in a panel too narrow for it.
+    FoldButton draws a folding sub-header in the same size and color."""
     lbl = QLabel(tr(text).upper())
     lbl.setWordWrap(True)
     lbl.setStyleSheet(
-        f"font-size: {THEME.font_size_small}px; "
-        f"color: {THEME.text_hint}; "
+        f"font-size: {THEME.font_size_base}px; "
+        f"color: {THEME.text_secondary}; "
         f"font-weight: {THEME.weight_semibold}; "
         f"margin-top: {THEME.space_xl}px;"
     )

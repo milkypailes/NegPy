@@ -74,7 +74,7 @@ class TestGearCombos:
 
     def test_other_pick_clones_the_catalog_camera_into_personal_gear(self, gear_sidebar: MetadataSidebar) -> None:
         cloned = Camera(id="cam-cloned", make="Leica", model="M6", is_bundled=False)
-        with patch.object(metadata_module, "resolve_other_gear_pick", return_value=cloned):
+        with patch.object(metadata_module, "resolve_other_gear_pick", return_value=(cloned, False)):
             gear_sidebar.camera_combo._commit_id(metadata_module.OTHER_ID)
 
         new_id = gear_sidebar.state.config.metadata.camera_id
@@ -84,12 +84,35 @@ class TestGearCombos:
 
     def test_other_pick_add_custom_starts_a_blank_personal_camera(self, gear_sidebar: MetadataSidebar) -> None:
         custom = Camera(id="cam-custom", display_name="New Camera")
-        with patch.object(metadata_module, "resolve_other_gear_pick", return_value=custom):
+        with patch.object(metadata_module, "resolve_other_gear_pick", return_value=(custom, True)):
             gear_sidebar.camera_combo._commit_id(metadata_module.OTHER_ID)
 
         new_id = gear_sidebar.state.config.metadata.camera_id
         assert new_id == "cam-custom"
         assert gear_sidebar.camera_combo.line_edit().text() == "New Camera"
+
+    def test_other_pick_add_custom_opens_the_blank_camera_in_my_gear(self, gear_sidebar: MetadataSidebar) -> None:
+        panel = GearLibraryPanel(gear_sidebar._gear_library)
+        gear_sidebar.attach_gear_panel(panel)
+        custom = Camera(id="cam-custom", display_name="New Camera")
+        with patch.object(metadata_module, "resolve_other_gear_pick", return_value=(custom, True)):
+            gear_sidebar.camera_combo._commit_id(metadata_module.OTHER_ID)
+        QApplication.processEvents()
+
+        assert gear_sidebar.tabs.current_key() == "gear"
+        selected = panel.items._selected_item()
+        assert selected is not None and selected.id == "cam-custom"
+        assert panel.items.display_name_edit.text() == "New Camera"
+
+    def test_other_pick_from_the_catalog_stays_on_the_shot_tab(self, gear_sidebar: MetadataSidebar) -> None:
+        gear_sidebar.attach_gear_panel(GearLibraryPanel(gear_sidebar._gear_library))
+        gear_sidebar.tabs.show_tab("shot")
+        cloned = Camera(id="cam-cloned", make="Leica", model="M6", is_bundled=False)
+        with patch.object(metadata_module, "resolve_other_gear_pick", return_value=(cloned, False)):
+            gear_sidebar.camera_combo._commit_id(metadata_module.OTHER_ID)
+        QApplication.processEvents()
+
+        assert gear_sidebar.tabs.current_key() == "shot"
 
     def test_other_pick_cancelled_reverts_to_the_previous_selection(self, gear_sidebar: MetadataSidebar) -> None:
         _set_metadata(gear_sidebar, camera_id="cam-mine")
@@ -122,6 +145,30 @@ class TestCaptureDate:
         sidebar.capture_date_edit.setText("")
         sidebar._persist_all_metadata_settings()
         assert sidebar.state.config.metadata.capture_date == ""
+
+
+class TestExposureLock:
+    """The Exposure field is lock-gated: unlock to type, re-lock to keep the text."""
+
+    def _type_and_relock(self, sidebar: MetadataSidebar) -> None:
+        sidebar._toggle_exif_lock("exposure", sidebar.exposure_edit, sidebar._exposure_lock_btn, True)
+        sidebar.exposure_edit.setText("1/125s f/2.8 ISO 400 -1/3ev")
+        sidebar._toggle_exif_lock("exposure", sidebar.exposure_edit, sidebar._exposure_lock_btn, False)
+
+    def test_relocking_keeps_the_typed_text(self, sidebar: MetadataSidebar) -> None:
+        self._type_and_relock(sidebar)
+
+        assert sidebar.exposure_edit.text() == "1/125s f/2.8 ISO 400 -1/3ev"
+        assert sidebar.state.config.metadata.exposure_override == "1/125s f/2.8 ISO 400 -1/3ev"
+
+    def test_the_debounce_and_a_frame_switch_keep_the_text(self, sidebar: MetadataSidebar) -> None:
+        self._type_and_relock(sidebar)
+        sidebar._persist_all_metadata_settings()
+        sidebar._on_file_selected("/scans/other/frame002.tif")
+        sidebar.sync_ui()
+
+        assert sidebar.exposure_edit.text() == "1/125s f/2.8 ISO 400 -1/3ev"
+        assert sidebar.state.config.metadata.exposure_override == "1/125s f/2.8 ISO 400 -1/3ev"
 
 
 class TestCapturePlace:
@@ -178,6 +225,33 @@ class TestCapturePlace:
             "Japan",
         )
         assert sidebar.place_edit.text() == "Tokyo, Tokyo, Japan"
+
+
+class TestCardLockOnEdit:
+    """Editing a Capture value locks the card so a frame switch keeps the value."""
+
+    def test_editing_place_locks_the_card(self, sidebar: MetadataSidebar) -> None:
+        sidebar.controller.sync_metadata_card_locks.reset_mock()
+        sidebar.place_edit.setText("35.68, 139.69")
+        sidebar._on_place_edited()
+
+        sidebar.controller.sync_metadata_card_locks.assert_called_once()
+        meta = sidebar.state.config.metadata
+        assert (meta.gps_latitude, meta.gps_longitude) == (35.68, 139.69)
+
+    def test_persisting_metadata_locks_the_card(self, sidebar: MetadataSidebar) -> None:
+        sidebar.controller.sync_metadata_card_locks.reset_mock()
+        sidebar._mark_dirty()
+        sidebar._persist_all_metadata_settings()
+
+        sidebar.controller.sync_metadata_card_locks.assert_called_once()
+
+    def test_flushing_exposure_override_locks_the_card(self, sidebar: MetadataSidebar) -> None:
+        sidebar.controller.sync_metadata_card_locks.reset_mock()
+        sidebar.exposure_edit.setText("1/125s f/2.8")
+        sidebar._flush_exposure_override()
+
+        sidebar.controller.sync_metadata_card_locks.assert_called_once()
 
 
 class TestSourceGpsPrefill:

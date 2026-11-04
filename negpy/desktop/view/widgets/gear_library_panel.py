@@ -47,7 +47,7 @@ from negpy.desktop.view.confirm import confirm_delete_named
 from negpy.desktop.view.shortcut_registry import tooltip_with_shortcut
 from negpy.desktop.view.styles.templates import (
     field_label,
-    header_row,
+    header_actions,
     hint_label,
     icon_button,
     labeled_action,
@@ -283,14 +283,17 @@ class GearItemsPanel(QWidget):
         self.focal_spin = QDoubleSpinBox()
         self.focal_spin.setRange(0, 2000)
         self.focal_spin.setSuffix(" mm")
+        self.focal_spin.setButtonSymbols(QDoubleSpinBox.ButtonSymbols.NoButtons)
         self.aperture_spin = QDoubleSpinBox()
         self.aperture_spin.setRange(0, 64)
         self.aperture_spin.setDecimals(1)
         self.aperture_spin.setPrefix("f/")
+        self.aperture_spin.setButtonSymbols(QDoubleSpinBox.ButtonSymbols.NoButtons)
         self.manufacturer_edit = QLineEdit()
         self.stock_name_edit = QLineEdit()
         self.iso_spin = QSpinBox()
         self.iso_spin.setRange(1, 12800)
+        self.iso_spin.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
         self.format_combo = StepCombo()
         add_choice_items(self.format_combo, [e.value for e in FilmFormat])
         self.color_combo = StepCombo()
@@ -648,8 +651,13 @@ class GearItemsPanel(QWidget):
         items.append(item)
         self._set_current_items(items)
         GearProfiles.save_library(self._library)
-        self._rebuild_item_list(select_id=item.id)
         self.library_changed.emit()
+        self.edit_item(self._category, item.id)
+
+    def edit_item(self, category: str, item_id: str) -> None:
+        """Show one item's form with its name selected, ready to type over."""
+        self._select_category(category)
+        self._rebuild_item_list(select_id=item_id)
         self.display_name_edit.setFocus()
         self.display_name_edit.selectAll()
 
@@ -693,6 +701,8 @@ class GearPresetsPanel(QWidget):
     library_changed = pyqtSignal()
     presets_changed = pyqtSignal()
     apply_requested = pyqtSignal(str)
+    # (category, item id): a blank item made by Other… needs the My Gear form.
+    edit_requested = pyqtSignal(str, str)
 
     def __init__(
         self,
@@ -756,9 +766,9 @@ class GearPresetsPanel(QWidget):
         root.addLayout(apply_row)
         self._apply_allowed = True
 
-        self.edit_btn = icon_button("fa5s.pen", tr("Rename the preset, or change which fields it stores"))
+        self.edit_btn = labeled_action("fa5s.pen", tr("Edit"), tr("Rename the preset, or change which fields it stores"))
         self.edit_btn.clicked.connect(self._edit_preset)
-        root.addLayout(header_row(section_subheader(tr("DETAILS")), self.edit_btn))
+        root.addLayout(header_actions(section_subheader(tr("DETAILS")), self.edit_btn))
 
         self.preset_panel = QWidget()
         preset_layout = QVBoxLayout(self.preset_panel)
@@ -1143,16 +1153,19 @@ class GearPresetsPanel(QWidget):
         category = self._preset_combo_category[id(combo)]
         meta = self._preset_meta()
         previous = self._preset_combo_field[id(combo)](meta) if meta is not None else ""
-        new_item = resolve_other_gear_pick(self, category, self._library, repo=self._repo)
-        if new_item is None:
+        picked = resolve_other_gear_pick(self, category, self._library, repo=self._repo)
+        if picked is None:
             self._set_own_gear_items(combo, getattr(self._library, category), previous)
             return
+        new_item, blank = picked
         items = list(getattr(self._library, category))
         items.append(new_item)
         setattr(self._library, category, items)
         GearProfiles.save_library(self._library)
         self.library_changed.emit()
         self._set_own_gear_items(combo, getattr(self._library, category), new_item.id)
+        if blank:
+            self.edit_requested.emit(category, new_item.id)
 
     def _on_preset_value_changed(self, *_args) -> None:
         meta = None if self._updating else self._preset_meta()
@@ -1313,6 +1326,7 @@ class GearLibraryPanel(QWidget):
 
     library_changed = pyqtSignal()
     presets_changed = pyqtSignal()
+    edit_requested = pyqtSignal(str, str)
 
     def __init__(
         self,
@@ -1331,6 +1345,7 @@ class GearLibraryPanel(QWidget):
         self.items.library_changed.connect(self.presets.refresh_gear_combos)
         self.presets.library_changed.connect(self.library_changed.emit)
         self.presets.presets_changed.connect(self.presets_changed.emit)
+        self.presets.edit_requested.connect(self.edit_requested.emit)
 
         self.sections: dict[str, CollapsibleSection] = {
             "items": make_section(self._repo, tr("My Gear"), "gear_items", self.items, "fa5s.toolbox", collapsible=False),

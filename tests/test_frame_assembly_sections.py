@@ -116,25 +116,68 @@ def test_trichrome_hint_names_the_frames_exposures(trichrome):
     assert "b.cr2" in sidebar.hint.text()
 
 
-def test_trichrome_edit_needs_a_loaded_frame(trichrome):
+def test_trichrome_edit_needs_an_open_frame(trichrome):
     sidebar, controller = trichrome
     assert sidebar.edit_btn.isEnabled() is False
 
     controller.state.uploaded_files = [{"path": "/tmp/r.cr2", "hash": "h1"}]
+    controller.state.selected_file_idx = 0
     sidebar.sync_ui()
 
     assert sidebar.edit_btn.isEnabled() is True
 
 
+def test_trichrome_edit_is_grayed_on_a_stitch(trichrome):
+    sidebar, controller = trichrome
+    controller.state.uploaded_files = [{"path": "/tmp/a.cr2", "hash": "h1#stitch", "stitch_paths": ("/tmp/b.cr2",)}]
+    controller.state.selected_file_idx = 0
+    sidebar.sync_ui()
+
+    assert sidebar.edit_btn.isEnabled() is False
+
+
 def test_trichrome_edit_opens_the_triplet_dialog(trichrome):
     sidebar, controller = trichrome
     controller.state.uploaded_files = [{"path": "/tmp/r.cr2", "hash": "h1"}]
+    controller.state.selected_file_idx = 0
     sidebar.sync_ui()
 
     with patch("negpy.desktop.view.sidebar.trichrome.open_triplet_dialog") as opener:
         sidebar.edit_btn.click()
 
-    opener.assert_called_once_with(sidebar, controller.session)
+    opener.assert_called_once_with(sidebar, controller)
+
+
+def test_trichrome_split_needs_an_open_triplet(trichrome):
+    sidebar, controller = trichrome
+    controller.state.uploaded_files = [{"path": "/tmp/r.cr2", "hash": "h1"}]
+    controller.state.selected_file_idx = 0
+    sidebar.sync_ui()
+    assert sidebar.split_btn.isEnabled() is False
+
+    controller.state.uploaded_files = [{"path": "/tmp/r.cr2", "hash": "h1", "green_path": "/tmp/g.cr2", "blue_path": "/tmp/b.cr2"}]
+    sidebar.sync_ui()
+    assert sidebar.split_btn.isEnabled() is True
+    assert sidebar.merge_btn.isEnabled() is False
+
+    sidebar.split_btn.click()
+    controller.request_split_triplet.assert_called_once()
+
+
+def test_trichrome_merge_needs_three_selected_single_frames(trichrome):
+    sidebar, controller = trichrome
+    controller.state.uploaded_files = [{"path": f"/tmp/{n}.cr2", "hash": n} for n in "abcd"]
+    controller.state.selected_indices = [0, 1]
+    sidebar.sync_ui()
+    assert sidebar.merge_btn.isEnabled() is False
+
+    controller.session.state_changed.connect.assert_any_call(sidebar._sync_buttons)
+    controller.state.selected_indices = [0, 1, 2]
+    sidebar._sync_buttons()
+    assert sidebar.merge_btn.isEnabled() is True
+
+    sidebar.merge_btn.click()
+    controller.request_trichrome_merge.assert_called_once()
 
 
 def test_half_frame_toggle_on_auto_detects_without_opening_a_dialog(half_frame):
@@ -227,18 +270,29 @@ def test_half_frame_follows_the_active_rolls_state_without_retoggling(half_frame
     controller.set_half_frame_mode.assert_not_called()
 
 
-def test_half_frame_card_is_dead_without_one_roll(half_frame):
-    """A batch with no single active roll (a library-wide search's mixed results) has no
-    roll-wide toggle to apply -- nothing in it splits."""
+def test_half_frame_card_is_live_for_loose_frames_with_no_roll(half_frame, monkeypatch):
+    """With no roll open, frames in no roll take this session's Half Frame."""
     sidebar, controller = half_frame
     controller.state.active_roll_id = None
+    monkeypatch.setattr("negpy.desktop.view.sidebar.half_frame.rolls.rolls_containing_path", lambda repo, path: [])
 
     sidebar.sync_ui()
 
-    assert sidebar.enable_btn.isEnabled() is False
-    assert sidebar.adjust_btn.isEnabled() is False
-    assert sidebar.auto_btn.isEnabled() is False
-    assert "roll-wide setting" in sidebar.hint.text()
+    assert sidebar.enable_btn.isEnabled() and sidebar.adjust_btn.isEnabled() and sidebar.auto_btn.isEnabled()
+    assert sidebar.hint.text() == "" and sidebar.hint.isHidden()
+
+
+def test_half_frame_card_grays_when_a_loaded_frame_follows_its_roll(half_frame, monkeypatch):
+    """A search result from a roll splits by that roll's toggle, which this one cannot change."""
+    sidebar, controller = half_frame
+    controller.state.active_roll_id = None
+    monkeypatch.setattr("negpy.desktop.view.sidebar.half_frame.rolls.rolls_containing_path", lambda repo, path: ["r2"])
+
+    sidebar.sync_ui()
+
+    assert not sidebar.enable_btn.isEnabled() and not sidebar.adjust_btn.isEnabled() and not sidebar.auto_btn.isEnabled()
+    assert sidebar.hint.text() == "Each of these frames follows its own roll's Half Frame. Open the roll to change it."
+    assert not sidebar.hint.isHidden()
 
 
 def test_half_frame_card_is_live_with_an_active_roll(half_frame):
@@ -248,7 +302,7 @@ def test_half_frame_card_is_live_with_an_active_roll(half_frame):
 
     assert sidebar.enable_btn.isEnabled() is True
     assert sidebar.adjust_btn.isEnabled() is True
-    assert sidebar.hint.text() == ""
+    assert sidebar.hint.text() == "" and sidebar.hint.isHidden()
 
 
 def test_unsplit_is_enabled_only_for_a_diptych(half_frame):
@@ -296,3 +350,17 @@ def test_adjust_does_nothing_without_a_frame(half_frame):
     sidebar._on_adjust()
 
     controller.open_half_frame_dialog.assert_not_called()
+
+
+def test_half_frame_graying_follows_a_roll_made_over_the_loaded_files(half_frame, monkeypatch):
+    sidebar, controller = half_frame
+    controller.state.active_roll_id = None
+    store: dict = {}
+    monkeypatch.setattr("negpy.desktop.view.sidebar.half_frame.rolls.saved_rolls", lambda repo: dict(store))
+    monkeypatch.setattr("negpy.desktop.view.sidebar.half_frame.rolls.rolls_containing_path", lambda repo, path: list(store))
+    sidebar.sync_ui()
+    assert sidebar.enable_btn.isEnabled()
+
+    store["r9"] = {"kind": "folder", "folder_path": "/tmp"}
+    sidebar.sync_ui()
+    assert not sidebar.enable_btn.isEnabled()

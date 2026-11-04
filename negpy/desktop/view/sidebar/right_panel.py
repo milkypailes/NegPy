@@ -22,9 +22,10 @@ from negpy.desktop.view.sidebar.history import HistoryPanel
 from negpy.desktop.view.sidebar.library_tree import LibraryTree
 from negpy.desktop.view.sidebar.metadata import MetadataSidebar
 from negpy.desktop.view.styles.color_vision import palette_for
-from negpy.desktop.view.styles.templates import clipping_sweep, gradient_icon, tool_toggle
+from negpy.desktop.view.styles.templates import ICON_BUTTON_WIDTH, clipping_sweep, gradient_icon, icon_button, tool_toggle
 from negpy.desktop.view.styles.theme import THEME
 from negpy.desktop.view.widgets.segmented_choice import SegmentedChoice
+from negpy.desktop.view.widgets.sliders import align_slider_columns
 from negpy.desktop.view.widgets.charts import (
     ChartWell,
     PhotometricCurveWidget,
@@ -38,19 +39,22 @@ from negpy.desktop.view.widgets.fold import Fold, group_fold
 from negpy.desktop.view.widgets.gear_library_panel import GearLibraryPanel
 from negpy.desktop.view.widgets.granular_settings_dialog import open_apply_dialog
 from negpy.desktop.view.widgets.tab_header import TabHeader
-from negpy.desktop.settings_catalog import rows_for_fields
+from negpy.desktop.settings_catalog import roll_card_rows
 from negpy.features.process.models import ProcessMode
-from negpy.services.assets.rolls import card_fields
 from negpy.desktop.view.widgets.stats import NegativeStatsWidget, ZonePlacementRows
 from negpy.desktop.view.widgets.overflow_bar import OverflowBar
 from negpy.desktop.view.widgets.panel_tab import PanelTab
 
+_FILM_BASE_TIP = tr(
+    "Film Base: click the clear film between frames to set the base these readouts measure from, for the open roll or this frame."
+)
 _SCAN_BASE_TIP = tr("Base Relative: line up each channel at its film base, so the channels compare at one height.")
 
 # The Roll tab's cards that own settings, for its header's Apply picker.
 _ROLL_TAB_CARDS = (
     "film",
     "sensor",
+    "fade",
     "baseline",
     "process",
     "demosaic",
@@ -314,7 +318,12 @@ class RightPanel(QWidget):
         analysis_layout.addLayout(chart_row)
         analysis_layout.addWidget(ChartWell(self.chart_stack, self.step_wedge, self.zone_strip), 1)
         analysis_layout.addWidget(self.zone_placement, 0)
-        readouts_header, self.readouts_fold = group_fold("analysis_readouts", tr("Readouts"), self.stats_widget)
+        self.film_base_btn = tool_toggle("fa5s.crosshairs", "", _FILM_BASE_TIP)
+        self.film_base_btn.setFixedWidth(ICON_BUTTON_WIDTH)
+        self.clear_film_base_btn = icon_button("fa5s.times", tr("Clear Film Base: forget the film base this frame uses."))
+        readouts_header, self.readouts_fold = group_fold(
+            "analysis_readouts", tr("Readouts"), self.stats_widget, buttons=(self.clear_film_base_btn, self.film_base_btn)
+        )
         self.stats_widget.warning_changed.connect(self.readouts_fold.set_warning)
         analysis_layout.addLayout(readouts_header)
         analysis_layout.addWidget(self.readouts_fold, 0)
@@ -376,6 +385,8 @@ class RightPanel(QWidget):
             btn.clicked.connect(lambda _checked=False, idx=i: self._switch_tab(idx))
             self.switcher.add_button(btn, tooltip)
 
+            # One label column across the tab's cards, so every slider track starts at the same x.
+            align_slider_columns(content)
             self.stack.addWidget(wrap_scroll(content))
             self._tab_buttons.append(btn)
             self._tab_keys.append(key)
@@ -450,8 +461,7 @@ class RightPanel(QWidget):
         """Every Roll card's settings in one picker. The cards themselves stay roll
         defaults; this carries their current values onto other frames, the same as the
         Film Strip's own apply with a narrower list."""
-        fields = tuple(f for card in _ROLL_TAB_CARDS for f in card_fields(card))
-        open_apply_dialog(self, self.controller.session, rows=rows_for_fields(fields))
+        open_apply_dialog(self, self.controller.session, rows=roll_card_rows(*_ROLL_TAB_CARDS))
 
     def _build_scan_page(self) -> QWidget:
         """Scanner choice and cards in a scroll area; the active scanner's footer stays pinned below."""
@@ -758,6 +768,29 @@ class RightPanel(QWidget):
         self._sync_debounce.timeout.connect(self.metadata_sidebar.sync_ui)
         self.controller.config_updated.connect(self._sync_debounce.start)
 
+        from negpy.desktop.session import ToolMode
+
+        self.film_base_btn.toggled.connect(lambda on: self.controller.set_active_tool(ToolMode.FILM_BASE if on else ToolMode.NONE))
+        self.clear_film_base_btn.clicked.connect(self.controller.clear_film_base)
+        self.controller.config_updated.connect(self._sync_film_base)
+        self.controller.tool_sync_requested.connect(self._sync_film_base)
+        self._sync_film_base()
+
+    def _sync_film_base(self) -> None:
+        """Film Base sits on the Readouts header: armed state, the dot and × for a picked base, and none on a slide."""
+        from negpy.desktop.session import ToolMode
+        from negpy.features.process.path import RenderPath, render_path
+
+        state = self.controller.state
+        negative = render_path(state.config.process) is RenderPath.PRINT
+        has_base = negative and self.controller.clearable_film_base()
+        self.film_base_btn.blockSignals(True)
+        self.film_base_btn.setChecked(state.active_tool == ToolMode.FILM_BASE)
+        self.film_base_btn.blockSignals(False)
+        self.film_base_btn.setVisible(negative)
+        self.film_base_btn.edited_dot.set_active(has_base)
+        self.clear_film_base_btn.setVisible(has_base)
+
     def _sync_tab_edited(self) -> None:
         """Mark control-group tabs whose sections have edits (corner dot, like edited sliders)."""
         for i, attrs in self._tab_sections.items():
@@ -913,10 +946,13 @@ class RightPanel(QWidget):
         """The scan parade's per-channel stretch ends (0..1 up the panel) and its caption, which
         names the unmix when the parade reads unmixed density."""
         from negpy.features.exposure.analysis import scan_density_axis
-        from negpy.features.exposure.normalization import effective_crosstalk_matrix
+        from negpy.features.exposure.normalization import crosstalk_unmix_active
+        from negpy.features.process.fade import fade_matrix
 
         config = self.controller.state.config
-        unmixed = effective_crosstalk_matrix(config.process, config.process.process_mode) is not None
+        mode = config.process.process_mode
+        unmixed = crosstalk_unmix_active(config.process, mode)
+        restored = not unmixed and fade_matrix(config.process) is not None
         caption = tr("Scan density")
         if self.scan_base_btn.isChecked():
             if self._scan_base_density is None:
@@ -925,6 +961,8 @@ class RightPanel(QWidget):
                 caption = tr("Scan density above film base") if self._scan_base_source == "picked" else tr("Scan density above rebate base")
         if unmixed:
             caption = tr("{caption}, unmixed", caption=caption)
+        elif restored:
+            caption = tr("{caption}, restored", caption=caption)
         bounds = self._scan_bounds
         if bounds is None:
             return None, caption
