@@ -168,7 +168,7 @@ def test_rehome_triplets_repoints_keys_and_members(tmp_path):
     rehome_triplets(repo, old, new)
 
     assert saved_triplets(repo) == {
-        os.path.join(new, "r.tif"): [os.path.join(new, "g.tif"), os.path.join(new, "b.tif"), True, ["hr", "hg", "hb"]]
+        os.path.join(new, "r.tif"): [os.path.join(new, "g.tif"), os.path.join(new, "b.tif"), True, ["hr", "hg", "hb"], False]
     }
 
 

@@ -3,6 +3,7 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, Optional
 
 from negpy.domain.migrations import CROSSTALK_PROFILE_RENAMES
+from negpy.kernel.system.i18n import mark
 from negpy.features.exposure.models import EXPOSURE_CONSTANTS, ExposureConfig
 
 if TYPE_CHECKING:
@@ -104,6 +105,26 @@ def mode_aware_exposure_reset(mode: str, base: ExposureConfig) -> ExposureConfig
     )
 
 
+class SourceEncoding(StrEnum):
+    """How a Positive TIFF's samples encode light. AUTO reads the file: its profile, else linear above 8 bits and sRGB at 8 bits. LINEAR and GAMMA_22 override it."""
+
+    AUTO = "auto"
+    LINEAR = "linear"
+    GAMMA_22 = "gamma22"
+
+    @classmethod
+    def _missing_(cls, value: object) -> "SourceEncoding":
+        return cls.AUTO
+
+
+# Lookup keys: display them through tr.
+SOURCE_ENCODING_LABELS = {
+    SourceEncoding.AUTO: mark("Auto"),
+    SourceEncoding.LINEAR: mark("Linear"),
+    SourceEncoding.GAMMA_22: mark("2.2"),
+}
+
+
 # Built-in fallback crosstalk matrix (row-major 3x3) used when no profile is baked.
 DEFAULT_CROSSTALK_MATRIX = (1.0, -0.05, -0.02, -0.04, 1.0, -0.08, -0.01, -0.1, 1.0)
 
@@ -121,10 +142,10 @@ class ProcessConfig:
     linear_raw: bool = False
     # The source is a finished positive (a scanned print, an export from other software, a
     # scanner's own positive) rather than a raw capture. Slide only, held in __post_init__.
-    # It decodes on its embedded profile, sRGB when untagged, instead of as literal linear
-    # data, and skips metering, negative inversion, the baseline lift and the filmic curve.
-    # See effective_linear_raw and path.render_path.
+    # A TIFF decodes by source_encoding; it skips metering, negative inversion, the
+    # baseline lift and the filmic curve. See path.render_path and path.positive_decode.
     positive_source: bool = False
+    source_encoding: SourceEncoding = SourceEncoding.AUTO
     # See loaders/helpers.get_best_demosaic_algorithm for what AUTO resolves to on each path.
     demosaic_preview: DemosaicMode = DemosaicMode.AUTO
     demosaic_export: DemosaicMode = DemosaicMode.AUTO
@@ -143,6 +164,17 @@ class ProcessConfig:
     # an auto crop.
     meter_rect: Optional[tuple] = None
     meter_key: str = ""
+    # The clear film base picked on this frame with no roll open, as per-channel raw log10
+    # transmittance; a roll's picked base (rolls.roll_film_base) wins inside that roll. Only the
+    # preview's base readouts use it.
+    film_base: Optional[tuple] = None
+    # Manual Pick Points: per-channel log10 in the bounds (unmixed) space. Dmin replaces the
+    # analyzed thin end (ceils), Dmax the dense end (floors). None keeps that end auto.
+    manual_dmin: Optional[tuple] = None
+    manual_dmax: Optional[tuple] = None
+    # Where each end was picked, content-normalized in the uncropped pick-tool view; only the canvas marks read it.
+    manual_dmin_at: Optional[tuple] = None
+    manual_dmax_at: Optional[tuple] = None
     # Two normalization clip axes: luma sets the black/white-point span, color sets
     # the per-channel balance clip (orange-mask cast removal).
     luma_range_clip: float = 0.0
@@ -183,6 +215,20 @@ class ProcessConfig:
     # E-6, so a mismatch resolves to identity instead of mixing in the wrong matrix.
     crosstalk_process: str = ProcessMode.C41
 
+    # Fade restoration of faded transparencies, composed with the crosstalk unmix
+    # (`fade.unmix_with_fade`). The ratios describe one slide: green and
+    # blue relative to red, and red's own survival. All three at 1.0 is the identity.
+    fade_ratio_r: float = 1.0
+    fade_ratio_g: float = 1.0
+    fade_ratio_b: float = 1.0
+    # Remove Stain (White Anchor): restore density above each channel's own white, (D - w) / a, for a slide whose
+    # clear areas carry a per-channel stain. The whites are log transmittance (<= 0) of the
+    # brightest cells, measured by the Estimate and never per render.
+    fade_white_anchor: bool = False
+    fade_white_r: float = 0.0
+    fade_white_g: float = 0.0
+    fade_white_b: float = 0.0
+
     # Sensor (CFA) crosstalk unmix on the LINEAR capture, before inversion. A
     # per-setup property calibrated from three bare-light R/G/B exposures
     # (features/process/sensor.py). 9 floats row-major; None = off.
@@ -207,6 +253,7 @@ class ProcessConfig:
         # Not a MIGRATIONS entry: the old mode names also reach us from sticky settings
         # and asset dicts, not only a loaded flat config, so this runs on every build.
         object.__setattr__(self, "process_mode", ProcessMode(self.process_mode))
+        object.__setattr__(self, "source_encoding", SourceEncoding(self.source_encoding))
         object.__setattr__(self, "sensor_unmix", SensorUnmix(self.sensor_unmix))
         # Same reach for renamed crosstalk profiles: roll defaults overlay this field
         # raw through dataclasses.replace, so the rename must run on every build too.
@@ -230,6 +277,11 @@ class ProcessConfig:
             object.__setattr__(self, "analysis_rect", tuple(self.analysis_rect))
         if self.meter_rect is not None:
             object.__setattr__(self, "meter_rect", tuple(self.meter_rect))
+        if self.film_base is not None:
+            object.__setattr__(self, "film_base", tuple(float(v) for v in self.film_base))
+        for name in ("manual_dmin", "manual_dmax", "manual_dmin_at", "manual_dmax_at"):
+            if getattr(self, name) is not None:
+                object.__setattr__(self, name, tuple(float(v) for v in getattr(self, name)))
 
     @property
     def is_local_initialized(self) -> bool:
@@ -293,13 +345,24 @@ def with_positive_source(config: "WorkspaceConfig", checked: bool) -> "Workspace
 
 
 def with_film_fields(config: "WorkspaceConfig", fields: dict) -> "WorkspaceConfig":
-    """*config* with the Film card's fields in *fields* applied through with_process_mode and
-    with_positive_source, popping them from *fields* so the caller overlays only the rest."""
+    """*config* with the Film card's fields in *fields* applied through with_process_mode,
+    with_positive_source and with_source_encoding, popping them from *fields* so the caller
+    overlays only the rest."""
     if "process_mode" in fields:
         config = with_process_mode(config, fields.pop("process_mode"))
     if "positive_source" in fields:
         config = with_positive_source(config, fields.pop("positive_source"))
+    if "source_encoding" in fields:
+        config = with_source_encoding(config, fields.pop("source_encoding"))
     return config
+
+
+def with_source_encoding(config: "WorkspaceConfig", encoding: str) -> "WorkspaceConfig":
+    """*config* decoding by *encoding*; the local bounds were measured on the old decode."""
+    proc = config.process
+    if proc.source_encoding == SourceEncoding(encoding):
+        return config
+    return replace(config, process=replace(proc, source_encoding=SourceEncoding(encoding), **invalidate_local_bounds(proc)))
 
 
 # The print stocks the scanning-setup wizard picks between; a frame on any other stock keeps it.

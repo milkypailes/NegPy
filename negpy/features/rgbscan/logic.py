@@ -259,6 +259,24 @@ def group_triplets(
     return triplets
 
 
+def place_triplet(probes: Dict[str, Optional[FrameProbe]], min_affinity: float = MIN_TRIPLET_AFFINITY) -> Tuple[Optional[Triplet], str]:
+    """Assign three hand-picked files to red, green and blue by their dominant channel.
+
+    Returns the triplet and "", or None and why: "channels" when the three are not one of each
+    (a file that could not be probed counts as unknown), "picture" when they do not show one frame.
+    """
+    if len(probes) != 3 or any(pr is None for pr in probes.values()):
+        return None, "channels"
+    by_channel = {classify_channel(pr.means): path for path, pr in probes.items() if pr is not None}
+    if set(by_channel) != {RED, GREEN, BLUE}:
+        return None, "channels"
+    triplet = Triplet(red=by_channel[RED], green=by_channel[GREEN], blue=by_channel[BLUE], ok=True)
+    score = triplet_affinity(triplet, {path: pr.signature for path, pr in probes.items() if pr is not None})
+    if score is not None and score < min_affinity:
+        return None, "picture"
+    return triplet, ""
+
+
 def estimate_shift(ref_gray: np.ndarray, mov_gray: np.ndarray) -> Tuple[float, float]:
     """Sub-pixel translation of ``mov_gray`` relative to ``ref_gray`` (phase correlation)."""
     h, w = ref_gray.shape[:2]
@@ -289,15 +307,16 @@ def _align_to(ref_gray: np.ndarray, mov: np.ndarray, mov_ch: int, max_shift: flo
 def assemble_rgb(r: np.ndarray, g: np.ndarray, b: np.ndarray, align: bool = True) -> np.ndarray:
     """Assemble one HxWx3 image: red channel from the red shot, green from green, blue from blue.
 
-    With ``align``, green/blue are registered to the red exposure first (sub-pixel
-    translation) to remove fringing from frame-to-frame drift during capture.
+    With ``align``, red and blue are registered to the green exposure first (sub-pixel
+    translation) to remove fringing from frame-to-frame drift during capture. Green is the
+    reference because resampling softens a channel and green carries the most detail.
     """
     if not (r.shape == g.shape == b.shape):
         raise ValueError(f"RGB-scan exposures differ in shape: {r.shape}, {g.shape}, {b.shape}")
     if align:
-        ref = negpy_core.extract_channel(np.ascontiguousarray(r, dtype=np.float32), RED)
+        ref = negpy_core.extract_channel(np.ascontiguousarray(g, dtype=np.float32), GREEN)
         max_shift = max(16.0, 0.02 * r.shape[1])
-        g = _align_to(ref, g, GREEN, max_shift)
+        r = _align_to(ref, r, RED, max_shift)
         b = _align_to(ref, b, BLUE, max_shift)
     return negpy_core.pick_channels(*(np.ascontiguousarray(x, dtype=r.dtype) for x in (r, g, b)))
 

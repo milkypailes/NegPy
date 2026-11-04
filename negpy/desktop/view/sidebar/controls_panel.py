@@ -10,7 +10,7 @@ from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from negpy.desktop.controller import AppController
 from negpy.desktop.view.shortcut_registry import label_with_shortcut, tooltip_with_shortcut
 from negpy.desktop.view.styles.color_vision import palette_for
-from negpy.desktop.view.styles.templates import gradient_icon, header_row, hint_label, section_subheader, set_hint_kind, wrap_tooltip
+from negpy.desktop.view.styles.templates import gradient_icon, header_actions, hint_label, section_subheader, set_hint_kind, wrap_tooltip
 from negpy.desktop.view.widgets.collapsible import NO_ROLL_SCOPE_HINT, CollapsibleSection, make_section
 from negpy.desktop.view.widgets.charts import MiniCurveWidget, MiniHistogramWidget, MiniRGBHistogramWidget
 from negpy.desktop.view.styles.theme import THEME
@@ -31,6 +31,7 @@ from negpy.desktop.settings_catalog import (
     PAPER_FIELDS,
     TONE_FIELDS,
     frame_card_rows,
+    roll_card_rows,
 )
 from negpy.desktop.view.widgets.granular_settings_dialog import open_apply_dialog
 from negpy.desktop.view.widgets.tab_header import TabHeader
@@ -74,6 +75,13 @@ _SENSOR_FIELDS = (
     "crosstalk_strength",
     "crosstalk_matrix",
     "crosstalk_process",
+    "fade_ratio_r",
+    "fade_ratio_g",
+    "fade_ratio_b",
+    "fade_white_anchor",
+    "fade_white_r",
+    "fade_white_g",
+    "fade_white_b",
     "hue_trim",
 )
 # ProcessConfig is split across five cards. Each tuple is both the card's reset scope and
@@ -88,6 +96,10 @@ _FILM_FIELDS = (
 _METERING_FIELDS = (
     "analysis_buffer",
     "analysis_rect",
+    "manual_dmin",
+    "manual_dmax",
+    "manual_dmin_at",
+    "manual_dmax_at",
     "lock_bounds",
     "luma_range_clip",
     "color_range_clip",
@@ -124,6 +136,7 @@ _AUTO_METER_FIELDS = ("auto_exposure", "auto_normalize_contrast")
 # Roll-tab sections that drive more than one roll card, keyed by section key.
 _SECTION_CARDS: dict[str, tuple[str, ...]] = {
     "optics": ("lens", "flatfield"),
+    "sensor": ("sensor", "fade"),
 }
 
 
@@ -192,7 +205,9 @@ class ControlsPanel(QWidget):
         optics_layout.addWidget(section_subheader(tr("LENS CORRECTION")))
         optics_layout.addWidget(self.lens_sidebar)
         optics_layout.addLayout(
-            header_row(section_subheader(tr("FLAT FIELD CORRECTION")), self.flatfield_sidebar.add_btn, self.flatfield_sidebar.delete_btn)
+            header_actions(
+                section_subheader(tr("FLAT FIELD CORRECTION")), self.flatfield_sidebar.add_btn, self.flatfield_sidebar.delete_btn
+            )
         )
         optics_layout.addWidget(self.flatfield_sidebar)
         self.optics_section = self._make_section(
@@ -430,6 +445,8 @@ class ControlsPanel(QWidget):
                         self.geometry_sidebar.auto_skew_btn,
                         qta.icon("fa5s.ruler-combined", color=THEME.text_hint, color_disabled=THEME.text_muted),
                     )
+                elif key == "color":
+                    self.auto_masking_mirror_btn = header.add_mirror(self.lab_sidebar.auto_masking_btn)
                 elif key == "finish":
                     self.optical_removal_mirror_btn = header.add_mirror(self.retouch_sidebar.auto_dust_btn)
                     self.ir_removal_mirror_btn = header.add_mirror(self.retouch_sidebar.ir_dust_btn)
@@ -471,6 +488,7 @@ class ControlsPanel(QWidget):
         self.auto_mirror_btn = header.add_lead_toggle(icon, auto.plain_tooltip)
         self.auto_mirror_btn.setMenu(auto.choice_menu)
         self.auto_mirror_btn.setChecked(auto.isChecked())
+        auto.mirror_right_click(self.auto_mirror_btn)
         auto.toggled.connect(self.auto_mirror_btn.setChecked)
 
     @staticmethod
@@ -566,15 +584,18 @@ class ControlsPanel(QWidget):
     def _show_card_menu(self, key: str, section: CollapsibleSection, pos) -> None:
         menu = QMenu(self)
         menu.setToolTipsVisible(True)
-        if key in dict(self._roll_sections()):
+        cards = _SECTION_CARDS.get(key, (key,))
+        roll_card = key in dict(self._roll_sections())
+        rows = roll_card_rows(*cards) if roll_card else frame_card_rows(key)
+        copy = menu.addAction(tr("Copy Card Settings"))
+        copy.setToolTip(tr("Copy this card alone; Paste then offers only its settings"))
+        copy.setEnabled(bool(rows))
+        copy.triggered.connect(lambda: self.controller.session.copy_card_settings(rows))
+        if roll_card:
             undo = menu.addAction(label_with_shortcut(tr("Undo Apply to Roll"), "undo_roll_push"))
             undo.setToolTip(tr("Give the roll back the values it had before the last Roll push from this frame"))
-            undo.setEnabled(self.controller.can_undo_roll_push(_SECTION_CARDS.get(key, (key,))))
+            undo.setEnabled(self.controller.can_undo_roll_push(cards))
             undo.triggered.connect(self.controller.undo_roll_push)
-        else:
-            copy = menu.addAction(tr("Copy Card Settings"))
-            copy.setToolTip(tr("Copy this card alone; Paste then offers only its settings"))
-            copy.triggered.connect(lambda: self.controller.session.copy_card_settings(frame_card_rows(key)))
         menu.exec(section.toggle_button.mapToGlobal(pos))
 
     def apply_shortcut_tooltips(self) -> None:
@@ -591,6 +612,8 @@ class ControlsPanel(QWidget):
             (self.optical_removal_mirror_btn, "toggle_optical_removal"),
             (self.ir_removal_mirror_btn, "toggle_ir_removal"),
             (self.auto_crop_mirror_btn, "auto_crop"),
+            (self.lab_sidebar.auto_masking_btn, "toggle_auto_masking"),
+            (self.auto_masking_mirror_btn, "toggle_auto_masking"),
             (self.flatfield_sidebar.enable_btn, "toggle_flat_field"),
             (self.flatfield_sidebar.check_btn, "toggle_flatfield_peek"),
             (self.autocrop_sidebar.auto_frame_btn, "auto_crop"),
@@ -602,6 +625,9 @@ class ControlsPanel(QWidget):
             (self.tone_sidebar.hold_black_action, "toggle_hold_black"),
             (self.presets_sidebar.apply_btn, "preset_apply"),
             (self.presets_sidebar.save_btn, "preset_save"),
+            (self.trichrome_sidebar.merge_btn, "triplet_merge"),
+            (self.trichrome_sidebar.split_btn, "triplet_split"),
+            (self.trichrome_sidebar.edit_btn, "triplet_edit"),
         ):
             btn.setToolTip(wrap_tooltip(tooltip_with_shortcut(btn.plain_tooltip, action_id)))
         exp = self.tone_sidebar
@@ -781,6 +807,12 @@ class ControlsPanel(QWidget):
                 "cast_average_toggle",
             )
         )
+        self.sensor_sidebar.fade_white_anchor_btn.setToolTip(
+            tooltip_with_shortcut(
+                tr("Remove Stain: makes the clear areas white again, for a faded slide whose highlights turned yellow."),
+                "fade_white_anchor_toggle",
+            )
+        )
         proc.analysis_buffer_slider.setToolTip(
             tooltip_with_shortcut(
                 tr("Ignores a border around the frame when measuring, so film edges and holders do not count."),
@@ -876,7 +908,7 @@ class ControlsPanel(QWidget):
         lab.sharpen_masking_slider.setToolTip(tr("Sharpens only edges, so sky, skin and grain stay smooth."))
         lab.glow_slider.setToolTip(
             tooltip_with_shortcut(
-                tr("A soft glow around bright areas, like an old lens."),
+                tr("A soft glow around bright areas, like the soft focus of a minilab scanner."),
                 ["glow_inc", "glow_dec"],
             )
         )
@@ -1080,7 +1112,7 @@ class ControlsPanel(QWidget):
 
         Frames that are not one roll (a library search's results, several folders at once)
         read Frame with Roll disabled: every value there is the frame's own, since no roll
-        spans them to hold a shared one. Save as Roll gives them one."""
+        spans them to hold a shared one. Saving them as a roll gives them one."""
         has_roll = self.controller.state.active_roll_id is not None
         overridden = []
         locked_cards = self.controller.locked_roll_cards()
@@ -1305,7 +1337,7 @@ class ControlsPanel(QWidget):
 
         proc = cfg.process
         film_count = sum(getattr(proc, f) != getattr(_proc, f) for f in _FILM_FIELDS)
-        process_count = sum(getattr(proc, f) != getattr(_proc, f) for f in _METERING_FIELDS)
+        process_count = sum(getattr(proc, f) != getattr(_proc, f) for f in _METERING_FIELDS if not f.endswith("_at"))
         demosaic_count = sum(getattr(proc, f) != getattr(_proc, f) for f in _DEMOSAIC_FIELDS)
         sensor_count = sum(getattr(proc, f) != getattr(_proc, f) for f in _SENSOR_FIELDS)
 

@@ -74,7 +74,7 @@ DROPPED_KEYS: frozenset[str] = frozenset(
         # Optical-removal exclusions became strokes (dust_exclusion_strokes); the loose
         # patch list they replaced cannot be unpacked as one.
         "dust_exclusions",
-        # The Contrast Mask's blur scale (spacer), fixed since the mask became the tone mask.
+        # The Contrast Mask's blur scale (spacer); the tone mask's blur is fixed.
         "mask_blur",
         "mask_spacer",
         # Slide Normalize (a metered stretch through the print curve) was retired: every slide
@@ -84,6 +84,8 @@ DROPPED_KEYS: frozenset[str] = frozenset(
         "sync_to_batch",
         # Narrowband and its bundled input profile became the Pakon print stock (migrate_flat_config).
         "narrowband_scan",
+        # Export sharpening: a resized export runs the Lab Sharpening at its final size instead.
+        "output_sharpen",
         # The pixel-grid contact sheet; the darkroom sheet keeps its settings app-wide, not per edit.
         "contact_sheet_cell_px",
         "contact_sheet_gap",

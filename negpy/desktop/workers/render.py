@@ -32,6 +32,7 @@ from negpy.features.geometry.batch_autocrop import CropEvidence, detect_crop_can
 from negpy.features.process.capture_color import wb_only_cam_xyz
 from negpy.features.process.sensor import apply_sensor_correction, effective_sensor_matrix
 from negpy.features.process.logic import effective_highlight_reconstruction, effective_linear_raw, highlight_reconstruction_bakes_wb
+from negpy.features.process.path import positive_decode
 from negpy.features.process.models import DemosaicMode
 from negpy.infrastructure.loaders.factory import loader_factory
 from negpy.infrastructure.loaders.helpers import unsupported_raw_reason
@@ -218,12 +219,14 @@ class NormalizationTask:
     frames: list[NormalizationInput]
     workspace_color_space: str
     # Roll-wide overrides taken from the current image, applied to every file's analysis
-    # before averaging, so the whole roll shares one buffer and luma bounds.
-    override_analysis_buffer: float
-    override_luma_range_clip: float
-    override_color_range_clip: float
+    # before averaging, so the whole roll shares one buffer and luma bounds. None reads each frame's own.
+    override_analysis_buffer: Optional[float]
+    override_luma_range_clip: Optional[float]
+    override_color_range_clip: Optional[float]
     # Detect Scenes: the same per-frame pass, grouped by light instead of pooled into a baseline.
     detect: bool = False
+    # One frame at a time on the background core pool, so the live preview keeps the CPU.
+    background: bool = False
 
 
 @dataclass(frozen=True)
@@ -288,6 +291,9 @@ class AssetDiscoveryTask:
     rgb_scan: bool = False  # Group discovered files into R/G/B triplets (one asset per frame).
     restore_triplets: dict | None = None  # {red_path: [green, blue, align, hashes?]}
     half_frame: bool = False  # Split each file into two half-frame assets.
+    # Without a roll the choice is per request path (a file, or a folder for every file in it),
+    # in os.path.normcase(os.path.normpath()) form; half_frame=True splits every file instead.
+    half_frame_paths: frozenset = frozenset()
     restore_stitches: dict | None = None  # {primary_path: {paths, transforms, canvas, sizes, hash}} (session restore).
     restore_hdr: dict | None = None  # {reference_path: {paths, ratios, align, hash}} (session restore).
     half_frame_profile: dict | None = None  # {crop_rect, split_x, gutter_thickness, split_axis} override
@@ -310,7 +316,7 @@ class PreviewLoadTask:
     workspace_color_space: str
     use_camera_wb: bool
     generation: int = 0
-    positive_source: bool = False
+    positive_decode: str = ""
     highlight_mode: int = 0
     bake_camera_wb: bool = False
     full_resolution: bool = False
@@ -779,7 +785,7 @@ def rgb_grouping_notice(made: int, loose: int, incomplete: int, mismatched: int,
     made_text = f"{count_of(made, 'frame')} assembled, " if made else ""
     return (
         f"Trichrome Mode: {made_text}{count_of(loose, 'file')} left separate{detail}{order}. "
-        "Right-click a frame and choose Edit RGB Triplet to pair them by hand."
+        "Select a frame's three files, right-click and choose Merge Exposures (Trichrome) to join them."
     )
 
 
@@ -816,7 +822,7 @@ def rgb_nothing_matched_message(summary: dict) -> tuple[str, str]:
         "Each frame needs three captures — one under red light, one under green, one under blue — "
         "taken back to back before you move on to the next frame, and the folder should hold "
         f"nothing else. {naming}\n\n"
-        "You can also pair files by hand: right-click a frame and choose Edit RGB Triplet.",
+        "You can also join files by hand: select a frame's three files, right-click and choose Merge Exposures (Trichrome).",
     )
 
 
@@ -893,7 +899,9 @@ class AssetDiscoveryWorker(QObject):
         from negpy.services.assets.migrations.hash import blank_ambiguous_legacy_hashes
 
         discovered_paths = []
+        split_paths = set()
         for path in task.paths:
+            split = task.half_frame or os.path.normcase(os.path.normpath(path)) in task.half_frame_paths
             try:
                 if os.path.isdir(path):
                     for f in os.listdir(path):
@@ -905,9 +913,13 @@ class AssetDiscoveryWorker(QObject):
                             and os.path.normcase(os.path.normpath(found)) not in task.skip_paths
                         ):
                             discovered_paths.append(found)
+                            if split:
+                                split_paths.add(found)
                 else:
                     if not is_hidden_path(path) and path.lower().endswith(task.supported_extensions):
                         discovered_paths.append(path)
+                        if split:
+                            split_paths.add(path)
             except Exception as e:
                 logger.error(f"Discovery error for {path}: {e}")
         # Half-frame re-discovery passes both halves' identical paths, so hash once.
@@ -944,8 +956,12 @@ class AssetDiscoveryWorker(QObject):
         if task.restore_hdr and valid_assets:
             valid_assets = self._attach_restored_hdr(valid_assets, task.restore_hdr)
 
-        if task.half_frame and valid_assets:
-            valid_assets = self._expand_half_frames(valid_assets, profile=task.half_frame_profile, overrides=task.half_frame_overrides)
+        if split_paths and valid_assets:
+            to_split = [a for a in valid_assets if a["path"] in split_paths]
+            halves: dict = {}
+            for half in self._expand_half_frames(to_split, profile=task.half_frame_profile, overrides=task.half_frame_overrides):
+                halves.setdefault(half["path"], []).append(half)
+            valid_assets = [h for a in valid_assets for h in (halves.get(a["path"]) or [a] if a["path"] in split_paths else [a])]
 
         self.finished.emit(valid_assets)
 
@@ -1027,6 +1043,7 @@ class AssetDiscoveryWorker(QObject):
         import os
 
         from negpy.kernel.image.logic import calculate_file_hash
+        from negpy.services.assets.triplets import made_by_hand
 
         hashes = {a["path"]: a["hash"] for a in assets}
         out = []
@@ -1052,6 +1069,7 @@ class AssetDiscoveryWorker(QObject):
                         "align": align,
                         "green_hash": hashes.get(gb[0], stored[1]),
                         "blue_hash": hashes.get(gb[1], stored[2]),
+                        "triplet_by_hand": made_by_hand(gb),
                     }
                 )
                 parts.update({gb[0], gb[1]})
@@ -1304,7 +1322,7 @@ class PreviewLoadWorker(QObject):
                     file_hash=task.file_hash,
                     half_slice=task.half_slice,
                     demosaic=task.demosaic,
-                    positive_source=task.positive_source,
+                    positive_decode=task.positive_decode,
                     integrated_gpu=task.integrated_gpu,
                     protected_file_hashes=task.protected_file_hashes,
                     should_cancel=lambda: not self._prefetch_is_current(task),
@@ -1322,7 +1340,7 @@ class PreviewLoadWorker(QObject):
                     use_camera_wb=task.use_camera_wb,
                     file_hash=task.file_hash,
                     demosaic=task.demosaic,
-                    positive_source=task.positive_source,
+                    positive_decode=task.positive_decode,
                     highlight_mode=task.highlight_mode,
                     bake_camera_wb=task.bake_camera_wb,
                     lens_corrections=task.lens_corrections,
@@ -1498,7 +1516,7 @@ class PreviewLoadWorker(QObject):
                     log_timings=True,
                     half_slice=task.half_slice,
                     demosaic=task.demosaic,
-                    positive_source=task.positive_source,
+                    positive_decode=task.positive_decode,
                     should_cancel=cancelled,
                     highlight_mode=task.highlight_mode,
                     bake_camera_wb=task.bake_camera_wb,
@@ -1520,7 +1538,7 @@ class PreviewLoadWorker(QObject):
                     log_timings=True,
                     half_slice=task.half_slice,
                     demosaic=task.demosaic,
-                    positive_source=task.positive_source,
+                    positive_decode=task.positive_decode,
                     should_cancel=cancelled,
                     highlight_mode=task.highlight_mode,
                     bake_camera_wb=task.bake_camera_wb,
@@ -1668,7 +1686,7 @@ def _decode_asset_preview_with_meta(
         raw, _, meta = preview_service.load_linear_preview(
             file_info["path"],
             workspace_color_space,
-            positive_source=config.process.positive_source,
+            positive_decode=positive_decode(config.process),
             highlight_mode=effective_highlight_reconstruction(config.process),
             bake_camera_wb=highlight_reconstruction_bakes_wb(config.process),
             lens_corrections=metadata_lens_corrections(config),
@@ -1935,7 +1953,7 @@ class ThumbnailRenderWorker(QObject):
             use_camera_wb=not effective_linear_raw(config.process),
             file_hash=base_hash(frame.file_info.get("hash")),
             demosaic=config.process.demosaic_preview,
-            positive_source=config.process.positive_source,
+            positive_decode=positive_decode(config.process),
             highlight_mode=effective_highlight_reconstruction(config.process),
             bake_camera_wb=highlight_reconstruction_bakes_wb(config.process),
             lens_corrections=metadata_lens_corrections(config),
@@ -2126,7 +2144,7 @@ class NormalizationWorker(QObject):
         from negpy.features.geometry.processor import GeometryProcessor
 
         total = len(task.frames)
-        limit = max(1, APP_CONFIG.max_workers // 2)
+        limit = 1 if task.background else max(1, APP_CONFIG.max_workers // 2)
         semaphore = asyncio.Semaphore(limit)
         lock = asyncio.Lock()
         completed = 0
@@ -2141,9 +2159,10 @@ class NormalizationWorker(QObject):
                     params = frame.config
                     # Roll-wide buffer and luma bounds from the current image, applied to every
                     # file, so one slider setting drives the whole batch baseline.
-                    analysis_buffer = task.override_analysis_buffer
-                    luma_range_clip = task.override_luma_range_clip
-                    color_range_clip = task.override_color_range_clip
+                    p = params.process
+                    analysis_buffer = p.analysis_buffer if task.override_analysis_buffer is None else task.override_analysis_buffer
+                    luma_range_clip = p.luma_range_clip if task.override_luma_range_clip is None else task.override_luma_range_clip
+                    color_range_clip = p.color_range_clip if task.override_color_range_clip is None else task.override_color_range_clip
                     process_mode = params.process.process_mode
                     geometry = params.geometry
 
@@ -2222,6 +2241,8 @@ class NormalizationWorker(QObject):
         try:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
+            if task.background:
+                loop.set_default_executor(ThreadPoolExecutor(1, initializer=negpy_core.set_background_thread, initargs=(True,)))
             batch_results = loop.run_until_complete(_run_batch())
             try:
                 loop.close()

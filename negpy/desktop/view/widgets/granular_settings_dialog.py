@@ -79,8 +79,8 @@ def build_scope_row(sel_count: int, roll_count: int, show_current: bool = False)
 class GranularSettingsDialog(QDialog):
     """Per-setting picker for paste / apply-to-many. Lists one collapsible section
     per edit area, each setting with a toggle and its value. Settings still at
-    their default are built but hidden until "Show unchanged settings" — they must
-    stay pickable so a roll can be reset back to a default value (#656). Reuses the
+    their default are built but hidden until "Show Defaults": they stay
+    pickable so a roll can be reset to a default value (#656). Reuses the
     shortcut-editor's CollapsibleSection look."""
 
     def __init__(
@@ -95,6 +95,7 @@ class GranularSettingsDialog(QDialog):
         roll_count: int = 0,
         ask_name: bool = False,
         exclude_sections: frozenset[str] = frozenset(),
+        exclude_rows: frozenset[str] = frozenset(),
         show_current: bool = False,
         show_apply_mode: bool = False,
         preselect_ids: frozenset[str] | None = None,
@@ -146,7 +147,7 @@ class GranularSettingsDialog(QDialog):
         if show_apply_mode:
             root.addLayout(self._build_mode_row())
         root.addLayout(self._build_checks_row())
-        root.addWidget(self._build_sections(source_cfg, bounds_mode, exclude_sections), 1)
+        root.addWidget(self._build_sections(source_cfg, bounds_mode, exclude_sections, exclude_rows), 1)
         root.addLayout(self._build_footer(ask_name))
 
         self._apply_visibility()
@@ -180,7 +181,7 @@ class GranularSettingsDialog(QDialog):
         check_none = labeled_action("", tr("All Off"), tr("Turn off every listed setting"))
         check_none.clicked.connect(lambda: self._set_all_checked(False))
         self._show_unchanged = labeled_toggle(
-            "fa5s.eye", tr("Show Unchanged"), False, tr("List settings still at their default, so they can be applied too")
+            "fa5s.eye", tr("Show Defaults"), False, tr("List settings still at their default, so they can be applied too")
         )
         self._show_unchanged.toggled.connect(self._apply_visibility)
         self._show_unchanged.setVisible(self._preselect_ids is None)
@@ -190,7 +191,9 @@ class GranularSettingsDialog(QDialog):
         row.addWidget(self._show_unchanged)
         return row
 
-    def _build_sections(self, source_cfg, bounds_mode: str, exclude_sections: frozenset[str] = frozenset()) -> QScrollArea:
+    def _build_sections(
+        self, source_cfg, bounds_mode: str, exclude_sections: frozenset[str] = frozenset(), exclude_rows: frozenset[str] = frozenset()
+    ) -> QScrollArea:
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QScrollArea.Shape.NoFrame)
@@ -201,7 +204,8 @@ class GranularSettingsDialog(QDialog):
 
         pick_mode = self._preselect_ids is not None
         for title, rows in catalog_sections(source_cfg):
-            if title in exclude_sections:
+            rows = [entry for entry in rows if entry[0].id not in exclude_rows]
+            if title in exclude_sections or not rows:
                 continue
             edited_count = sum(1 for _r, _v, edited in rows if edited)
             section = CollapsibleSection(tr(title), expanded=not pick_mode, select=pick_mode)
@@ -713,11 +717,11 @@ def open_sticky_dialog(parent, controller) -> None:
     """Pick which settings carry onto a freshly-opened file. Values shown are the last
     saved edit's, so the list reads as what would actually carry."""
     from negpy.domain.models import WorkspaceConfig
-    from negpy.desktop.sticky import load_sticky_config, load_sticky_rows, save_sticky_rows
+    from negpy.desktop.sticky import ALWAYS_STICKY_ROW_IDS, load_sticky_config, load_sticky_rows, save_sticky_rows
 
     repo = controller.session.repo
     source = load_sticky_config(repo) or WorkspaceConfig()
     chosen = frozenset(r.id for r in load_sticky_rows(repo))
-    dlg = GranularSettingsDialog(parent, source, "", preselect_ids=chosen, repo=repo)
+    dlg = GranularSettingsDialog(parent, source, "", preselect_ids=chosen, exclude_rows=ALWAYS_STICKY_ROW_IDS, repo=repo)
     if dlg.exec() == QDialog.DialogCode.Accepted:
         save_sticky_rows(repo, dlg.selected_ids())

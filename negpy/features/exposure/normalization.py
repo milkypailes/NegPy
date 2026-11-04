@@ -15,14 +15,15 @@ if TYPE_CHECKING:
 
 # Bump in any change that alters the bounds a frame measures for unchanged settings. Saved
 # per-frame bounds from an older version are dropped at startup (migrations/bounds.py).
-BOUNDS_VERSION = 2
+BOUNDS_VERSION = 3
 
 # Contrast Mask blur sigma, per-cent of the analysis grid's short side. Of the grid, not of
 # the render, so preview and export mask alike. Near the Frontier HyperTone blur's spread.
 MASK_BLUR_PERCENT = 4.0
-# Diffusion's blur sigma in per-cent of the printed frame's short side: one diffuser at the
-# lens, whose spread a printer does not vary between prints.
-DIFFUSION_SPREAD = 2.0
+# Diffusion's spread, one diffuser at the lens that a printer does not vary between prints:
+# (weight, sigma in per-cent of the printed frame's short side) Gaussians that fit a sum of
+# radial exponentials, a halo and a bloom with a power-law tail. The weights sum to 1.
+DIFFUSION_PSF = ((0.0421, 0.213), (0.1576, 0.449), (0.2723, 0.926), (0.3540, 2.017), (0.1740, 5.48))
 
 
 class LogNegativeBounds:
@@ -157,9 +158,17 @@ def effective_crosstalk_matrix(process: "ProcessConfig", process_mode: Optional[
     """
 
     profile_mode = str(getattr(process, "crosstalk_process", ProcessMode.C41) or ProcessMode.C41)
-    if process_mode is not None and profile_mode != str(process_mode):
-        return None
-    return resolve_crosstalk_matrix(process.crosstalk_strength, process.crosstalk_matrix)
+    if process_mode is None or profile_mode == str(process_mode):
+        return resolve_crosstalk_matrix(process.crosstalk_strength, process.crosstalk_matrix)
+    return None
+
+
+def crosstalk_unmix_active(process: "ProcessConfig", process_mode: Optional[str]) -> bool:
+    """A crosstalk unmix for this film process applies."""
+    profile_mode = str(getattr(process, "crosstalk_process", ProcessMode.C41) or ProcessMode.C41)
+    return (process_mode is None or profile_mode == str(process_mode)) and (
+        resolve_crosstalk_matrix(process.crosstalk_strength, process.crosstalk_matrix) is not None
+    )
 
 
 def resolve_crosstalk_matrix(strength: float, matrix: Optional[tuple]) -> Optional[np.ndarray]:
@@ -182,10 +191,23 @@ def resolve_crosstalk_matrix(strength: float, matrix: Optional[tuple]) -> Option
 
 
 def unmix_log_image(img_log: ImageBuffer, matrix: Optional[np.ndarray]) -> ImageBuffer:
-    """Apply the unmix matrix to a (H, W, 3) log-density image; identity when None."""
+    """Apply the unmix matrix to a (H, W, 3) log-density image; identity when None. A (3, 4)
+    matrix is an affine: its last column is added after the 3x3, as normalization.wgsl does."""
     if matrix is None:
         return img_log
-    return np.einsum("hwc,kc->hwk", img_log.astype(np.float32, copy=False), matrix.astype(np.float32))
+    m = np.ascontiguousarray(matrix, dtype=np.float32)
+    out = negpy_core.unmix_log(np.ascontiguousarray(img_log, dtype=np.float32), np.ascontiguousarray(m[:, :3]))
+    # A (3, 4) matrix is Remove Stain's affine: the last column is a log offset added after the 3x3.
+    return out + m[:, 3] if m.shape[1] == 4 else out
+
+
+def relog_matrix_image(img_log: ImageBuffer, matrix: Optional[np.ndarray]) -> ImageBuffer:
+    """Apply a linear-light 3x3 to a (H, W, 3) log-density image: 10^v, the matrix, then the log
+    clamped at 1e-6 as `log_density_open` clamps it. Identity when None."""
+    if matrix is None:
+        return img_log
+    m = np.ascontiguousarray(np.asarray(matrix, dtype=np.float32)[:, :3])
+    return negpy_core.relog_matrix(np.ascontiguousarray(img_log, dtype=np.float32), m)
 
 
 def sorted_channel_grid(img_log: ImageBuffer) -> np.ndarray:
@@ -595,12 +617,12 @@ def diffusion_grid(
     converge_h: float = 0.0,
     roi_norm: Optional[Tuple[float, float, float, float]] = None,
 ) -> np.ndarray:
-    """The unmixed light blurred by `DIFFUSION_SPREAD`, as log density on `analysis_grid`. It takes no bounds:
+    """The unmixed light blurred by `DIFFUSION_PSF`, as log density on `analysis_grid`. It takes no bounds:
     the print's normalization is a per-channel gain on that light."""
     image = analysis_grid(image, rotation, fine_rotation, flip_horizontal, flip_vertical, distortion_k1, converge_v, converge_h, roi_norm)
     unmixed = np.ascontiguousarray(unmix_log_image(prefilter_log_grid(image, None, 0.0), unmix), dtype=np.float32)
-    sigma = DIFFUSION_SPREAD * 0.01 * min(unmixed.shape[:2])
-    return negpy_core.diffusion_tail(unmixed, sigma)
+    short = 0.01 * min(unmixed.shape[:2])
+    return negpy_core.diffusion_tail(unmixed, [(w, s * short) for w, s in DIFFUSION_PSF])
 
 
 def diffusion_plane(
@@ -1037,6 +1059,8 @@ def resolve_bounds_detailed(process, analyze_fn) -> tuple[LogNegativeBounds, Log
     if roll_luma and roll_color:
         return locked, locked
     base = LogNegativeBounds(process.local_floors, process.local_ceils) if process.is_local_initialized else analyze_fn()
+    if process.manual_dmin is not None or process.manual_dmax is not None:
+        base = LogNegativeBounds(process.manual_dmax or base.floors, process.manual_dmin or base.ceils)
     final = mix_luma_color_bounds(locked if roll_luma else base, locked if roll_color else base)
     return final, base
 

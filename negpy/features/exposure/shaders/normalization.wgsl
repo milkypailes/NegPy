@@ -7,9 +7,10 @@ struct NormUniforms {
     transfer_flag: u32,
     wp_offset: f32,
     bp_offset: f32,
-    // Capture-side dye-unmix rows (effective blended+row-normalized matrix,
-    // computed CPU-side); identity rows when the unmix is off. Applied to the
-    // raw negative log densities before the stretch — mirrors the CPU path.
+    // Log-density matrix rows, computed CPU-side (`unmix_with_fade`): the row-normalized
+    // crosstalk unmix, times the fade restoration on a slide, which is not row-normalized.
+    // Identity rows when neither applies. Applied before the stretch, as on the CPU.
+    // The w lanes carry Remove Stain's log offset, added after the 3x3; 0.0 when it is off.
     unmix0: vec4<f32>,
     unmix1: vec4<f32>,
     unmix2: vec4<f32>,
@@ -19,6 +20,12 @@ struct NormUniforms {
     cam0: vec4<f32>,
     cam1: vec4<f32>,
     cam2: vec4<f32>,
+    // A Positive source's primaries, applied in LINEAR after the density matrix so the unmix,
+    // fade and stain offset act on its own channels (density_stage_matrices). post0.w is 1.0
+    // when it applies; the cam rows are then identity.
+    post0: vec4<f32>,
+    post1: vec4<f32>,
+    post2: vec4<f32>,
 };
 
 @group(0) @binding(0) var input_tex: texture_2d<f32>;
@@ -58,10 +65,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // does not apply, so there is nothing to branch on here (and branching here is
     // exactly how this silently stopped working on the GPU once before).
     log_color = vec3<f32>(
-        dot(params.unmix0.xyz, log_color),
-        dot(params.unmix1.xyz, log_color),
-        dot(params.unmix2.xyz, log_color),
+        dot(params.unmix0.xyz, log_color) + params.unmix0.w,
+        dot(params.unmix1.xyz, log_color) + params.unmix1.w,
+        dot(params.unmix2.xyz, log_color) + params.unmix2.w,
     );
+    if (params.post0.w > 0.5) {
+        let unmixed = pow(vec3<f32>(10.0), log_color);
+        log_color = log10_vec(max(vec3<f32>(
+            dot(params.post0.xyz, unmixed),
+            dot(params.post1.xyz, unmixed),
+            dot(params.post2.xyz, unmixed),
+        ), vec3<f32>(epsilon)));
+    }
 
     var res: vec3<f32>;
 

@@ -127,9 +127,8 @@ def test_the_analysis_bar_holds_everything_that_meters_this_frame(qapp):
     ]
     assert order == sorted(order)
     assert _row_index_containing(col, sidebar.analysis_header) == 0
-    assert _row_index_containing(col, sidebar.film_base_btn) == _row_index_containing(col, sidebar.analysis_region_btn)
+    assert _row_index_containing(col, sidebar.reanalyze_frame_btn) == _row_index_containing(col, sidebar.analysis_region_btn)
     assert sidebar.clear_analysis_region_btn.parentWidget() is sidebar.analysis_region_btn
-    assert sidebar.clear_film_base_btn.parentWidget() is sidebar.film_base_btn
 
 
 def test_the_region_buttons_carry_their_names(qapp):
@@ -142,19 +141,18 @@ def test_average_toggles_ride_the_baseline_bar_not_the_analysis(qapp):
     """Use Luma/Color Average is about the roll baseline, so it travels with the picker
     in baseline_bar, apart from the metering controls."""
     _, sidebar = _sidebar()
-    bar = sidebar.baseline_bar.layout()
-    assert _row_index_containing(bar, sidebar.use_luma_avg_btn) == _row_index_containing(bar, sidebar.use_color_avg_btn)
+    assert sidebar.baseline_bar.isAncestorOf(sidebar.use_luma_avg_btn)
     for widget in (sidebar.luma_range_clip_slider, sidebar.white_point_slider):
         assert not sidebar.baseline_bar.isAncestorOf(widget)
 
 
-def test_reanalyze_and_lock_bounds_sit_on_the_analysis_header(qapp):
+def test_lock_bounds_sits_on_the_analysis_header(qapp):
     _, sidebar = _sidebar()
     col = sidebar.analysis_bar.layout()
     header_i = _row_index_containing(col, sidebar.analysis_header)
-    assert _row_index_containing(col, sidebar.reanalyze_frame_btn) == header_i
     assert _row_index_containing(col, sidebar.lock_bounds_btn) == header_i
-    assert sidebar.lock_bounds_btn.text() == "", "an icon-only toggle"
+    assert sidebar.reanalyze_frame_btn.text().strip() == "Reanalyze Frame"
+    assert sidebar.lock_bounds_btn.text().strip() == "Lock"
 
 
 def test_the_point_header_folds_the_channel_row_and_its_sliders(qapp):
@@ -186,25 +184,30 @@ def test_average_toggles_hide_on_the_transparency_transfer(qapp):
     assert sidebar.use_color_avg_btn.isHidden()
 
 
+def test_a_right_click_on_any_average_toggle_turns_every_average_on(qapp):
+    from PyQt6.QtCore import Qt
+    from PyQt6.QtTest import QTest
+
+    controller, sidebar = _sidebar()
+    controller.state.active_roll_id = "roll-1"
+    controller.state.config = replace(
+        controller.state.config, process=replace(controller.state.config.process, process_mode=ProcessMode.BW)
+    )
+    sidebar.sync_ui()
+    QTest.mouseClick(sidebar.use_color_avg_btn, Qt.MouseButton.RightButton)
+    controller.set_roll_average.assert_called_with(use_luma_average=True, use_color_average=True)
+
+
 def test_use_luma_average_toggle_reaches_the_controller(qapp):
-    """Goes through set_roll_default on the Roll Analysis card -- flipping it locks that
-    card to this frame, and drops roll_name since a single picked baseline no longer
-    applies."""
     controller, sidebar = _sidebar()
     sidebar.use_luma_avg_btn.setChecked(True)
-    args, kwargs = controller.set_roll_default.call_args
-    assert args[0] == "baseline"
-    assert kwargs["use_luma_average"] is True
-    assert kwargs["roll_name"] is None
+    controller.set_roll_average.assert_called_with(use_luma_average=True)
 
 
 def test_use_color_average_toggle_reaches_the_controller(qapp):
     controller, sidebar = _sidebar()
     sidebar.use_color_avg_btn.setChecked(True)
-    args, kwargs = controller.set_roll_default.call_args
-    assert args[0] == "baseline"
-    assert kwargs["use_color_average"] is True
-    assert kwargs["roll_name"] is None
+    controller.set_roll_average.assert_called_with(use_color_average=True)
 
 
 def test_white_black_point_retarget_and_sync(qapp):
@@ -306,20 +309,16 @@ def test_white_black_point_are_normalization_roll_defaults():
     assert rolls.card_fields("baseline") == ("use_luma_average", "use_color_average", "use_cast_average")
 
 
-def test_reanalyze_frame_clears_local_bounds_and_persists(qapp):
+def test_reanalyze_frame_measures_the_selection_again(qapp):
     controller, sidebar = _sidebar()
-    cfg = controller.state.config
-    controller.state.config = replace(cfg, process=replace(cfg.process, local_floors=(0.1, 0.1, 0.1), local_ceils=(0.9, 0.9, 0.9)))
     sidebar.sync_ui()
 
     sidebar.reanalyze_frame_btn.click()
 
-    new_cfg = controller.apply_config.call_args.args[0]
-    assert not new_cfg.process.is_local_initialized
-    assert controller.apply_config.call_args.kwargs == {"persist": True}
+    controller.reanalyze_selection.assert_called_once_with()
 
 
-def test_reanalyze_frame_is_disabled_when_nothing_would_be_measured(qapp):
+def test_reanalyze_frame_is_disabled_for_a_locked_frame(qapp):
     controller, sidebar = _sidebar()
     cfg = controller.state.config
     sidebar.sync_ui()
@@ -329,9 +328,16 @@ def test_reanalyze_frame_is_disabled_when_nothing_would_be_measured(qapp):
     sidebar.sync_ui()
     assert not sidebar.reanalyze_frame_btn.isEnabled()
 
-    controller.state.config = replace(cfg, process=replace(cfg.process, use_luma_average=True, use_color_average=True))
+
+def test_reanalyze_names_the_selection(qapp):
+    controller, sidebar = _sidebar()
+    controller.session.selection_is_open_frame.return_value = False
+    controller.state.selected_indices = [0, 1, 2]
+    cfg = controller.state.config
+    controller.state.config = replace(cfg, process=replace(cfg.process, lock_bounds=True))
     sidebar.sync_ui()
-    assert not sidebar.reanalyze_frame_btn.isEnabled()
+    assert sidebar.reanalyze_frame_btn.isEnabled()
+    assert "Reanalyze 3 Frames" in sidebar.reanalyze_frame_btn.toolTip()
 
 
 def test_baseline_hint_names_where_the_bounds_came_from(qapp):
@@ -374,6 +380,36 @@ def test_baseline_hint_flags_a_roll_baseline_from_an_older_analysis(qapp):
     assert sidebar.baseline_source_hint.property("hint") == "warning"
 
 
+def test_baseline_hint_warns_on_an_outlier_riding_the_average(qapp):
+    from negpy.services.assets import rolls
+
+    controller, sidebar = _sidebar()
+    controller.state.current_file_hash = "h1"
+    cfg = controller.state.config
+    riding = dict(use_luma_average=True, locked_floors=(0.1, 0.1, 0.1), locked_ceils=(0.9, 0.9, 0.9), baseline_source="roll:r1")
+    saved = {"floors": [0.1] * 3, "ceils": [0.9] * 3, "bounds_version": rolls.BOUNDS_VERSION}
+
+    with patch.object(rolls, "roll_for_id", return_value={"name": "Tri-X", "normalization": {**saved, "outliers": ["h1"]}}):
+        controller.state.config = replace(cfg, process=replace(cfg.process, **riding))
+        sidebar.sync_ui()
+    assert "far from the average" in sidebar.baseline_source_hint.text()
+    assert sidebar.baseline_source_hint.property("hint") == "warning"
+
+    with patch.object(rolls, "roll_for_id", return_value={"name": "Tri-X", "normalization": {**saved, "outliers": ["h2"]}}):
+        sidebar.sync_ui()
+    assert sidebar.baseline_source_hint.text() == "Baseline: Roll “Tri-X”"
+    assert sidebar.baseline_source_hint.property("hint") == "muted"
+
+
+def test_baseline_hint_says_the_roll_is_being_measured(qapp):
+    controller, sidebar = _sidebar()
+    controller.measuring_baseline.return_value = True
+    cfg = controller.state.config
+    controller.state.config = replace(cfg, process=replace(cfg.process, use_luma_average=True))
+    sidebar.sync_ui()
+    assert sidebar.baseline_source_hint.text() == "Measuring the average…"
+
+
 def test_the_clipping_hint_reads_as_the_analysis_row_does():
     _controller, sidebar = _sidebar()
 
@@ -386,3 +422,19 @@ def test_the_clipping_hint_reads_as_the_analysis_row_does():
 
     sidebar.set_clipping(None, None)
     assert sidebar.clipping_hint.text() == "Clipping: —"
+
+
+def test_average_toggles_gray_out_without_a_roll(qapp):
+    """The averages read a roll baseline; the Roll Analysis hint above says why they are gray."""
+    controller, sidebar = _sidebar()
+    cfg = controller.state.config
+    controller.state.config = replace(cfg, process=replace(cfg.process, use_luma_average=True))
+    controller.state.active_roll_id = None
+    sidebar.sync_ui()
+    assert sidebar.use_luma_avg_btn.isChecked()
+    # A checked average can still be turned off; an unchecked one cannot be turned on.
+    assert sidebar.use_luma_avg_btn.isEnabled() and not sidebar.use_color_avg_btn.isEnabled()
+
+    controller.state.active_roll_id = "roll-1"
+    sidebar.sync_ui()
+    assert sidebar.use_luma_avg_btn.isEnabled() and sidebar.use_color_avg_btn.isEnabled()

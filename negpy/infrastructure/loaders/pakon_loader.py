@@ -22,6 +22,10 @@ class PakonLoader(IImageLoader):
     ]
 
     HEADER_SIZE = 16
+    # F135 scans always have this many lines; a trimmed frame keeps them and shortens the width.
+    # The cap covers a panoramic (XPan, 65 mm) frame at 2000 lines per 24 mm, about 5400 columns.
+    TRIMMED_HEIGHT = 2000
+    TRIMMED_WIDTHS = range(1000, 6001)
 
     @classmethod
     def read_header(cls, file_path: str) -> Optional[Tuple[int, int]]:
@@ -52,10 +56,13 @@ class PakonLoader(IImageLoader):
         except OSError:
             return None
         spec = next((s for s in cls.PAKON_SPECS if abs(file_size - s["size"]) < 1024), None)
-        if spec is None:
-            return None
-        height, width = spec["res"]
-        return height, width, None
+        if spec is not None:
+            height, width = spec["res"]
+            return height, width, None
+        row_bytes = cls.TRIMMED_HEIGHT * 6
+        if file_size % row_bytes == 0 and file_size // row_bytes in cls.TRIMMED_WIDTHS:
+            return cls.TRIMMED_HEIGHT, file_size // row_bytes, None
+        return None
 
     @classmethod
     def can_handle(cls, file_path: str) -> bool:

@@ -23,7 +23,7 @@ from negpy.desktop.controller import AppController
 from negpy.desktop.session import ToolMode
 from negpy.infrastructure.loaders.constants import SUPPORTED_RAW_EXTENSIONS
 from negpy.desktop.converters import ImageConverter
-from negpy.desktop.view.canvas.hud import INFO_FULL, MODE_LABELS, frame_info
+from negpy.desktop.view.canvas.hud import INFO_BASIC, INFO_FULL, frame_info
 from negpy.desktop.view.canvas.reference_pane import ReferencePane
 from negpy.desktop.view.canvas.toolbar import ActionToolbar, frame_position
 from negpy.desktop.view.canvas.widget import ImageCanvas
@@ -42,7 +42,6 @@ from negpy.desktop.view.widgets.collapsible import fit_pane
 from negpy.desktop.view.widgets.command_palette import CommandPalette, FindField
 from negpy.desktop.view.widgets.loading_overlay import LoadingOverlay
 from negpy.desktop.view.widgets.pinnable_dock import PinnableDockWidget
-from negpy.desktop.view.widgets.progress_dialog import ProgressDialog
 from negpy.domain.models import AspectRatio
 from negpy.infrastructure.gpu.resources import GPUTexture
 from negpy.kernel.image.logic import float_to_uint8
@@ -129,6 +128,11 @@ class _EmptyStateOverlay(QWidget):
         menu.addAction(tr("Scan…")).triggered.connect(self.scan_requested)
         menu.exec(self.load_btn.mapToGlobal(self.load_btn.rect().bottomLeft()))
 
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        # Each render raises the canvas's own layers, which would otherwise cover these buttons.
+        self.raise_()
+
     def eventFilter(self, obj, event) -> bool:
         if obj is self.parent() and event.type() == QEvent.Type.Resize:
             self.setGeometry(self.parent().rect())
@@ -143,6 +147,7 @@ class _EmptyStateOverlay(QWidget):
 # (canvas, Film Strip) heights until the splitter is first dragged; Qt scales them to the window.
 _STRIP_DEFAULT_SPLIT = (700, 300)
 _CANVAS_MIN_HEIGHT = 120
+_LOADING_MESSAGE = tr("Processing…")
 # The Film Strip section's key, so a strip folded before keeps its fold.
 _STRIP_EXPANDED_KEY = "section_expanded_frames"
 
@@ -156,6 +161,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.controller = controller
         self.state = controller.state
+        self._export_size_zoom_pending = False
 
         self._restore_window_geometry()
         self.setAcceptDrops(True)
@@ -242,8 +248,10 @@ class MainWindow(QMainWindow):
             )
             if reply == QMessageBox.StandardButton.Yes:
                 self.controller.restore_session()
+                self.file_browser.restore_hot_folder(True)
                 self._schedule_onboarding()
                 return
+        self.file_browser.restore_hot_folder(False)
         self.show_library(ask_if_unset=False)
         self._schedule_onboarding()
 
@@ -310,9 +318,16 @@ class MainWindow(QMainWindow):
         self.reference_pane = ReferencePane(self.canvas.background_color)
         self.reference_pane.closed.connect(self.close_reference)
         self.reference_pane.hide()
+        # The strip spans both pages, so a job started on the Light Table reports there too.
+        self.central_column = QWidget()
+        column = QVBoxLayout(self.central_column)
+        column.setContentsMargins(0, 0, 0, 0)
+        column.setSpacing(0)
+        column.addWidget(self.canvas.hud)
+        column.addWidget(self.central_stack, 1)
         self.central_splitter = QSplitter(Qt.Orientation.Horizontal)
         self.central_splitter.addWidget(self.reference_pane)
-        self.central_splitter.addWidget(self.central_stack)
+        self.central_splitter.addWidget(self.central_column)
         self.central_splitter.setCollapsible(1, False)
         # The Film Strip under the canvas, the toolbar at the window's bottom: the splitter sets the
         # strip's height, the toolbar's chevron collapses it.
@@ -454,7 +469,10 @@ class MainWindow(QMainWindow):
         box.exec()
 
     def show_command_palette(self) -> None:
-        CommandPalette(self).exec()
+        # Not exec(): on macOS a modal session drops the clicks outside that close a popup.
+        palette = CommandPalette(self)
+        palette.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        palette.show()
 
     def _restore_default_dock_state(self) -> None:
         """Restore the controls dock to the snapshot taken at startup (home edge + width)."""
@@ -630,7 +648,9 @@ class MainWindow(QMainWindow):
         self.controller.preview_loaded.connect(self._refresh_image_info)
         self.controller.loading_started.connect(self._on_loading_started)
         self.controller.gpu_textures_released.connect(self.canvas.release_gpu_texture)
-        self.controller.image_updated.connect(self.loading_overlay.stop)
+        self.controller.image_updated.connect(self._stop_loading)
+        # The recipe shows the metered values, which settle with each render.
+        self.controller.image_updated.connect(lambda *_: self._refresh_image_info())
         self.controller.load_failed.connect(self._on_load_failed)
         self.controller.zoom_changed.connect(self._on_zoom_info_changed)
 
@@ -662,7 +682,6 @@ class MainWindow(QMainWindow):
         self.canvas.local_mask_edited.connect(self.controller.handle_local_mask_edited)
         self.canvas.local_vertex_deleted.connect(self.controller.delete_local_vertex)
 
-        self.controller.export_progress.connect(self._on_export_progress)
         self.controller.export_finished.connect(self._on_export_finished)
         self.controller.session.settings_copied.connect(lambda: self.canvas.hud.showMessage(tr("Settings copied"), timeout=1500))
         self.controller.session.settings_pasted.connect(lambda: self.canvas.hud.showMessage(tr("Settings pasted"), timeout=1500))
@@ -686,6 +705,8 @@ class MainWindow(QMainWindow):
         self.controller.clipping_overlay_changed.connect(lambda _on: self.canvas.overlay.update())
         self.controller.zone_highlight_changed.connect(self.canvas.overlay.update)
         self.controller.grain_focuser_changed.connect(lambda _on: self.canvas.overlay.update())
+        self.controller.export_view_ready.connect(self.canvas.overlay.update)
+        self.controller.export_size_view_changed.connect(self._on_export_size_view_changed)
         self.controller.printing_notes_changed.connect(lambda _on: self.canvas.overlay.update())
         self.controller.cursor_probe_changed.connect(lambda _on: self.canvas.overlay.update())
         self.controller.densitometer_readout.connect(self.canvas.overlay.set_probe_reading)
@@ -719,11 +740,13 @@ class MainWindow(QMainWindow):
         )
         QApplication.instance().installEventFilter(self.shortcut_hints)
 
-        self.progress_dialog = ProgressDialog(self)
+        self._batch_title = ""
+        self._batch_message = ""
+        self._batch_quiet = False
         self.controller.batch_started.connect(self._on_batch_started)
-        self.controller.batch_progress.connect(self.progress_dialog.set_progress)
-        self.controller.batch_finished.connect(self.progress_dialog.finish)
-        self.progress_dialog.abort_requested.connect(self.controller.abort_active_batch)
+        self.controller.batch_progress.connect(self._on_batch_progress)
+        self.controller.batch_finished.connect(self._on_batch_finished)
+        self.canvas.hud.abort_requested.connect(self.controller.abort_active_batch)
 
     def _on_pick_better_changed(self, up: bool) -> None:
         """Show the separate Pick Better window while the mode is active; hide it when it ends."""
@@ -757,16 +780,30 @@ class MainWindow(QMainWindow):
 
     def _on_batch_started(self, title: str, abortable: bool) -> None:
         """Hot Folder polls every 2 s, so its per-frame import batches (the only
-        non-abortable ones) would pop the dialog on every capture. The HUD status
-        line still reports those; abortable batches always show the popup.
+        non-abortable ones) keep their bar but post no message on every capture.
+        Suppression keys off which sequence owns this batch (`hot_folder_sequence_active`),
+        not the toggle: a manual Add Files while Hot Folder is on still reports."""
+        self._batch_title = title
+        self._batch_quiet = not abortable and self.controller.hot_folder_sequence_active
+        self.canvas.hud.set_abortable(abortable)
+        if not self._batch_quiet:
+            self._show_batch_message(tr("{title}…", title=title))
 
-        Suppression keys off which sequence actually owns this batch
-        (`hot_folder_sequence_active`), not whether the toggle happens to be
-        checked — a manual Add Files/Add Folder/drop while Hot Folder is on must
-        still show progress."""
-        if not abortable and self.controller.hot_folder_sequence_active:
-            return
-        self.progress_dialog.start(title, abortable)
+    def _on_batch_progress(self, current: int, total: int, name: str) -> None:
+        self.canvas.hud.set_progress(current, total)
+        if not self._batch_quiet:
+            self._show_batch_message(
+                tr("{title}: {name} ({current}/{total})", title=self._batch_title, name=name, current=current, total=total)
+            )
+
+    def _show_batch_message(self, text: str) -> None:
+        self._batch_message = text
+        self.canvas.hud.showMessage(text, -1)
+
+    def _on_batch_finished(self) -> None:
+        self.canvas.hud.set_abortable(False)
+        self.canvas.hud.hide_progress()
+        self.canvas.hud.clear_message(self._batch_message)
 
     def _save_printing_notes(self) -> None:
         """Write the marked-up work print. The annotated pixels are the canvas's own
@@ -784,12 +821,19 @@ class MainWindow(QMainWindow):
             self.controller.set_status(tr("Could not write {path}", path=path), 4000, kind="error")
 
     def _on_loading_started(self) -> None:
-        """Keep the previous frame visible (dimmed) under a spinner instead of blanking."""
+        """Keep the previous frame visible (dimmed) instead of blanking. The note goes in the strip
+        only while it is up: popping the strip for each load would resize the canvas every frame."""
         self.empty_state.setVisible(False)
         self.loading_overlay.start()
+        if not self.canvas.hud.isHidden():
+            self.canvas.hud.showMessage(_LOADING_MESSAGE, LoadingOverlay.MAX_VISIBLE_MS)
+
+    def _stop_loading(self, *_args) -> None:
+        self.loading_overlay.stop()
+        self.canvas.hud.clear_message(_LOADING_MESSAGE)
 
     def _on_load_failed(self) -> None:
-        self.loading_overlay.stop()
+        self._stop_loading()
         self.canvas.clear()
         # With nothing else open, a black canvas after the toast expires is a dead end.
         self.empty_state.setVisible(not self.state.uploaded_files)
@@ -797,10 +841,13 @@ class MainWindow(QMainWindow):
     def _on_session_emptied(self) -> None:
         """Last file was unloaded/cleared: blank the viewer (the removed image must
         not linger with no way to dismiss it) and bring the empty-state hint back."""
-        self.loading_overlay.stop()
+        self._stop_loading()
         self.canvas.clear()
         self.empty_state.setVisible(True)
         self._refresh_image_info()
+
+    def _on_export_size_view_changed(self, on: bool) -> None:
+        self._export_size_zoom_pending = on
 
     def _on_image_updated(self) -> None:
         """Refreshes canvas when a new render pass completes."""
@@ -818,7 +865,8 @@ class MainWindow(QMainWindow):
             return
         content_rect = shown("content_rect")
 
-        if isinstance(buffer, np.ndarray) and not self.state.gpu_enabled:
+        # The export render carries its own mat.
+        if isinstance(buffer, np.ndarray) and not self.state.gpu_enabled and not shown("export_view"):
             finish_conf = self.state.config.finish
             export_conf = self.state.config.export
             # No padding for a crop_preview_full buffer (the uncropped frame), as on the GPU: it would misalign
@@ -852,13 +900,17 @@ class MainWindow(QMainWindow):
             splash=bool(shown("splash")), proofed=bool(shown("proof", True))
         )
         self.canvas.update_buffer(buffer, display_cs, content_rect=content_rect, monitor_icc_bytes=monitor_bytes, proof=proof)
+        # The first export frame opens at 100%: Export Size is for judging pixels.
+        if self._export_size_zoom_pending and shown("export_view"):
+            self._export_size_zoom_pending = False
+            self.canvas.zoom_to_percent(100.0)
 
     def _refresh_image_info(self) -> None:
-        """Updates the canvas HUD corner pills."""
+        """Updates the frame info in the canvas strip."""
         st = self.state
         if not st.current_file_path:
             self.canvas.hud.set_zoom_note("")
-            self.canvas.hud.update_info("", "", "")
+            self.canvas.hud.update_info("", "")
             return
         w, h = st.original_res
         proof = os.path.splitext(os.path.basename(st.proof_icc_path))[0] if st.soft_proof_enabled and st.proof_icc_path else ""
@@ -868,7 +920,7 @@ class MainWindow(QMainWindow):
                 st.config,
                 os.path.basename(st.current_file_path),
                 f"{w} x {h} px",
-                MODE_LABELS[st.config.process.process_mode],
+                self.canvas.overlay.recipe(brief=st.canvas_info_level == INFO_BASIC, with_frame=False),
                 frame_position(self.controller.session.asset_model, st.selected_file_idx),
                 proof,
             )
@@ -876,7 +928,7 @@ class MainWindow(QMainWindow):
         self._on_zoom_info_changed(self.canvas.zoom_level)
 
     def _on_zoom_info_changed(self, zoom: float) -> None:
-        """The zoom readout: under the navigator while it is up, else the bottom-right pill."""
+        """The zoom readout: under the navigator while it is up, else at the strip's right end."""
         if not self.state.current_file_path:
             return
         note = self.canvas.zoom_note()
@@ -887,10 +939,6 @@ class MainWindow(QMainWindow):
             return
         full = self.state.canvas_info_level == INFO_FULL
         self.canvas.hud.set_zoom_note(" · ".join(s for s in (percent if full else "", note) if s))
-
-    def _on_export_progress(self, current: int, total: int, filename: str) -> None:
-        self.canvas.hud.set_progress(current, total)
-        self.canvas.hud.showMessage(tr("Exporting {filename} ({current}/{total})…", filename=filename, current=current, total=total))
 
     def _on_export_finished(self, elapsed: float, errors: list) -> None:
         self.canvas.hud.hide_progress()
@@ -955,5 +1003,5 @@ class MainWindow(QMainWindow):
             # them rather than reporting that it found nothing.
             self.file_browser.open_or_browse(paths[0])
         elif paths:
-            self.controller.request_asset_discovery(paths, auto_open=True)
+            self.controller.request_asset_discovery(paths, auto_open=True, user_add=True)
         event.acceptProposedAction()

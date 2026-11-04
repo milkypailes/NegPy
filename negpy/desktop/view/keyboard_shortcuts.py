@@ -8,8 +8,9 @@ from PyQt6.QtWidgets import QApplication, QWidget
 
 from negpy.desktop.session import ToolMode
 from negpy.services.assets import rolls
-from negpy.desktop.view.confirm import confirm_close_roll, confirm_remove_from_roll, confirm_reset_frames
+from negpy.desktop.view.confirm import confirm_remove_from_roll, confirm_reset_frames, confirm_restore_removed, confirm_unload_all
 from negpy.desktop.view.widgets.granular_settings_dialog import open_paste_dialog, open_sticky_dialog, open_sync_bounds_dialog
+from negpy.desktop.view.widgets.rgb_triplet_dialog import open_triplet_dialog
 from negpy.desktop.view.shortcut_registry import (
     REGISTRY,
     load_bindings,
@@ -62,12 +63,8 @@ def _reset_roll(window, controller) -> None:
         controller.request_render()
 
 
-def close_roll_label(state) -> str:
-    return tr("Close Roll…") if state.active_roll_id else tr("Unload All…")
-
-
-def _close_roll(window, controller) -> None:
-    """Empty the Film Strip: the open roll, or every loaded frame when no roll is open."""
+def _unload_all(window, controller) -> None:
+    """Empty the Film Strip and close the open roll, which stays in the Library."""
     session = controller.session
     if not session.state.uploaded_files:
         return
@@ -75,7 +72,7 @@ def _close_roll(window, controller) -> None:
     name = None
     if roll_id:
         name = (rolls.roll_for_id(session.repo, roll_id) or {}).get("name") or tr("this roll")
-    if confirm_close_roll(window, name):
+    if confirm_unload_all(window, name):
         session.clear_files()
 
 
@@ -89,6 +86,19 @@ def remove_from_roll(window, controller) -> None:
     name = (rolls.roll_for_id(controller.session.repo, state.active_roll_id) or {}).get("name") or tr("this roll")
     if count and confirm_remove_from_roll(window, count, name):
         controller.request_remove_from_roll(indices)
+
+
+def restore_removed_frames(window, controller, roll_id: Optional[str] = None) -> bool:
+    """Bring back the frames removed from a folder roll (the open one by default), after a confirmation."""
+    roll_id = roll_id or controller.state.active_roll_id
+    count = controller.removed_frame_count(roll_id) if roll_id else 0
+    if not count:
+        return False
+    name = (rolls.roll_for_id(controller.session.repo, roll_id) or {}).get("name") or tr("this roll")
+    if not confirm_restore_removed(window, count, name):
+        return False
+    controller.restore_removed_frames(roll_id)
+    return True
 
 
 def _reset_selected(window, controller) -> None:
@@ -129,6 +139,9 @@ def _context_cancel(controller, window) -> None:
     if controller.state.negative_peek:
         controller.toggle_negative_peek(force=False)
         return
+    if controller.state.average_peek:
+        controller.toggle_average_peek(force=False)
+        return
     if controller.state.embedded_peek:
         controller.toggle_embedded_peek(force=False)
         return
@@ -137,6 +150,9 @@ def _context_cancel(controller, window) -> None:
         return
     if controller.state.flat_peek:
         controller.toggle_flat_peek(force=False)
+        return
+    if controller.state.export_size_view:
+        controller.toggle_export_size_view(force=False)
         return
     if controller.state.compare_mode:
         controller.toggle_compare()
@@ -158,16 +174,19 @@ def _context_cancel(controller, window) -> None:
     controller.revert_active_tool()
 
 
-def _toggle_tool_button(window, tab_key: str, button) -> None:
+def _toggle_tool_button(window, tab_key: str | None, button) -> None:
     """Reveal the tool's tab first: the tab-switch suspend/restore logic only runs
     on switches, so activating a tool while its tab is hidden would leave it live
-    with its controls off-screen."""
-    window.right_panel.show_tab_by_key(tab_key)
+    with its controls off-screen. None for a tool above the tabs."""
+    if tab_key is not None:
+        window.right_panel.show_tab_by_key(tab_key)
     # toggle() bypasses the enabled state: a gated tool must not arm, but an armed one always goes down.
     if button.isChecked() or (button.isEnabled() and not hidden_by_gating(button)):
         button.toggle()
     else:
-        window.controller.set_status(tr("{value} not available", value=button.text().strip()), 1500, kind="warning")
+        # An icon-only tool names itself in its tooltip ("Film Base: ...").
+        name = button.text().strip() or getattr(button, "plain_tooltip", "").split(":")[0]
+        window.controller.set_status(tr("{value} not available", value=name), 1500, kind="warning")
 
 
 def _slider_name(slider: object, group: SliderShortcutGroup) -> str:
@@ -382,6 +401,7 @@ class ShortcutManager:
             action_id: self._spring_loaded(flag, toggle)
             for action_id, flag, toggle in (
                 ("toggle_negative_peek", "negative_peek", controller.toggle_negative_peek),
+                ("toggle_average_peek", "average_peek", controller.toggle_average_peek),
                 ("toggle_flat_peek", "flat_peek", controller.toggle_flat_peek),
                 ("toggle_embedded_peek", "embedded_peek", controller.toggle_embedded_peek),
             )
@@ -444,6 +464,9 @@ class ShortcutManager:
             "toggle_advance_after_mark": lambda: self.window.file_browser.act_advance_after_mark.toggle(),
             "hdr_merge": controller.request_hdr_merge_selected,
             "hdr_unmerge": controller.request_unmerge_hdr,
+            "triplet_merge": controller.request_trichrome_merge,
+            "triplet_edit": lambda: open_triplet_dialog(self.window, controller),
+            "triplet_split": controller.request_split_triplet,
             # The view method, not the controller's: it carries the confirm the deletion needs.
             "half_frame_undiptych": self.window.file_browser.prompt_undiptych,
             "update_thumbnails_selection": (
@@ -465,12 +488,14 @@ class ShortcutManager:
             "lock_bounds_toggle": lambda: controls.process_sidebar.lock_bounds_btn.toggle(),
             "reanalyze_frame": lambda: controls.process_sidebar.reanalyze_frame_btn.click(),
             "cast_average_toggle": lambda: controls.process_sidebar.use_cast_avg_btn.toggle(),
+            "fade_white_anchor_toggle": lambda: controls.sensor_sidebar.fade_white_anchor_btn.toggle(),
             "metadata_preset_load": lambda: right.gear_panel.presets.apply_btn.click(),
             "metadata_clear_gear": lambda: right.metadata_sidebar.gear_clear_btn.click(),
             "metadata_clear_process": lambda: right.metadata_sidebar.process_clear_btn.click(),
             "metadata_clear_scanning": lambda: right.metadata_sidebar.scan_clear_btn.click(),
             "assign_sequential_frame": lambda: right.metadata_sidebar.frame_sequence_btn.click(),
             "measure_chart": lambda: controls.sensor_sidebar.measure_chart_btn.click(),
+            "estimate_fade": lambda: controls.sensor_sidebar.estimate_fade_btn.click(),
             "scan_prescan": (lambda: right.scan_sidebar.prescan_btn.click() if getattr(right, "scan_sidebar", None) is not None else None),
             "scan_meter_frame": (
                 lambda: right.scan_sidebar.exposure_meter_btn.click() if getattr(right, "scan_sidebar", None) is not None else None
@@ -484,6 +509,19 @@ class ShortcutManager:
             "scanlight_keep_light_on": lambda: (
                 right.scanlight_sidebar.keep_light_btn.toggle() if not right.scanlight_sidebar.keep_light_btn.isHidden() else None
             ),
+            "lento_film_off": lambda: (
+                right.scanlight_sidebar.film_choice.setCurrentIndex(0) if not right.scanlight_sidebar.dock_body.isHidden() else None
+            ),
+            "lento_film_next": lambda: (
+                right.scanlight_sidebar.film_choice.setCurrentIndex(1) if not right.scanlight_sidebar.dock_body.isHidden() else None
+            ),
+            "lento_film_strip": lambda: (
+                right.scanlight_sidebar.film_choice.setCurrentIndex(2) if not right.scanlight_sidebar.dock_body.isHidden() else None
+            ),
+            "lento_strip_flat": lambda: (
+                right.scanlight_sidebar.strip_flat_btn.toggle() if not right.scanlight_sidebar.strip_flat_btn.isHidden() else None
+            ),
+            "lento_eject": lambda: right.scanlight_sidebar.eject_btn.click() if not right.scanlight_sidebar.dock_body.isHidden() else None,
             "scanlight_infrared": lambda: (
                 right.scanlight_sidebar.ir_toggle.toggle() if not right.scanlight_sidebar._ir_exposure_widget.isHidden() else None
             ),
@@ -511,13 +549,17 @@ class ShortcutManager:
             "local_oval": lambda: _toggle_tool_button(self.window, "tone", controls.local_sidebar.oval_btn),
             "local_gradient": lambda: _toggle_tool_button(self.window, "tone", controls.local_sidebar.gradient_btn),
             "analysis_draw": lambda: _toggle_tool_button(self.window, "roll", controls.process_sidebar.analysis_region_btn),
-            "film_base": lambda: _toggle_tool_button(self.window, "roll", controls.process_sidebar.film_base_btn),
+            "film_base": lambda: _toggle_tool_button(self.window, None, self.window.right_panel.film_base_btn),
+            "dmin_pick": lambda: _toggle_tool_button(self.window, "roll", controls.process_sidebar.dmin_btn),
+            "dmax_pick": lambda: _toggle_tool_button(self.window, "roll", controls.process_sidebar.dmax_btn),
             "open_tools_menu": lambda: self.window.toolbar.open_tools_menu(),
             "toggle_flat_peek": controller.toggle_flat_peek,
             "toggle_negative_peek": controller.toggle_negative_peek,
             "toggle_heal_bypass": controller.toggle_heal_bypass,
+            "toggle_average_peek": controller.toggle_average_peek,
             "toggle_embedded_peek": controller.toggle_embedded_peek,
             "toggle_flatfield_peek": controller.toggle_flatfield_peek,
+            "toggle_export_size_view": controller.toggle_export_size_view,
             "toggle_zones": controller.toggle_zones_overlay,
             "toggle_clipping_overlay": controller.toggle_clipping_overlay,
             "toggle_zone_hover_highlight": controller.toggle_zone_hover_highlight,
@@ -578,8 +620,9 @@ class ShortcutManager:
             "paste": lambda: open_paste_dialog(self.window, controller),
             "sync_bounds": lambda: open_sync_bounds_dialog(self.window, controller.session),
             "reset_roll": lambda: _reset_roll(self.window, controller),
-            "close_roll": lambda: _close_roll(self.window, controller),
+            "close_roll": lambda: _unload_all(self.window, controller),
             "remove_from_roll": lambda: remove_from_roll(self.window, controller),
+            "restore_removed_frames": lambda: restore_removed_frames(self.window, controller),
             "reset_tab": lambda: _fire_tab_header(right, "reset"),
             "reset_tab_to_roll": lambda: _fire_tab_header(right, "revert"),
             "reset_to_roll": controller.revert_frame_to_roll,
@@ -595,6 +638,7 @@ class ShortcutManager:
             "roll_settings": lambda: self.window.file_browser.roll_settings_btn.click(),
             "contact_sheet": lambda: right.export_sidebar.contact_sheet_btn.click(),
             "save_as_roll": lambda: self.window.file_browser.save_roll_action.trigger(),
+            "save_to_folder_roll": lambda: self.window.file_browser.save_to_folder_roll(),
             "import_roll": lambda: self.window.right_panel.library_tree.prompt_import_folder(),
             "index_library": lambda: self.window.right_panel.library_tree.index_action.trigger(),
             "metadata_infer_gear": lambda: right.metadata_sidebar.gear_infer_btn.click(),
@@ -629,6 +673,7 @@ class ShortcutManager:
             "batch_autocrop": controls.autocrop_sidebar.auto_crop_all_btn.click,
             "toggle_auto_density": controls.tone_sidebar.auto_density_action.trigger,
             "toggle_auto_grade": controls.tone_sidebar.auto_grade_action.trigger,
+            "toggle_auto_masking": controls.lab_sidebar.auto_masking_btn.click,
             "toggle_auto_both": controls.tone_sidebar.auto_both_action.trigger,
             "auto_levels": lambda: controls.tone_sidebar.levels_auto_btn.click(),
             "toggle_hold_black": controls.tone_sidebar.hold_black_action.trigger,

@@ -47,11 +47,39 @@ _VP8X_EXIF = 0x08
 _VP8X_XMP = 0x04
 
 
+# EV (exposure bias) is a sum of stops written to ExposureBiasValue as a signed
+# rational; terms join by a sign with no space before the next number (1+2/3ev =
+# 5/3, -1-2/3ev = -5/3), and a sign followed by a space ("1 + 2/3 ev") is skipped.
+_EV_SIGNS = "+−-"  # +, the U+2212 minus, and the ASCII hyphen
+_EV_NUMBER = r"(?:\d+/\d+|\d+(?:\.\d+)?|\.\d+)"  # fraction form leads so a signed fraction (-1/3) reads as one term, not two
+# In a regex character class the hyphen must sit at the end to stay literal.
+_EV_SIGN_CLASS = "[" + _EV_SIGNS + "]"
+# A term is an optional sign then a number; a token is the first term then any
+# further terms, each led by a sign with no space before its number.
+_EV_TERM = rf"{_EV_SIGN_CLASS}?{_EV_NUMBER}"
+_EV_TOKEN = rf"{_EV_TERM}(?:{_EV_SIGN_CLASS}{_EV_NUMBER})*"
+_EV_RE = re.compile(rf"({_EV_TOKEN})\s?ev", re.IGNORECASE)
+_EV_TERM_RE = re.compile(_EV_TERM)
+
+
+def _ev_fraction(token: str) -> Optional[Fraction]:
+    """Sum the signed terms of an EV token as exact fractions (1+2/3 -> 5/3)."""
+    # Fraction reads only the ASCII hyphen, so map the U+2212 minus to an ASCII hyphen.
+    token = token.replace("−", "-")
+    total = Fraction(0)
+    try:
+        for term in _EV_TERM_RE.findall(token):
+            total += Fraction(term)
+    except (ValueError, ZeroDivisionError):
+        return None
+    return total
+
+
 def _parse_exposure_str(text: str) -> dict:
     """
-    Parse a free-form exposure string like '1/125s f/2.8 ISO 400' into
-    piexif-format rational tuples for ExposureTime, FNumber, and ISOSpeedRatings.
-    Returns an empty dict if parsing fails.
+    Parse a free-form exposure string like '1/125s f/2.8 ISO 400 +1/3ev' into
+    piexif-format values for ExposureTime, FNumber, ISOSpeedRatings and
+    ExposureBiasValue (a signed rational). Returns an empty dict if parsing fails.
     """
     result: dict = {}
 
@@ -79,6 +107,16 @@ def _parse_exposure_str(text: str) -> dict:
     if m_iso:
         iso_val = int(m_iso.group(1))
         result[piexif.ExifIFD.ISOSpeedRatings] = iso_val
+
+    m_ev = _EV_RE.search(text)
+    if m_ev is not None:
+        start = m_ev.start(1)
+        # A sign followed by a space just left of the token splits the sum
+        # ("1 + 2/3 ev"); skip it instead of reading a wrong value.
+        if not (start >= 2 and text[start - 2] in _EV_SIGNS and text[start - 1] == " "):
+            ev = _ev_fraction(m_ev.group(1))
+            if ev is not None:
+                result[piexif.ExifIFD.ExposureBiasValue] = (ev.numerator, ev.denominator)
 
     return result
 
@@ -696,23 +734,24 @@ def _decode_ascii(value: object) -> str | None:
     return None
 
 
-def _exif_bytes_to_extratags(exif_bytes: bytes) -> tuple[str | None, list[tuple]]:
+def _exif_bytes_to_extratags(exif_bytes: bytes, *, fold_user_comment: bool = True) -> tuple[str | None, list[tuple]]:
     exif_dict = piexif.load(exif_bytes)
     description = _decode_ascii(exif_dict.get("0th", {}).get(piexif.ImageIFD.ImageDescription))
+    if fold_user_comment:
+        comment = (exif_dict.get("Exif") or {}).get(piexif.ExifIFD.UserComment)
+        description = _fold_user_comment_into_description(description, comment)
 
+    # Capture fields belong to the Exif IFD written by attach_exif_ifd.
     extratags: list[tuple] = []
-    for ifd_name in ("0th", "Exif"):
-        ifd_data = exif_dict.get(ifd_name) or {}
-        type_table = piexif.TAGS.get(ifd_name, {})
-        for tag, value in ifd_data.items():
-            if tag in _TIFFFILE_RESERVED_TAGS:
-                continue
-            tag_info = type_table.get(tag)
-            if not tag_info:
-                continue
-            entry = _build_extratag(tag, tag_info["type"], value)
-            if entry is not None:
-                extratags.append(entry)
+    for tag, value in (exif_dict.get("0th") or {}).items():
+        if tag in _TIFFFILE_RESERVED_TAGS:
+            continue
+        tag_info = piexif.TAGS["0th"].get(tag)
+        if not tag_info:
+            continue
+        entry = _build_extratag(tag, tag_info["type"], value)
+        if entry is not None:
+            extratags.append(entry)
 
     return description, extratags
 
@@ -767,9 +806,7 @@ def _tiff_metadata_from_exif_bytes(exif_bytes: bytes) -> tuple[dict | None, str 
 def tiff_metadata_kwargs(exif_bytes: bytes, xmp_bytes: Optional[bytes] = None, *, fold_user_comment: bool = True) -> dict:
     """tifffile.imwrite kwargs carrying the EXIF/XMP payload, for embedding at the
     first encode."""
-    description, extratags = _exif_bytes_to_extratags(exif_bytes)
-    if fold_user_comment:
-        description = _fold_user_comment_into_description(description, extratags)
+    description, extratags = _exif_bytes_to_extratags(exif_bytes, fold_user_comment=fold_user_comment)
     if xmp_bytes:
         extratags.append((_TIFF_XMP_TAG, 7, len(xmp_bytes), xmp_bytes, True))
     metadata, software = _tiff_metadata_from_exif_bytes(exif_bytes)
@@ -1129,18 +1166,14 @@ def _rewrite_tiff_with_metadata(
     _rewrite_tiff_preserve(image_bytes, exif_bytes, output, xmp_bytes, fold_user_comment=True)
 
 
-def _fold_user_comment_into_description(description: str | None, extratags: list[tuple]) -> str | None:
+def _fold_user_comment_into_description(description: str | None, comment: object) -> str | None:
     uc_text: str | None = None
-    for entry in extratags:
-        tag, _ttype, _count, value, _ = entry
-        if tag != piexif.ExifIFD.UserComment or not isinstance(value, (bytes, bytearray)):
-            continue
-        raw = bytes(value)
+    if isinstance(comment, (bytes, bytearray)):
+        raw = bytes(comment)
         if raw[:8] == b"ASCII\x00\x00\x00":
             uc_text = _decode_ascii(raw[8:])
             if uc_text is not None:
                 uc_text = uc_text.strip()
-        break
 
     if not uc_text:
         return description

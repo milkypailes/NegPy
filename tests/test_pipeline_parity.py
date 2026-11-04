@@ -15,6 +15,7 @@ locally or in a nightly GPU-enabled CI job.
 """
 
 import numpy as np
+import pytest
 from dataclasses import replace
 
 from negpy.domain.models import WorkspaceConfig
@@ -353,6 +354,40 @@ class TestExposureParity:
         s = replace(base, process=replace(base.process, crosstalk_strength=0.7))
         self._run_and_compare(s)
 
+    @pytest.mark.parametrize("positive", [False, True])
+    def test_slide_fade_restoration(self, positive):
+        # Both engines compose the fade after the unmix; a fade one of them drops moves the render past this tolerance.
+        base = _make_base_settings()
+        fade = dict(fade_ratio_r=0.8, fade_ratio_g=0.7, fade_ratio_b=1.3)
+        s = replace(base, process=replace(base.process, process_mode=ProcessMode.E6, positive_source=positive, **fade))
+        cpu, gpu = self._render_both(s)
+        plain, _ = self._render_both(replace(s, process=replace(s.process, fade_ratio_r=1.0, fade_ratio_g=1.0, fade_ratio_b=1.0)))
+        assert float(np.abs(cpu - plain).mean()) > 0.02
+        _assert_mostly_close(cpu, gpu, atol=2e-2, rtol=2e-2, max_violation_frac=0.01)
+
+    @pytest.mark.parametrize("fade", [False, True])
+    def test_positive_source_primaries(self, fade):
+        # A Positive source's primaries ride the camera-matrix slot; with a fade both engines
+        # convert them after the density matrix, the GPU in the normalization shader.
+        from negpy.domain.interfaces import PipelineContext
+        from negpy.features.process.capture_color import source_cam_xyz
+        from negpy.infrastructure.loaders.source_encoding import _SRGB_COLORANTS_D50, _to_working
+        from negpy.kernel.system.config import render_scale_factor
+
+        cam_xyz = source_cam_xyz(_to_working(_SRGB_COLORANTS_D50))
+        base = _make_base_settings()
+        ratios = dict(fade_ratio_r=0.5, fade_ratio_g=1.6, fade_ratio_b=1.3) if fade else {}
+        s = replace(base, process=replace(base.process, process_mode=ProcessMode.E6, positive_source=True, **ratios))
+        h, w = self.img.shape[:2]
+        ctx = PipelineContext(
+            original_size=(h, w), scale_factor=render_scale_factor(self.img.shape), process_mode=ProcessMode.E6, cam_xyz=cam_xyz
+        )
+        cpu = self.cpu.process(self.img, s, f"parity_positive_primaries_{fade}", ctx)
+        tex, _ = self.gpu.process_to_texture(
+            self.img, s, scale_factor=max(h, w) / 1024.0, apply_layout=False, readback_metrics=False, cam_xyz=cam_xyz
+        )
+        _assert_mostly_close(cpu, self.gpu._readback_downsampled(tex), atol=2e-2, rtol=2e-2, max_violation_frac=0.01)
+
 
 class TestLabParity:
     """CPU vs GPU parity for the lab color/sharpening shader."""
@@ -574,6 +609,28 @@ class TestLabParity:
         s = replace(_make_base_settings(), lab=LabConfig(sharpen=0.8, sharpen_method="rl", sharpen_radius=1.2, sharpen_masking=0.7))
         self._run_and_compare_sharpen(s, scale=1.0)
 
+    def _auto_masking_both(self, settings: WorkspaceConfig) -> tuple:
+        from negpy.domain.interfaces import PipelineContext
+
+        h, w = self.img.shape[:2]
+        ctx = PipelineContext(original_size=(h, w), scale_factor=1.0, process_mode=settings.process.process_mode)
+        cpu = self.cpu.process(self.img, settings, "parity_auto_masking", context=ctx)
+        tex, gpu_metrics = self.gpu.process_to_texture(self.img, settings, scale_factor=1.0, apply_layout=False, readback_metrics=True)
+        gpu = self.gpu._readback_downsampled(tex)
+        _assert_mostly_close(cpu, gpu, atol=5e-2, rtol=5e-2, max_violation_frac=0.001)
+        return ctx.metrics["auto_masking"], gpu_metrics["auto_masking"]
+
+    @pytest.mark.parametrize("method", ["usm", "rl"])
+    def test_sharpen_auto_masking(self, method):
+        lab = LabConfig(sharpen=0.8, sharpen_method=method, sharpen_auto_masking=True)
+        cpu_auto, gpu_auto = self._auto_masking_both(replace(_make_base_settings(), lab=lab))
+        assert gpu_auto == pytest.approx(cpu_auto, abs=0.01)
+        assert cpu_auto != LabConfig().sharpen_masking
+
+    def test_sharpen_auto_masking_offset(self):
+        lab = LabConfig(sharpen=0.8, sharpen_masking=0.3, sharpen_auto_masking=True)
+        self._auto_masking_both(replace(_make_base_settings(), lab=lab))
+
     def test_sharpen_rl_export_scale(self):
         s = replace(_make_base_settings(), lab=LabConfig(sharpen=0.8, sharpen_method="rl", sharpen_radius=1.0))
         self._run_and_compare_sharpen(s, scale=4.0)
@@ -585,6 +642,36 @@ class TestLabParity:
     def test_halation(self):
         s = replace(_make_base_settings(), lab=LabConfig(halation_strength=0.3))
         self._run_and_compare(s)
+
+
+@pytest.mark.skipif(not GPUDevice.get().is_available, reason="GPU not available")
+@pytest.mark.parametrize("mode", [ProcessMode.C41, ProcessMode.BW])
+@pytest.mark.parametrize("effect", ["glow_amount", "halation_strength"])
+def test_glow_and_halation_match_on_a_frame_they_span(mode, effect):
+    from negpy.services.rendering.image_processor import ImageProcessor
+
+    h, w = 800, 1200
+    neg = np.full((h, w, 3), 0.8, np.float32)
+    neg[300:500, 450:750] = 0.05
+    neg[100:140, 100:1100] = 0.3
+    base = WorkspaceConfig()
+    base = replace(
+        base,
+        process=replace(base.process, process_mode=mode),
+        exposure=replace(base.exposure, auto_exposure=False, auto_normalize_contrast=False),
+    )
+    processor = ImageProcessor()
+    out = {}
+    for strength in (0.0, 1.0):
+        settings = replace(base, lab=replace(LabConfig(), **{effect: strength}))
+        for gpu in (False, True):
+            res, _ = processor.run_pipeline(
+                neg.copy(), settings, f"{effect}{strength}{gpu}{mode}", render_size_ref=float(w), prefer_gpu=gpu, readback_metrics=False
+            )
+            arr = np.asarray(res.readback()) if hasattr(res, "readback") else np.asarray(res)
+            out[(strength, gpu)] = arr[..., :3].astype(np.float64)
+    assert np.abs(out[(1.0, False)] - out[(0.0, False)]).max() > 0.15
+    assert np.abs(out[(1.0, False)] - out[(1.0, True)]).max() < 0.04
 
 
 class TestToningParity:

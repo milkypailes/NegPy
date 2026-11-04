@@ -25,7 +25,7 @@ from negpy.domain.models import (
 from negpy.features.altprocess.models import AltProcess
 from negpy.features.process.capture_color import wb_only_cam_xyz
 from negpy.features.process.models import DemosaicMode, ProcessMode, invalidate_local_bounds
-from negpy.features.process.path import RenderPath, render_path
+from negpy.features.process.path import RenderPath, positive_decode, render_path
 from negpy.features.process.logic import (
     demosaic_token,
     effective_highlight_reconstruction,
@@ -172,8 +172,16 @@ def _grey_reencode_lut(working_color_space: Optional[str], bits: int) -> np.ndar
         gray = np.where(lin <= 0.0031308, lin * 12.92, 1.055 * np.power(lin, 1.0 / 2.4) - 0.055)
         out = np.clip(gray * 65535.0 + 0.5, 0.0, 65535.0).astype(np.uint16)
     if bits == 8:
-        out = np.clip(np.round(out.astype(np.float32) / 257.0), 0.0, 255.0).astype(np.uint8)
+        out = _u16_to_u8_lut()[out]
     out = np.ascontiguousarray(out)
+    out.setflags(write=False)
+    return out
+
+
+@lru_cache(maxsize=1)
+def _u16_to_u8_lut() -> np.ndarray:
+    """Round every uint16 code to the nearest uint8 code, as a table for negpy_core.lut_u16."""
+    out = np.clip(np.round(np.arange(65536, dtype=np.float32) / 257.0), 0.0, 255.0).astype(np.uint8)
     out.setflags(write=False)
     return out
 
@@ -354,7 +362,7 @@ def precorrect_key(
         shape,
         linear_raw_token(settings.process),
         demosaic_token(settings.process.demosaic_preview),
-        settings.process.positive_source,
+        positive_decode(settings.process),
         skip_flatfield,
         gain_slices,
         source_orientation,
@@ -1007,7 +1015,7 @@ class ImageProcessor:
         fast: bool = False,
         wb_override: Optional[Sequence[float]] = None,
         demosaic: str = DemosaicMode.AUTO,
-        positive_source: bool = False,
+        positive_decode: str = "",
         highlight_mode: int = 0,
         bake_camera_wb: bool = False,
         load_ir: bool = True,
@@ -1038,7 +1046,7 @@ class ImageProcessor:
 
         Returns (rgb_uint16, loader_metadata).
         """
-        ctx_mgr, metadata = loader_factory.get_loader(file_path, linear_raw=linear_raw, positive_source=positive_source, load_ir=load_ir)
+        ctx_mgr, metadata = loader_factory.get_loader(file_path, linear_raw=linear_raw, positive_decode=positive_decode, load_ir=load_ir)
         with ctx_mgr as raw:
             algo = get_best_demosaic_algorithm(raw, demosaic)
             # Read before postprocess: camera_whitebalance is sensor metadata, unaffected by it,
@@ -1104,6 +1112,7 @@ class ImageProcessor:
             mtime,
             lens_decode_token(metadata_lens_corrections(params), params.flatfield),
             effective_linear_raw(params.process),
+            positive_decode(params.process),
             effective_highlight_reconstruction(params.process),
             highlight_reconstruction_bakes_wb(params.process),
             rgbscan_token(params.rgbscan),
@@ -1192,7 +1201,7 @@ class ImageProcessor:
                     fast=fast_decode,
                     wb_override=_NEUTRAL_WB,
                     demosaic=demosaic,
-                    positive_source=params.process.positive_source,
+                    positive_decode=positive_decode(params.process),
                     highlight_mode=highlight_mode,
                 )
                 decoded = dict(
@@ -1204,7 +1213,7 @@ class ImageProcessor:
                                 linear_raw,
                                 wb_override=_NEUTRAL_WB,
                                 demosaic=demosaic,
-                                positive_source=params.process.positive_source,
+                                positive_decode=positive_decode(params.process),
                                 highlight_mode=highlight_mode,
                             )[0],
                             siblings,
@@ -1219,7 +1228,7 @@ class ImageProcessor:
                 fast=fast_decode,
                 wb_override=wb_override,
                 demosaic=demosaic,
-                positive_source=params.process.positive_source,
+                positive_decode=positive_decode(params.process),
                 highlight_mode=highlight_mode,
                 bake_camera_wb=bake_wb,
                 load_ir=params.retouch.ir_dust_remove,
@@ -1273,7 +1282,7 @@ class ImageProcessor:
                                 fast=fast_decode,
                                 wb_override=bracket_wb,
                                 demosaic=demosaic,
-                                positive_source=params.process.positive_source,
+                                positive_decode=positive_decode(params.process),
                                 highlight_mode=highlight_mode,
                             )[0],
                             hdr_siblings,
@@ -1472,8 +1481,9 @@ class ImageProcessor:
         crop_rect: Optional[tuple[float, float, float, float]] = None,
         gutter_thickness: float = 0.0,
         split_axis: str = "x",
-    ) -> Tuple[np.ndarray, str]:
-        """Full-res render of one frame; returns the float buffer and its color space."""
+    ) -> Tuple[np.ndarray, str, Optional[Tuple[int, int, int, int]]]:
+        """Full-res render of one frame; returns the float buffer, its color space and the
+        (x, y, w, h) the picture fills inside the mat."""
         f32_buffer, source_cs, export_token = self._prepare_export_source(
             file_path,
             params,
@@ -1509,6 +1519,10 @@ class ImageProcessor:
 
         if self._is_flat(params):
             prefer_gpu = False
+        # A resized export sharpens after the resize, so the radius is in exported pixels as it is
+        # in the preview's own pixels.
+        sharpen_after = self._sharpens_after_resize(params)
+        render_params = dc_replace(params, lab=dc_replace(params.lab, sharpen=0.0)) if sharpen_after else params
 
         if prefer_gpu and self.engine_gpu:
             # Mirrors run_pipeline's base_hash, so a multi-preset batch of one frame
@@ -1517,7 +1531,7 @@ class ImageProcessor:
             with timing.step("GPU"):
                 buffer, _gpu_metrics = self.engine_gpu.process(
                     f32_buffer,
-                    params,
+                    render_params,
                     scale_factor=export_scale,
                     bounds_override=bounds_override,
                     readback_metrics=False,
@@ -1530,7 +1544,7 @@ class ImageProcessor:
         else:
             buffer, _ = self.run_pipeline(
                 f32_buffer,
-                params,
+                render_params,
                 source_hash,
                 render_size_ref=float(APP_CONFIG.preview_render_size),
                 metrics=metrics or {"log_bounds": bounds_override} if bounds_override else metrics,
@@ -1552,27 +1566,31 @@ class ImageProcessor:
             self.engine_cpu.cache.clear()
             timing.lap("print layout")
 
-        buffer = self._sharpen_resized_content(buffer, content_rect, params)
-        timing.lap("output sharpen")
-        return buffer, color_space
+        if sharpen_after:
+            buffer = self._sharpen_resized_content(buffer, content_rect, params)
+            timing.lap("output sharpen")
+        return buffer, color_space, content_rect
 
+    @staticmethod
+    def _sharpens_after_resize(params: WorkspaceConfig) -> bool:
+        """A Print or Pixels export with Lab Sharpening on, or any with Auto Masking, which measures
+        the whole exported image where a tiled render sees one tile. Otherwise an Original-size
+        export and a flat master sharpen in the pipeline."""
+        return (
+            params.lab.sharpen > 0.0
+            and (params.export.export_resolution_mode != ExportResolutionMode.ORIGINAL.value or params.lab.sharpen_auto_masking)
+            and not ImageProcessor._is_flat(params)
+        )
+
+    @staticmethod
     def _sharpen_resized_content(
-        self, buffer: np.ndarray, content_rect: Optional[Tuple[int, int, int, int]], params: WorkspaceConfig
+        buffer: np.ndarray, content_rect: Optional[Tuple[int, int, int, int]], params: WorkspaceConfig
     ) -> np.ndarray:
-        """Export sharpening: runs once on the CPU for both engines, on the scaled content
-        inside the mat. An Original-size export and a flat master skip it."""
-        amount = float(params.export.output_sharpen)
-        if (
-            amount <= 0.0
-            or content_rect is None
-            or params.export.export_resolution_mode == ExportResolutionMode.ORIGINAL.value
-            or self._is_flat(params)
-        ):
-            return buffer
-        x, y, w, h = content_rect
+        """The Lab Sharpening on the scaled content inside the mat, on the CPU for both engines."""
+        x, y, w, h = content_rect or (0, 0, buffer.shape[1], buffer.shape[0])
         if not buffer.flags.writeable:
             buffer = buffer.copy()
-        buffer[y : y + h, x : x + w] = apply_resize_sharpening(buffer[y : y + h, x : x + w], amount)
+        buffer[y : y + h, x : x + w] = apply_resize_sharpening(buffer[y : y + h, x : x + w], params.lab)
         return buffer
 
     def render_export(
@@ -1617,6 +1635,54 @@ class ImageProcessor:
         logger.info("export-timing render %s | %s", timing.summary(times), os.path.basename(file_path))
         return result
 
+    def render_export_view(
+        self,
+        file_path: str,
+        params: WorkspaceConfig,
+        export_settings,
+        source_hash: str,
+        prefer_gpu: bool = True,
+        bounds_override: Optional[Any] = None,
+        half: int = 0,
+        split_x: float = 0.5,
+        crop_rect: Optional[tuple[float, float, float, float]] = None,
+        gutter_thickness: float = 0.0,
+        split_axis: str = "x",
+        diptych: Optional[Tuple[WorkspaceConfig, WorkspaceConfig]] = None,
+    ) -> Tuple[np.ndarray, Optional[Tuple[int, int, int, int]]]:
+        """The export render of one frame, still in the working space, and the rect its picture
+        fills inside the mat (None for a diptych). Raises on failure."""
+        if diptych is not None:
+            buffer, status = self.render_export(
+                file_path,
+                params,
+                export_settings,
+                source_hash,
+                prefer_gpu=prefer_gpu,
+                split_x=split_x,
+                crop_rect=crop_rect,
+                gutter_thickness=gutter_thickness,
+                split_axis=split_axis,
+                diptych=diptych,
+            )
+            if buffer is None:
+                raise RuntimeError(status)
+            return buffer, None
+        buffer, _, content_rect = self._render_export_buffer(
+            file_path,
+            params,
+            export_settings,
+            source_hash,
+            prefer_gpu=prefer_gpu,
+            bounds_override=bounds_override,
+            half=half,
+            split_x=split_x,
+            crop_rect=crop_rect,
+            gutter_thickness=gutter_thickness,
+            split_axis=split_axis,
+        )
+        return buffer, content_rect
+
     def _render_export(
         self,
         file_path: str,
@@ -1652,11 +1718,11 @@ class ImageProcessor:
                     )
                     for n, cfg in ((1, diptych[0]), (2, diptych[1]))
                 ]
-                (left, color_space), (right, _) = rendered
+                (left, color_space, _), (right, _, _) = rendered
                 along = 1 if split_axis == "x" else 0
                 buffer = join_halves(left, right, gap_px(left.shape[along], right.shape[along], gutter_thickness), axis=split_axis)
             else:
-                buffer, color_space = self._render_export_buffer(
+                buffer, color_space, _ = self._render_export_buffer(
                     file_path,
                     params,
                     export_settings,
@@ -1872,6 +1938,26 @@ class ImageProcessor:
             return self._apply_color_management_u16(float_to_uint16(buffer), working_color_space, color_space, icc_output, icc_input)
         if is_greyscale:
             return self._greyscale_to_u8(buffer, working_color_space, color_space, icc_output, icc_input)
+        if not self._has_custom_icc(icc_input, icc_output) and working_color_space == color_space:
+            return float_to_uint8(buffer), self._get_target_icc_bytes(color_space, None)
+        # Convert at 16 bits and round to 8 once: near the destination gamut edge, one 8-bit
+        # source step moves a near-zero destination channel by many codes. The 8-bit PIL
+        # transform is the fallback when the CMS codec cannot load or refuses the profiles.
+        src_bytes = self._get_target_icc_bytes(working_color_space, icc_input)
+        dst_bytes = self._get_target_icc_bytes(color_space, icc_output)
+        if src_bytes and dst_bytes:
+            img16 = float_to_uint16(buffer)
+            out16 = apply_matrix_trc_u16(img16, src_bytes, dst_bytes)
+            if out16 is None:
+                try:
+                    out16 = _cms_transform_strips(np.ascontiguousarray(img16), src_bytes, dst_bytes)
+                except ImportError as e:
+                    self._log_cms_codec_dlopen_error()
+                    logger.warning(f"imagecodecs CMS codec unavailable on this build ({e}); using the 8-bit transform")
+                except Exception as e:
+                    logger.warning(f"16-bit CMS transform failed ({e}); using the 8-bit transform")
+            if out16 is not None:
+                return negpy_core.lut_u16(out16, _u16_to_u8_lut()), dst_bytes
         return self.apply_color_management(float_to_uint8(buffer), working_color_space, color_space, icc_output, icc_input)
 
     def render_display_array(
@@ -2204,7 +2290,7 @@ class ImageProcessor:
                 return img_u16, self._get_target_icc_bytes(color_space, output_icc_path)
 
             # Matrix/TRC pairs take the exact kernel: lcms resamples a 16-bit transform to a
-            # grid, off by up to 8% near the destination gamut edge. LUT profiles keep lcms.
+            # grid, which drifts near the destination gamut edge. LUT profiles keep lcms.
             if img_u16.ndim == 3:
                 fast = apply_matrix_trc_u16(img_u16, src_bytes, dst_bytes)
                 if fast is not None:

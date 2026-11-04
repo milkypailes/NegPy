@@ -20,9 +20,11 @@ from negpy.features.exposure.papers import PAPER_PROFILES
 from negpy.features.geometry.models import with_auto_crop_field
 from negpy.features.metadata.capture import place_summary
 from negpy.features.metadata.models import GEAR_FIELDS, PROCESS_FIELDS, PUSH_PULL_LABELS, SCANNING_FIELDS
-from negpy.features.process.models import invalidate_local_bounds, with_film_fields
+from negpy.features.process.logic import VALID_HIGHLIGHT_LEVELS
+from negpy.features.process.models import SOURCE_ENCODING_LABELS, SourceEncoding, invalidate_local_bounds, with_film_fields
 from negpy.services.assets.flatfield import FlatFieldProfiles
 from negpy.services.assets.presets import preset_fields
+from negpy.services.assets.rolls import card_fields
 
 
 class SettingRow:
@@ -80,6 +82,10 @@ def _row(label, section, *fields, channels="", fmt=None, sticky=False) -> Settin
     return SettingRow(label, section, tuple(fields), channels, fmt, sticky)
 
 
+def _fmt_source_encoding(values: tuple) -> str:
+    return tr(SOURCE_ENCODING_LABELS[SourceEncoding(values[0])])
+
+
 def _fmt_print_stock(values: tuple) -> str:
     profile = PAPER_PROFILES.get(values[0])
     return profile.label if profile else str(values[0])
@@ -114,11 +120,37 @@ def _fmt_flatfield(values: tuple) -> str:
     return profile.name if profile else _fmt_scalar(True)
 
 
+def _fmt_white_balance(values: tuple) -> str:
+    return tr("Linear RAW") if values[0] else tr("Camera WB")
+
+
+# Highlight Recovery's choices: rawpy's HighlightMode collapsed to three, Reconstruct pinned
+# to libraw's own default level.
+HIGHLIGHT_LEVELS = (
+    (0, tr("Off")),
+    (2, tr("Blend")),
+    (5, tr("Reconstruct")),
+)
+
+
+def highlight_bucket(level: int) -> int:
+    """The HIGHLIGHT_LEVELS entry a stored level shows under. Any other valid level (3-9) is a
+    Reconstruct level. An invalid one is Off, as effective_highlight_reconstruction decodes it."""
+    if level not in VALID_HIGHLIGHT_LEVELS or level == 0:
+        return 0
+    return 1 if level == 2 else 2
+
+
+def _fmt_highlights(values: tuple) -> str:
+    return HIGHLIGHT_LEVELS[highlight_bucket(values[0])][1]
+
+
 # fmt: off
 CATALOG: list[tuple[str, tuple[SettingRow, ...]]] = [
     (mark("Setup"), (
         _row(mark("Film Mode"), "process", "process_mode", sticky=True),
         _row(mark("Positive"), "process", "positive_source", sticky=True),
+        _row(mark("Encoding"), "process", "source_encoding", sticky=True, fmt=_fmt_source_encoding),
     )),
     (mark("Metering"), (
         _row(mark("Analysis Buffer"), "process", "analysis_buffer", sticky=True),
@@ -136,12 +168,19 @@ CATALOG: list[tuple[str, tuple[SettingRow, ...]]] = [
         _row(mark("Use Average Cast"), "process", "use_cast_average", "locked_neutral_axis", fmt=lambda v: _fmt_scalar(v[0])),
     )),
     (mark("Calibration"), (
-        # Strength, profile and the baked matrix copy atomically: strength alone would leave the
-        # target on a stale or None matrix.
-        _row(mark("Crosstalk"), "process", "crosstalk_strength", "crosstalk_profile", "crosstalk_matrix", fmt=lambda v: _fmt_scalar(v[0]), sticky=True),
+        # Strength, profile, the baked matrix and the process it was baked for copy atomically:
+        # strength alone would leave the target on a stale or None matrix.
+        _row(mark("Crosstalk"), "process", "crosstalk_strength", "crosstalk_profile", "crosstalk_matrix", "crosstalk_process", fmt=lambda v: _fmt_scalar(v[0]), sticky=True),
+        _row(mark("Fade Restoration"), "process", "fade_ratio_r", "fade_ratio_g", "fade_ratio_b", "fade_white_anchor", "fade_white_r", "fade_white_g", "fade_white_b", fmt=lambda v: _fmt_scalar(v[0])),
         _row(mark("Sensor Crosstalk Profile"), "process", "sensor_profile", "sensor_matrix", "sensor_unmix", fmt=lambda v: _fmt_scalar(v[0]), sticky=True),
         # Absent from BOUNDS_INPUT_FIELDS: it acts after inversion, so it never feeds the meters.
         _row(mark("Hue Trim"), "process", "hue_trim", sticky=True),
+    )),
+    (mark("Raw Decode"), (
+        _row(mark("White Balance"), "process", "linear_raw", fmt=_fmt_white_balance),
+        _row(mark("Demosaic Preview"), "process", "demosaic_preview"),
+        _row(mark("Demosaic Export"), "process", "demosaic_export"),
+        _row(mark("Highlight Recovery"), "process", "highlight_reconstruction", fmt=_fmt_highlights),
     )),
     (mark("Crop"), (
         _row(mark("Auto Crop"), "geometry", "crop_from_auto", sticky=True),
@@ -251,6 +290,7 @@ CATALOG: list[tuple[str, tuple[SettingRow, ...]]] = [
         _row(mark("Sharpen Method"), "lab", "sharpen_method", sticky=True),
         _row(mark("Sharpen Radius"), "lab", "sharpen_radius", sticky=True),
         _row(mark("Sharpen Masking"), "lab", "sharpen_masking", sticky=True),
+        _row(mark("Auto Masking"), "lab", "sharpen_auto_masking", sticky=True),
         _row(mark("Chroma Denoise"), "lab", "chroma_denoise", sticky=True),
         _row(mark("Glow"), "lab", "glow_amount", sticky=True),
         _row(mark("Halation"), "lab", "halation_strength", sticky=True),
@@ -349,7 +389,6 @@ CATALOG: list[tuple[str, tuple[SettingRow, ...]]] = [
         _row(mark("DPI"), "export", "export_dpi", sticky=True),
         _row(mark("Target Edge"), "export", "export_target_edge", sticky=True),
         _row(mark("Target Size"), "export", "export_target_edge_px", sticky=True),
-        _row(mark("Output Sharpening"), "export", "output_sharpen", sticky=True),
         _row(mark("Export Profile"), "export", "export_color_space", sticky=True),
         _row(mark("Filename Pattern"), "export", "filename_pattern", sticky=True),
         _row(mark("Overwrite Existing Files"), "export", "overwrite", sticky=True),
@@ -377,9 +416,21 @@ BOUNDS_INPUT_FIELDS = frozenset(
         "crosstalk_strength",
         "crosstalk_profile",
         "crosstalk_matrix",
+        "fade_ratio_r",
+        "fade_ratio_g",
+        "fade_ratio_b",
+        "fade_white_anchor",
+        "fade_white_r",
+        "fade_white_g",
+        "fade_white_b",
         "sensor_profile",
         "sensor_matrix",
         "sensor_unmix",
+        # Each changes the decoded preview the meters read.
+        "linear_raw",
+        "source_encoding",
+        "highlight_reconstruction",
+        "demosaic_preview",
         "crop_from_auto",
         "autocrop_offset",
         "autocrop_rebate_trim",
@@ -434,13 +485,6 @@ _UNLISTED_CARD = {
     "metadata": mark("Metadata"),
     "export": mark("Export"),
 }
-_UNLISTED_FIELD_CARD = {
-    "linear_raw": mark("Raw Decode"),
-    "demosaic_preview": mark("Raw Decode"),
-    "demosaic_export": mark("Raw Decode"),
-    "highlight_reconstruction": mark("Raw Decode"),
-    "crosstalk_process": mark("Calibration"),
-}
 
 
 def changed_settings(prev: WorkspaceConfig, config: WorkspaceConfig) -> list[tuple[str, str]]:
@@ -459,7 +503,7 @@ def changed_settings(prev: WorkspaceConfig, config: WorkspaceConfig) -> list[tup
         for f in dataclass_fields(after):
             key = (section, f.name)
             if key not in _LISTED and key not in _MEASURED and getattr(before, f.name) != getattr(after, f.name):
-                changed.append((_UNLISTED_FIELD_CARD.get(f.name) or _UNLISTED_CARD.get(section, section), ""))
+                changed.append((_UNLISTED_CARD.get(section, section), ""))
     return changed
 
 
@@ -592,6 +636,11 @@ FRAME_CARD_FIELDS: dict[str, tuple | None] = {
     "retouch": None,
     "finish": None,
 }
+
+
+def roll_card_rows(*card_keys: str) -> list[SettingRow]:
+    """The catalog rows of one or more Roll-tab cards (ROLL_DEFAULT_FIELDS keys)."""
+    return rows_for_fields(f for card in card_keys for f in card_fields(card))
 
 
 def frame_card_rows(card_key: str) -> list[SettingRow]:

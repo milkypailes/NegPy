@@ -31,8 +31,10 @@ from negpy.desktop.sticky import (
 from negpy.desktop.view.canvas.crop_guides import CropGuide
 from negpy.domain.models import PROOF_INTENT_LABELS, ExportPreset, ProofIntent, WorkspaceConfig
 from negpy.features.exposure.models import apply_targets
+from negpy.features.process.capture_color import is_source_profile
 from negpy.features.geometry.logic import flip_geometry_and_analysis, has_manual_crop, rotate_geometry_and_analysis
 from negpy.features.process.models import invalidate_local_bounds, mode_aware_exposure_reset, with_process_mode
+from negpy.infrastructure.loaders.source_kind import with_scanner_positive_default
 from negpy.features.rgbscan.models import RgbScanConfig, is_rgb_triplet
 from negpy.features.hdr.logic import resolve_anchor, seed_shadow_density
 from negpy.features.hdr.models import ANCHOR_EV_UNSET, HdrConfig, hdr_frame_paths
@@ -43,7 +45,7 @@ from negpy.infrastructure.storage.repository import StorageRepository
 from negpy.kernel.system.config import APP_CONFIG, DEFAULT_WORKSPACE_CONFIG
 from negpy.kernel.system.text import count_of
 from negpy.services.assets.composites import remember_composites
-from negpy.services.assets.triplets import remember_triplets
+from negpy.services.assets.triplets import remember_triplets, triplet_record
 from negpy.services.assets.flatfield import FlatFieldProfiles
 from negpy.services.assets import rolls
 from negpy.services.assets import semantic_model
@@ -72,11 +74,15 @@ class ToolMode(Enum):
     KEYSTONE_LINES = auto()
     ZONE_PLACE = auto()
     FILM_BASE = auto()
+    DMIN_PICK = auto()
+    DMAX_PICK = auto()
 
 
 # These tools' renders carry crop_preview_full, which skips the crop, the border and the filed carrier.
 # Film Base shows the whole scan too: the rebate it reads lies outside the crop.
-UNCROPPED_PREVIEW_TOOLS = frozenset({ToolMode.CROP_MANUAL, ToolMode.ANALYSIS_DRAW, ToolMode.KEYSTONE_LINES, ToolMode.FILM_BASE})
+UNCROPPED_PREVIEW_TOOLS = frozenset(
+    {ToolMode.CROP_MANUAL, ToolMode.ANALYSIS_DRAW, ToolMode.KEYSTONE_LINES, ToolMode.FILM_BASE, ToolMode.DMIN_PICK, ToolMode.DMAX_PICK}
+)
 # Esc puts back what these changed since they opened: each adjusts one thing as often as it likes.
 REVERTIBLE_TOOLS = frozenset({ToolMode.CROP_MANUAL, ToolMode.ANALYSIS_DRAW})
 
@@ -127,8 +133,10 @@ class AppState:
     found_scenes: List[Dict[str, Any]] = field(default_factory=list)
     # The roll (negpy.services.assets.rolls) the loaded frames came from, if any -- a
     # plain Add Files pick or a clear leaves this None. Files appended while it is set
-    # join that roll's membership so reopening it later still shows them.
+    # join it when it is a virtual roll; a folder roll holds only its folder's files.
     active_roll_id: Optional[str] = None
+    # Half Frame for frames in no roll: this session's choice, saved with it, cleared by Unload All.
+    half_frame_loose: bool = False
     active_adjustment_idx: int = 0
     last_metrics: Dict[str, Any] = field(default_factory=dict)
     metrics_lock: threading.Lock = field(default_factory=threading.Lock, init=False, compare=False, repr=False)
@@ -136,7 +144,8 @@ class AppState:
     auto_meters: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     preview_raw: Optional[Any] = None
     # Decoder XYZ->camera matrix for preview_raw. Only the transparency transfer reads it.
-    # None for sources that carry no camera matrix (scanner TIFF, JPEG).
+    # None for sources that carry no camera matrix (scanner TIFF, JPEG). A Positive decode carries
+    # its profile's primaries here instead (source_cam_xyz), so a camera is camera_raw_preview().
     preview_cam_xyz: Optional[list] = None
     preview_camera_wb: Optional[list] = None
     # EXIF orientation the decode baked into preview_raw; the flat-field gain takes it.
@@ -255,7 +264,7 @@ class AppState:
     grain_focuser: bool = False
     # Densitometer reading in a chip beside the pointer. A persisted preference.
     cursor_probe: bool = False
-    # Canvas corner pills: 0 off, 1 basic, 2 full (hud.INFO_*). A persisted preference.
+    # Canvas strip frame info: 0 off, 1 basic, 2 full (hud.INFO_*). A persisted preference.
     canvas_info_level: int = 1
 
     # Printing notes: the dodge/burn map and print recipe over the frame. Display-only and
@@ -345,12 +354,22 @@ class AppState:
     flat_peek: bool = False
     # Transient: preview is showing the decoded source as loaded, un-inverted.
     negative_peek: bool = False
+    # Transient: preview is printing the frame on the roll average, with average_peek_axes on.
+    average_peek: bool = False
+    average_peek_axes: dict = field(default_factory=dict)
+    # "roll" while a scene frame peeks at the roll's average instead of its scene's.
+    average_peek_scope: Optional[str] = None
     # Transient: preview is showing the camera's own embedded preview, as a reference.
     embedded_peek: bool = False
     # Transient: preview is showing the selected Flat Field profile's self-check.
     flatfield_peek: bool = False
     # Transient: preview is showing the unhealed source under the placed-heal markers.
     heal_bypass: bool = False
+    # Transient: preview is showing the frame as it exports, at the export size.
+    export_size_view: bool = False
+    # The open frame's export render for the current edit, for Export Size and the loupe:
+    # {"key", "buffer", "content_rect"}. None while it renders or nothing asks for it.
+    export_view: Optional[Dict[str, Any]] = None
     # A painted peek's canvas keys (negative, embedded, Check Flat Field), apart from last_metrics,
     # which holds the print. Stays until the print is painted again, not until the peek flag drops.
     peek_frame: Optional[Dict[str, Any]] = None
@@ -401,6 +420,11 @@ class AppState:
         return self.last_metrics.get(key, default)
 
 
+def camera_raw_preview(state: Any) -> bool:
+    """The open frame carries a camera's matrix, not a Positive decode's source primaries."""
+    return state.preview_cam_xyz is not None and not is_source_profile(state.preview_cam_xyz)
+
+
 def _asset_key(asset: Dict[str, Any]) -> tuple:
     """A file's stable identity: its content hash, plus which half for a half-frame pair
     sharing that hash. Survives `uploaded_files` gaining or losing rows, unlike its position."""
@@ -439,11 +463,32 @@ def composite_kind(asset: Dict[str, Any]) -> str:
     return ""
 
 
+def can_edit_triplet(asset: Dict[str, Any]) -> bool:
+    """Edit Trichrome rebuilds a plain frame or a triplet; it would drop a composite's parts or a half's split."""
+    return composite_kind(asset) in ("", "rgb") and not asset.get("half")
+
+
+def is_plain_triplet(asset: Dict[str, Any]) -> bool:
+    return composite_kind(asset) == "rgb" and not asset.get("half")
+
+
+def trichrome_merge_indices(files: List[Dict[str, Any]], indices: Collection[int]) -> List[int]:
+    """The selection Merge Exposures (Trichrome) joins: three plain frames of three files, else []."""
+    picked = sorted({i for i in indices if 0 <= i < len(files)})
+    if len(picked) != 3 or any(composite_kind(files[i]) for i in picked):
+        return []
+    return picked if len({files[i]["path"] for i in picked}) == 3 else []
+
+
+#: Part rows a stitch tooltip lists before it folds the rest into "+N more".
+STITCH_TOOLTIP_PARTS = 8
+
+
 def composite_summary(asset: Dict[str, Any]) -> str:
-    """One tooltip line naming what a frame is built from. Empty for a plain frame."""
+    """Tooltip text naming what a frame is built from. Empty for a plain frame."""
     kind = composite_kind(asset)
     if kind == "stitch":
-        return tr("Stitched composite of {value}", value=count_of(len(asset["stitch_paths"]) + 1, "frame"))
+        return _stitch_summary(asset)
     if kind == "hdr":
         return tr("HDR merge of {value}", value=count_of(len(hdr_frame_paths(asset)), "exposure"))
     if kind == "rgb":
@@ -453,6 +498,21 @@ def composite_summary(asset: Dict[str, Any]) -> str:
     if kind == "diptych":
         return tr("Diptych: both halves, each with its own edit")
     return ""
+
+
+def _stitch_summary(asset: Dict[str, Any]) -> str:
+    """The part count, then one file name per part. A Trichrome part shows by its red file only."""
+    parts = [asset["path"], *asset["stitch_paths"]]
+    count = count_of(len(parts), "frame")
+    if any(green and blue for green, blue in asset.get("stitch_triplets") or ()):
+        header = tr("Stitched composite of {value} (Trichrome)", value=count)
+    else:
+        header = tr("Stitched composite of {value}", value=count)
+    shown = parts if len(parts) <= STITCH_TOOLTIP_PARTS else parts[: STITCH_TOOLTIP_PARTS - 1]
+    lines = [header, *(f"  {os.path.basename(p)}" for p in shown)]
+    if len(shown) < len(parts):
+        lines.append("  " + tr("+{value} more", value=len(parts) - len(shown)))
+    return "\n".join(lines)
 
 
 class AssetListModel(QAbstractListModel):
@@ -871,6 +931,7 @@ class DesktopSessionManager(QObject):
     history_changed = pyqtSignal()  # Emitted when undo/redo/persist happens
     work_prints_changed = pyqtSignal()  # A named version was saved, renamed or deleted
     settings_saved = pyqtSignal()
+    frame_previews_ending = pyqtSignal()  # The live config is about to become a stored edit: a preview a tool owns ends here
     active_file_changing = pyqtSignal()  # Outgoing file about to be replaced — last chance to snapshot it
     settings_copied = pyqtSignal()
     settings_pasted = pyqtSignal()
@@ -1362,16 +1423,29 @@ class DesktopSessionManager(QObject):
 
         Keyed on the unforked hash: a lock is about this physical frame's relationship
         to the roll, and must survive forking or unforking its edit identity.
-        A *fresh* frame, one with no saved edit, also takes the roll's frame seed.
+        A *fresh* frame, one with no saved edit, also takes the roll's frame seed. A frame in
+        no roll has no roll baseline to average, so an average it does not already ride is off.
         """
         roll_id = rolls.frame_roll(self.repo, self.state.active_roll_id, asset)
         if roll_id is None:
-            return config
+            return self._without_unbaselined_averages(config)
         if fresh and (seed := rolls.frame_seed(self.repo, roll_id)):
             config = with_frame_seed(config, seed)
         file_hash = unforked_hash(asset["hash"])
         config = rolls.resolve_roll_config(self.repo, roll_id, file_hash, config)
         return rolls.resolve_roll_baseline(self.repo, roll_id, file_hash, config)
+
+    @staticmethod
+    def _without_unbaselined_averages(config: WorkspaceConfig) -> WorkspaceConfig:
+        """Use Average off where nothing saved backs it: Luma and Color without a baseline, Cast
+        without a neutral axis. The render ignores such an average, so no pixel changes."""
+        proc = config.process
+        off = {}
+        if not proc.is_locked_initialized:
+            off.update({k: False for k in ("use_luma_average", "use_color_average") if getattr(proc, k)})
+        if proc.use_cast_average and proc.locked_neutral_axis is None:
+            off["use_cast_average"] = False
+        return replace(config, process=replace(proc, **off)) if off else config
 
     def load_edit_from_sidecar(self, path: str) -> bool:
         """Replace the active frame's edit with the sidecar at *path*, as an undoable
@@ -1410,7 +1484,13 @@ class DesktopSessionManager(QObject):
         # Not a bare WorkspaceConfig(): only this config holds the shipped autocrop fields, and the
         # print/transfer curves are an identity at it (transfer_grade_ref, test_transparency_transfer.py).
         config = self._overlay_roll_defaults(self._apply_sticky_settings(DEFAULT_WORKSPACE_CONFIG, only_global=False), asset, fresh=True)
-        return self._asset_defaults(config, asset)
+        config = self._asset_defaults(config, asset)
+        return config if self._roll_sets_positive(asset) else with_scanner_positive_default(config, asset["path"])
+
+    def _roll_sets_positive(self, asset: dict) -> bool:
+        """The frame's roll holds a Positive value on its Film card, which beats the scanner default."""
+        roll_id = rolls.frame_roll(self.repo, self.state.active_roll_id, asset)
+        return roll_id is not None and "positive_source" in rolls.roll_defaults(self.repo, roll_id)
 
     def config_for_asset(self, asset: dict) -> WorkspaceConfig:
         """Return an asset's hydrated config without changing the active session state.
@@ -1450,6 +1530,7 @@ class DesktopSessionManager(QObject):
         if 0 <= index < len(self.state.uploaded_files):
             # Save current before switching, but only if user actually made explicit edits
             if self.state.current_file_hash:
+                self.end_frame_previews()
                 self._commit_preview()
                 if self._config_dirty:
                     self.repo.save_file_settings(
@@ -1541,9 +1622,44 @@ class DesktopSessionManager(QObject):
                 else:
                     f.pop(key, None)
 
+    def _stamp_averages(self, hashes: Optional[Collection[str]] = None) -> bool:
+        """Marks each loaded frame (or each of *hashes*) that uses the roll average, ``average`` "on"
+        or "outlier", for the Film Strip. True when a mark changed."""
+        files = [f for f in self.state.uploaded_files if hashes is None or f["hash"] in hashes]
+        saved = self.repo.load_file_settings_many([f["hash"] for f in files])
+        # A frame with no saved edit rides an average only through the roll's Use Average default.
+        defaults = rolls.roll_defaults(self.repo, self.state.active_roll_id) if self.state.active_roll_id else {}
+        unsaved_rides = any(rolls.config_value(defaults[k]) for k in rolls.card_fields("baseline") if k in defaults)
+        changed = False
+        for f in files:
+            if f["hash"] == self.state.current_file_hash:
+                process = self.state.config.process
+            elif f["hash"] in saved:
+                process = saved[f["hash"]].process
+            elif unsaved_rides:
+                process = self.config_for_asset(f).process
+            else:
+                process = None
+            mark = None
+            if process is not None and (process.use_luma_average or process.use_color_average or process.use_cast_average):
+                mark = "outlier" if rolls.frame_is_outlier(self.repo, process, f["hash"]) else "on"
+            if mark != f.get("average"):
+                changed = True
+                if mark:
+                    f["average"] = mark
+                else:
+                    f.pop("average", None)
+        return changed
+
+    def refresh_average_marks(self, hashes: Optional[Collection[str]] = None) -> None:
+        if self._stamp_averages(hashes):
+            self.asset_model.refresh()
+            self.files_changed.emit()
+
     def refresh_scene_marks(self) -> None:
         """Re-reads the active roll's scenes onto the loaded frames after a scene edit."""
         self._stamp_scenes()
+        self._stamp_averages()
         self.asset_model.refresh()
         self.files_changed.emit()
 
@@ -1701,7 +1817,12 @@ class DesktopSessionManager(QObject):
             # even when the multi-selection was built without it (a Ctrl-toggle range).
             indices = set(self.state.selected_indices)
             indices.add(self.state.selected_file_idx)
-            target_indices = sorted(indices)
+            # Number visible, selected frames in Film Strip display order; a selected
+            # frame a filter hid stays a target, after the visible ones, in index order.
+            visible = self.asset_model.visible_actual_indices_ordered()
+            visible_set = set(visible)
+            target_indices = [i for i in visible if i in indices]
+            target_indices += sorted(i for i in indices if i not in visible_set)
         if skip_rejected:
             target_indices = [
                 i for i in target_indices if 0 <= i < len(self.state.uploaded_files) and not self.state.uploaded_files[i].get("excluded")
@@ -1910,9 +2031,23 @@ class DesktopSessionManager(QObject):
             if self.state.current_file_hash:
                 self.repo.save_file_settings(self.state.current_file_hash, config, file_path=self.state.current_file_path or "")
                 self.settings_saved.emit()
+                self.refresh_average_marks({self.state.current_file_hash})
 
         if render:
             self.state_changed.emit()
+
+    def end_frame_previews(self) -> None:
+        """Call before the active frame is left or its live config is copied to another edit row,
+        so a tool that previews on the frame takes its preview back first."""
+        self.frame_previews_ending.emit()
+
+    def discard_preview(self) -> bool:
+        """Return the active frame to its config before its unsaved preview. False when there is none."""
+        if self._preview_history is None or self._preview_history[0] != self.state.current_file_hash:
+            return False
+        self.state.config = self._preview_history[1]
+        self._preview_history = None
+        return True
 
     def _commit_preview(self) -> None:
         if self._preview_history is not None:
@@ -2247,14 +2382,19 @@ class DesktopSessionManager(QObject):
         paths = [f["path"] for f in self.state.uploaded_files]
         self.repo.save_global_setting("session_files", paths)
         self.repo.save_global_setting("session_active_path", self.state.current_file_path)
+        self.repo.save_global_setting("session_active_roll", self.state.active_roll_id or "")
         # RGB-scan triplets keep their green and blue exposures here so restore can rebuild the
-        # merged asset. Re-discovery from the red path alone cannot regroup it.
+        # merged asset. Re-discovery from the red path alone cannot regroup it. A composite's pair
+        # carries no member hashes: its own hash is not the red file's, and would refuse the restore.
         triplets = {
             f["path"]: [f["green_path"], f["blue_path"], bool(f.get("align", True))]
+            if f.get("stitch_paths") or f.get("hdr_paths")
+            else triplet_record(f)
             for f in self.state.uploaded_files
             if f.get("green_path") and f.get("blue_path")
         }
         self.repo.save_global_setting("session_triplets", triplets)
+        self.repo.save_global_setting("session_half_frame", self.state.half_frame_loose)
         # Stitch and HDR membership is not part of the manifest: a composite outlives the
         # file list it was made in, so it is upserted into its own store instead.
         remember_composites(self.repo, self.state.uploaded_files)
@@ -2323,6 +2463,7 @@ class DesktopSessionManager(QObject):
             f["keeper"] = m == "keeper"
             f["excluded"] = m == "excluded"
         self._stamp_scenes()
+        self._stamp_averages()
 
         self.asset_model.refresh()
         self.files_changed.emit()
@@ -2332,7 +2473,7 @@ class DesktopSessionManager(QObject):
         """Replace the source assets with the composite built from them (inserted at the
         first source's position), then open it.
 
-        Stitch parts and HDR bracket frames both land here. Source edits stay in the DB
+        Stitch parts, HDR bracket frames and triplet exposures all land here. Source edits stay in the DB
         under their own content hashes, so an unstitch or unmerge restores them intact.
         """
         valid = sorted({i for i in indices if 0 <= i < len(self.state.uploaded_files)})
@@ -2342,9 +2483,11 @@ class DesktopSessionManager(QObject):
         for i in reversed(valid):
             self._drop_thumbnail(self.state.uploaded_files.pop(i))
         marks = self.repo.load_file_marks()
-        m = marks.get(composite["hash"])
+        m = marks.get(unforked_hash(composite["hash"]))
         composite = {**composite, "keeper": m == "keeper", "excluded": m == "excluded"}
         self.state.uploaded_files.insert(pos, composite)
+        self._stamp_scenes()
+        self._stamp_averages([composite["hash"]])
         self.asset_model.refresh()
         self.files_changed.emit()
         self._persist_session()
@@ -2370,6 +2513,7 @@ class DesktopSessionManager(QObject):
             m = marks.get(unforked_hash(asset["hash"]))
             self.state.uploaded_files[i] = {**asset, "keeper": m == "keeper", "excluded": m == "excluded"}
         self._stamp_scenes()
+        self._stamp_averages()
         self.asset_model.refresh()
         self.files_changed.emit()
         self._persist_session()
@@ -2396,33 +2540,10 @@ class DesktopSessionManager(QObject):
         self.state.selected_file_idx = shifted(self.state.selected_file_idx)
         self.state.selected_indices = [shifted(i) for i in self.state.selected_indices]
         self._stamp_scenes()
+        self._stamp_averages()
         self.asset_model.refresh()
         self.files_changed.emit()
         self._persist_session()
-
-    def set_triplet(self, index: int, red_path: str, green_path: str, blue_path: str, align: bool = True) -> None:
-        """Reassign the R/G/B exposures of an RGB-scan asset, then reload it."""
-        import os
-
-        from negpy.kernel.image.logic import calculate_file_hash
-
-        if not (0 <= index < len(self.state.uploaded_files)):
-            return
-        name = os.path.splitext(os.path.basename(red_path))[0] + tr(" (RGB)")
-        self.state.uploaded_files[index] = {
-            "name": name,
-            "path": red_path,
-            "hash": calculate_file_hash(red_path),
-            "green_path": green_path,
-            "blue_path": blue_path,
-            "green_hash": calculate_file_hash(green_path),
-            "blue_hash": calculate_file_hash(blue_path),
-            "align": align,
-        }
-        self.asset_model.refresh()
-        self.files_changed.emit()
-        self._persist_session()
-        self.select_file(index)
 
     def _reset_active_image_state(self) -> None:
         """Clears everything tied to the previously displayed image after the session
@@ -2438,6 +2559,7 @@ class DesktopSessionManager(QObject):
         self.state.preview_detect = None
         self.state.preview_embedded = None
         self.state.peek_frame = None
+        self.state.export_view = None
         self.state.has_ir = False
         self.state.config = self._empty_session_config()
         self._config_dirty = False
@@ -2454,6 +2576,7 @@ class DesktopSessionManager(QObject):
         self.state.thumbnails.clear()
         self.state.rendered_thumbnails.clear()
         self.state.active_roll_id = None
+        self.state.half_frame_loose = False
         self.state.stale_thumbnails.clear()
         self.state.duplicate_paths.clear()
         self.state.embeddings.clear()

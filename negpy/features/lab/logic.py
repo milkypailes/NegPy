@@ -1,10 +1,12 @@
 import math
-from typing import Callable
+from typing import Callable, Optional
 
 import negpy_core
 import numpy as np
 
 from negpy.domain.types import ImageBuffer
+from negpy.features.lab.models import LabConfig, SharpenMethod
+from negpy.features.process.models import ProcessMode
 from negpy.kernel.image.logic import (
     WORKING_INV_GAMMA,
     WORKING_LAB,
@@ -93,27 +95,47 @@ def apply_usm_sharpening(img: ImageBuffer, amount: float, radius: float = 1.0, m
     return _map_row_blocks(img, lambda block: _usm_sharpening_block(block, amount, radius, masking), halo)
 
 
-# Blur sigma of the pass that follows an export resize, in exported pixels.
-RESIZE_SHARPEN_RADIUS = 0.7
+# Auto Masking: the masking that holds back the grain is this gain times the measured grain
+# gradient. sharpen_grain_pick.wgsl mirrors both.
+AUTO_MASKING_GAIN = 0.27
+NEUTRAL_MASKING = LabConfig().sharpen_masking
 
 
-def apply_resize_sharpening(encoded: np.ndarray, amount: float) -> np.ndarray:
+def auto_masking(img: ImageBuffer, config: LabConfig) -> Optional[float]:
+    """The masking Auto Masking picks for this buffer, or None when it is off. Without a measure it
+    picks the neutral masking."""
+    if not config.sharpen_auto_masking:
+        return None
+    lum = (np.float32(LUM_R), np.float32(LUM_G), np.float32(LUM_B))
+    grain = negpy_core.sharpen_grain(np.ascontiguousarray(img, dtype=np.float32), lum)
+    return NEUTRAL_MASKING if grain is None else min(AUTO_MASKING_GAIN * grain, 1.0)
+
+
+def effective_masking(config: LabConfig, auto: Optional[float]) -> float:
+    if auto is None:
+        return config.sharpen_masking
+    return min(max(auto + config.sharpen_masking - NEUTRAL_MASKING, 0.0), 1.0)
+
+
+def apply_lab_sharpening(img: ImageBuffer, config: LabConfig, auto: Optional[float] = None) -> ImageBuffer:
+    """The Lab Sharpening of `config` on linear working RGB, at this buffer's pixel scale. `auto`
+    is auto_masking of this buffer."""
+    sharpen = apply_rl_sharpening if config.sharpen_method == SharpenMethod.RL else apply_usm_sharpening
+    return sharpen(img, config.sharpen, radius=config.sharpen_radius, masking=effective_masking(config, auto))
+
+
+def apply_resize_sharpening(encoded: np.ndarray, config: LabConfig) -> np.ndarray:
     """
-    Unsharp mask on export content already scaled to its final size. Takes and
-    returns working-OETF code values; a channel after RGB passes through.
+    The Lab Sharpening on export content already scaled to its final size, so its radius is in
+    exported pixels. Takes and returns working-OETF code values; a channel after RGB passes through.
     """
-    if amount <= 0:
+    if config.sharpen <= 0:
         return encoded
-
-    def block(rows: np.ndarray) -> np.ndarray:
-        linear = working_oetf_decode(rows[..., :3])
-        sharpened = working_oetf_encode(_usm_sharpening_block(linear, amount, RESIZE_SHARPEN_RADIUS))
-        if rows.shape[2] == 3:
-            return sharpened
-        return np.concatenate([sharpened, rows[..., 3:]], axis=2)
-
-    halo = max(len(gaussian_kernel_1d(RESIZE_SHARPEN_RADIUS)) // 2, 2)
-    return _map_row_blocks(encoded, block, halo)
+    linear = working_oetf_decode(np.ascontiguousarray(encoded[..., :3]))
+    sharpened = working_oetf_encode(apply_lab_sharpening(linear, config, auto_masking(linear, config)))
+    if encoded.shape[2] == 3:
+        return sharpened
+    return np.concatenate([sharpened, encoded[..., 3:]], axis=2)
 
 
 def _usm_sharpening_block(
@@ -190,6 +212,11 @@ def _saturation_block(img: ImageBuffer, saturation: float, skin_protection: floa
 CHROMA_DENOISE_MIN_SIGMA = 0.25
 
 
+def chroma_denoise_radius(radius: float, process_mode: ProcessMode) -> float:
+    """B&W has no chroma to denoise, so the stage never runs there."""
+    return 0.0 if process_mode == ProcessMode.BW else radius
+
+
 def chroma_denoise_sigma(radius: float, scale_factor: float) -> float:
     """The low-pass sigma in render pixels for both engines; 0.0 when the stage does not run."""
     sigma = radius * scale_factor
@@ -209,35 +236,52 @@ def apply_chroma_denoise(img: ImageBuffer, radius: float, scale_factor: float = 
     return negpy_core.chroma_denoise(np.ascontiguousarray(img, dtype=np.float32), sigma, k, *WORKING_LAB)
 
 
-# Halation mask threshold in LINEAR reflectance: the regions the negative rendered dense,
-# near paper white on the print. Thresholding linear light keeps the halation footprint
-# fixed by scene exposure instead of moving with grade and density.
-HALATION_THRESHOLD_LINEAR = 0.65
+# Base-reflection bounces, (weight, sigma over HALATION_SIGMA). Mirrored in shaders/lab.wgsl.
+HALATION_SIGMA = 0.0027  # of the short side: 65 um on 35 mm
+HALATION_BOUNCES = ((4.0 / 7.0, 1.0), (2.0 / 7.0, math.sqrt(2.0)), (1.0 / 7.0, math.sqrt(3.0)))
+HALATION_AMOUNT_MAX = 0.2
+HALATION_TINT = (1.0, 0.3, 0.05)
 
 
-def apply_glow_and_halation(
-    img: ImageBuffer,
-    glow_amount: float,
-    halation_strength: float,
-    scale_factor: float = 1.0,
-) -> ImageBuffer:
-    """
-    Glow: all-channel Gaussian bloom of highlights (lens diffusion, a print-side
-    effect — its mask stays in the display domain).
-    Halation: red-dominant scatter of highlights (light reflecting off the film
-    base at capture — masked in linear light, composited additively: scattered
-    light is added exposure, not an opacity composite).
-    """
+def halation_amounts(strength: float, bw: bool) -> tuple[float, float, float]:
+    """Per-channel mix at a Halation value; neutral, same luminance, on B&W."""
+    r, g, b = (HALATION_AMOUNT_MAX * float(strength) * t for t in HALATION_TINT)
+    if bw:
+        y = r * LUM_R + g * LUM_G + b * LUM_B
+        return (y, y, y)
+    return (r, g, b)
+
+
+def halation_sigma_px(shape: tuple[int, ...]) -> float:
+    return HALATION_SIGMA * min(shape[:2])
+
+
+def halation_reach_px(shape: tuple[int, ...]) -> int:
+    return int(math.ceil(3.0 * HALATION_BOUNCES[-1][1] * halation_sigma_px(shape)))
+
+
+# Glow: a mist filter's scatter, Gaussian fit of spektrafilm's Black Pro-Mist halo and bloom
+# without its core, as (weight, sigma over the short side). Mirrored in shaders/lab.wgsl.
+GLOW_PSF = ((0.1104, 0.001582), (0.3559, 0.004122), (0.4014, 0.010181), (0.1323, 0.024798))
+GLOW_AMOUNT_MAX = 0.25
+GLOW_THRESHOLD = 0.5  # display-encoded luma where the highlights start to scatter
+
+
+def glow_reach_px(shape: tuple[int, ...]) -> int:
+    return int(math.ceil(3.0 * GLOW_PSF[-1][1] * min(shape[:2])))
+
+
+def apply_glow_and_halation(img: ImageBuffer, glow_amount: float, halation_strength: float, bw: bool = False) -> ImageBuffer:
+    """Glow spreads the highlights, halation all light, each I + a·(K*L − L), so a flat area keeps its value."""
     if glow_amount == 0.0 and halation_strength == 0.0:
         return img
 
     glow = halation = None
     if glow_amount > 0.0:
-        # Highlight mask in the display domain (keeps the 0.5 threshold); bloom is linear.
-        base_r = max(3, int(15 * scale_factor))
-        glow = (np.float32(glow_amount), min((base_r * 2 + 1) | 1, 201), base_r * 0.5, 0.5)
+        a = GLOW_AMOUNT_MAX * float(glow_amount)
+        glow = (((a, a, a), [(w, s * min(img.shape[:2])) for w, s in GLOW_PSF]), GLOW_THRESHOLD)
     if halation_strength > 0.0:
-        base_r = max(5, int(25 * scale_factor))
-        halation = (np.float32(halation_strength), min((base_r * 2 + 1) | 1, 301), base_r * 0.5, HALATION_THRESHOLD_LINEAR)
+        sigma = halation_sigma_px(img.shape)
+        halation = (halation_amounts(halation_strength, bw), [(w, k * sigma) for w, k in HALATION_BOUNCES])
     lum = (np.float32(LUM_R), np.float32(LUM_G), np.float32(LUM_B))
     return negpy_core.glow_and_halation(np.ascontiguousarray(img, dtype=np.float32), glow, halation, lum, WORKING_INV_GAMMA)

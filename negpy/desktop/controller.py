@@ -28,7 +28,10 @@ from negpy.desktop.session import (
     REVERTIBLE_TOOLS,
     UNCROPPED_PREVIEW_TOOLS,
     _source_effective_bounds,
+    can_edit_triplet,
     composite_kind,
+    is_plain_triplet,
+    trichrome_merge_indices,
     resolve_asset_hdr,
     resolve_asset_rgbscan,
     resolve_asset_stitch,
@@ -70,10 +73,12 @@ from negpy.desktop.workers.render import (
     ThumbnailWorker,
 )
 from negpy.desktop.workers.embedding import EmbeddingWorker
+from negpy.desktop.workers.export_view import ExportViewWorker
 from negpy.desktop.workers.scan_worker import BatchRequest, MeterRequest, PrescanRequest, RollPreviewRequest, ScanRequest, ScanWorker
 from negpy.desktop.workers.library import LibrarySearchTask, LibrarySearchWorker
 from negpy.desktop.workers.hdr import HdrTask, HdrWorker
 from negpy.desktop.workers.stitch import StitchTask, StitchWorker
+from negpy.desktop.workers.triplet_probe import TripletProbeWorker
 from negpy.desktop.workers.chart_fit import ChartSource
 from negpy.desktop.workers.frame_merge import FrameMergeTask, FrameMergeWorker
 from negpy.features.hdr.models import ANCHOR_EV_UNSET, hdr_frame_paths, hdr_hash, hdr_name
@@ -109,9 +114,22 @@ from negpy.domain.models import (
     preset_from_export_config,
     resolve_preset_export,
 )
-from negpy.services.assets.composites import forget_composite, rehome_composites, restore_maps, source_files
+from negpy.services.assets.composites import (
+    forget_composite,
+    frame_count,
+    part_paths,
+    rehome_composites,
+    restore_maps,
+    saved_composites,
+    source_files,
+)
 from negpy.services.assets.library import folder_label
-from negpy.services.assets.triplets import forget_triplets, rehome_triplets, saved_triplets
+from negpy.services.assets.triplets import (
+    applied_triplets,
+    forget_triplets,
+    rehome_triplets,
+    saved_triplets,
+)
 from negpy.services.assets import rolls
 from negpy.services.assets.sensor import SensorProfiles
 from negpy.services.export.contact_sheet_layout import ContactSheetSettings
@@ -137,7 +155,7 @@ from negpy.services.assets.half_frame import (
     saved_crop_rect,
     split_scans,
 )
-from negpy.services.export.templating import path_safe, render_export_filename
+from negpy.services.export.templating import render_export_filename
 from negpy.services.assets.sidecar import load_or_promote, promote_sidecars, sidecar_path_for, write_sidecar
 from negpy.services.assets.frame_merge import carry_edit, carry_sidecar
 from negpy.services.export.frame_merge import (
@@ -190,17 +208,20 @@ from negpy.features.geometry.processor import CropProcessor, GeometryProcessor
 from negpy.domain.interfaces import PipelineContext
 from negpy.features.lab.models import LabConfig
 from negpy.features.local.models import LocalAdjustmentsConfig
-from negpy.features.process.path import RenderPath, render_path
+from negpy.features.process.path import RenderPath, positive_decode, render_path
 from negpy.features.process.models import (
     SCAN_SETUP_PAPERS,
+    ProcessConfig,
     ProcessMode,
     invalidate_local_bounds,
     mode_aware_exposure_reset,
     scan_setup_values,
     with_film_fields,
+    with_source_encoding,
     with_positive_source,
     with_process_mode,
 )
+from negpy.infrastructure.loaders.source_kind import with_scanner_positive_default
 from negpy.desktop.settings_catalog import (
     BOUNDS_INPUT_FIELDS,
     FRAME_CARD_FIELDS,
@@ -218,7 +239,6 @@ from negpy.services.assets.thumbnail_fingerprint import (
     thumbnail_fingerprint,
 )
 from negpy.services.assets import semantic_model
-from negpy.kernel.system.paths import get_default_user_dir
 from negpy.features.retouch.logic import downsample_ir, trace_scratch
 from negpy.features.retouch.models import HEAL_SIZE_MAX, HEAL_SIZE_MIN, RetouchConfig
 from negpy.features.pickbetter.logic import (
@@ -369,10 +389,12 @@ class _DiscoveryRequest:
     reselect_path: Optional[str]
     rgb_scan: bool
     half_frame: bool
+    half_frame_paths: frozenset = frozenset()
     half_frame_profile: Optional[dict] = None  # {crop_rect, split_x, gutter_thickness}
     half_frame_overrides: Optional[dict] = None  # {base_hash: {crop_rect, split_x, gutter_thickness}}
     hot_folder: bool = False
     skip_paths: frozenset = frozenset()
+    user_add: bool = False
 
 
 # Sections a scan peek shows itself or that never reach the pixels; an edit to any other section ends the peek.
@@ -503,11 +525,22 @@ def _first_two(names: List[str]) -> str:
 
 
 _NOTHING_TO_APPLY = tr("Nothing to apply: every card already follows the roll")
+# One wording wherever a roll-only feature is reached with no roll open: a grayed panel's
+# hint, a grayed menu's tooltip and a shortcut's status message.
+ROLL_ANALYSIS_NEEDS_A_ROLL = tr("Open or save a roll to use Roll Analysis.")
+SCENES_NEED_A_ROLL = tr("Open or save a roll to use scenes.")
+
+_AVERAGE_FIELDS = ("use_luma_average", "use_color_average", "use_cast_average")
 
 
 def _kept_own_exposure(count: int) -> str:
     locked = count_of(count, "locked frame")
     return tr("{value} kept its own exposure", value=locked) if count == 1 else tr("{value} kept their own exposure", value=locked)
+
+
+def _own_bounds(process: ProcessConfig) -> ProcessConfig:
+    """*process* off its roll or scene baseline, its local bounds cleared for a fresh measure."""
+    return replace(process, use_luma_average=False, use_color_average=False, use_cast_average=False, **invalidate_local_bounds(process))
 
 
 # Process-wide, so a cleared last_metrics never reissues a serial a canvas cache still holds.
@@ -551,12 +584,12 @@ class AppController(QObject):
     # Emitted before the GPU engine frees its texture pool; the canvas samples a
     # pooled texture directly and must drop it first.
     gpu_textures_released = pyqtSignal()
-    export_progress = pyqtSignal(int, int, str)
     export_finished = pyqtSignal(float, list)  # elapsed seconds, the failed files' messages
     render_requested = pyqtSignal(RenderTask)
     preview_load_requested = pyqtSignal(PreviewLoadTask)
     prefetch_load_requested = pyqtSignal(PreviewLoadTask)
     normalization_requested = pyqtSignal(NormalizationTask)
+    background_normalization_requested = pyqtSignal(NormalizationTask)
     batch_autocrop_requested = pyqtSignal(BatchAutoCropTask)
     thumbnail_render_requested = pyqtSignal(ThumbnailRenderTask)
     dust_scan_requested = pyqtSignal(object)  # DustScanTask
@@ -601,6 +634,7 @@ class AppController(QObject):
     contact_sheet_requested = pyqtSignal(object)  # ContactSheetJob
     hdr_requested = pyqtSignal(object)
     frame_merge_requested = pyqtSignal(list)
+    trichrome_merge_requested = pyqtSignal(object)  # the three paths
     thumbnail_requested = pyqtSignal(list)
     thumbnail_cancel_requested = pyqtSignal()
     thumbnail_update_requested = pyqtSignal(ThumbnailUpdateTask)
@@ -618,8 +652,13 @@ class AppController(QObject):
     flat_peek_changed = pyqtSignal(bool)
     heal_bypass_changed = pyqtSignal(bool)
     negative_peek_changed = pyqtSignal(bool)
+    average_peek_changed = pyqtSignal(bool)
     embedded_peek_changed = pyqtSignal(bool)
     flatfield_peek_changed = pyqtSignal(bool)
+    export_size_view_changed = pyqtSignal(bool)
+    # The open frame's export render landed in state.export_view.
+    export_view_ready = pyqtSignal()
+    _export_view_requested = pyqtSignal(object, object)  # key, ExportTask
     zoom_requested = pyqtSignal(float)
     zoom_changed = pyqtSignal(float)
     _render_cleanup_requested = pyqtSignal(object)  # texture to spare, or None
@@ -627,6 +666,7 @@ class AppController(QObject):
     status_progress_requested = pyqtSignal(int, int)
     # "" when no refresh is running.
     thumbnail_refresh_progress = pyqtSignal(str)
+    baseline_progress = pyqtSignal(str)
     batch_started = pyqtSignal(str, bool)  # title, abortable
     batch_progress = pyqtSignal(int, int, str)  # current, total, label
     batch_finished = pyqtSignal()
@@ -664,6 +704,7 @@ class AppController(QObject):
     scan_meter_error = pyqtSignal(str)
     capture_light_requested = pyqtSignal(int, int, int, int, str)
     capture_requested = pyqtSignal(CaptureRequest)
+    capture_eject_requested = pyqtSignal(str)  # light port
     capture_light_set = pyqtSignal(int, int, int, int)
     capture_progress = pyqtSignal(float)
     capture_countdown = pyqtSignal(int)  # seconds left of the Capture Delay; 0 when the shot starts
@@ -673,9 +714,12 @@ class AppController(QObject):
     capture_live_view_unsupported = pyqtSignal(str)  # body advertises no preview; none was attempted
     capture_focus_magnifier_unavailable = pyqtSignal(str)  # reason
     capture_finished = pyqtSignal(list)
+    capture_clipped = pyqtSignal(str, float)  # a single-file capture's path, share of its picture at saturation
     capture_cancelled = pyqtSignal()
     capture_error = pyqtSignal(str)
     capture_status = pyqtSignal(str)
+    capture_strip_finished = pyqtSignal(int, bool)  # frames scanned, the strip ran to its end
+    capture_scan_button_pressed = pyqtSignal()  # the light's own Scan button (the Lento Dock's S)
     live_view_requested = pyqtSignal(LiveViewRequest)
     live_view_stop_requested = pyqtSignal()
     camera_session_close_requested = pyqtSignal()
@@ -721,6 +765,8 @@ class AppController(QObject):
         self._replace_after_discovery = False
         self._reselect_after_discovery: Optional[str] = None
         self._announce_rgb = False
+        self._user_add_after_discovery = False
+        self._extras_notice: Optional[str] = None
         self._pending_capture_imports: Dict[str, _PendingCaptureImport] = {}
         self._pending_asset_discoveries: List[_DiscoveryRequest] = []
         self._active_discovery_keys: frozenset[str] = frozenset()
@@ -736,6 +782,12 @@ class AppController(QObject):
         self._active_batch_token: Optional[int] = None
         self._normalization_scope: Optional[str] = None
         self._scene_queue: List[str] = []
+        # (roll id, frame hashes) of the running background Roll Analysis.
+        self._background_baseline: Optional[Tuple[str, Tuple[str, ...]]] = None
+        self._background_baseline_timer = QTimer(self)
+        self._background_baseline_timer.setSingleShot(True)
+        self._background_baseline_timer.setInterval(2000)
+        self._background_baseline_timer.timeout.connect(self._run_background_baseline)
         # True while a hot-folder-triggered discovery owns the batch lane. Thumbnail
         # loading is an independent background queue and never owns this state.
         self._hot_folder_sequence_active = False
@@ -745,8 +797,8 @@ class AppController(QObject):
         # Per frame hash: its resolved Auto Crop when the run started.
         self._autocrop_started_auto: Dict[str, bool] = {}
         self._autocrop_cancel_requested = False
-        # The analysis a run of Auto-crop all frames was started for: (scene id or None,), run when it finishes.
-        self._analysis_after_crop: Optional[Tuple[Optional[str], bool]] = None
+        # The analysis a run of Auto-crop all frames was started for, run when it finishes.
+        self._analysis_after_crop: Optional[Callable[[], None]] = None
         # Background thumbnail refresh runs off the shared batch lane entirely — it must
         # never block Export or another user-triggered batch — so it tracks its own
         # generation instead of `_batch_serial`/`_active_batch_token`.
@@ -806,6 +858,8 @@ class AppController(QObject):
         self.hdr_worker.moveToThread(self.export_thread)
         self.frame_merge_worker = FrameMergeWorker()
         self.frame_merge_worker.moveToThread(self.export_thread)
+        self.triplet_probe_worker = TripletProbeWorker()
+        self.triplet_probe_worker.moveToThread(self.export_thread)
         self.export_thread.start()
 
         self.thumb_thread = QThread()
@@ -820,6 +874,8 @@ class AppController(QObject):
         self.norm_thread = QThread()
         self.norm_worker = NormalizationWorker(self.preview_service)
         self.norm_worker.moveToThread(self.norm_thread)
+        self.bg_norm_worker = NormalizationWorker(self.preview_service)
+        self.bg_norm_worker.moveToThread(self.norm_thread)
         self.batch_autocrop_worker = BatchAutoCropWorker(self.batch_autocrop_preview_service)
         self.batch_autocrop_worker.moveToThread(self.norm_thread)
         self.thumbnail_render_worker = ThumbnailRenderWorker(self.thumbnail_render_preview_service, self.preview_service)
@@ -903,6 +959,14 @@ class AppController(QObject):
         self._render_debounce.setSingleShot(True)
         self._render_debounce.setInterval(50)
         self._render_debounce.timeout.connect(self.request_render)
+        # The export render takes seconds, so it waits for an edit to settle.
+        self._export_view_timer = QTimer()
+        self._export_view_timer.setSingleShot(True)
+        self._export_view_timer.setInterval(400)
+        self._export_view_timer.timeout.connect(self._dispatch_export_view)
+        self._export_view_thread: Optional[QThread] = None
+        self._export_view_worker: Optional[ExportViewWorker] = None
+        self._export_view_busy = False
         self._dispatched_render_state: Optional[tuple] = None  # _render_state() of the last plain render
 
         self._crop_bounds_dirty = False
@@ -1076,7 +1140,6 @@ class AppController(QObject):
         self.render_worker.error.connect(self._on_strip_error)
         self.render_worker.error.connect(self._on_pick_better_error)
 
-        self.export_worker.progress.connect(self.export_progress.emit)
         self.export_worker.progress.connect(self._on_batch_progress)
         self.export_worker.finished.connect(self._on_export_finished)
         self.export_worker.cancelled.connect(self._on_export_batch_cancelled)
@@ -1095,6 +1158,10 @@ class AppController(QObject):
         self.frame_merge_requested.connect(self.frame_merge_worker.run)
         self.frame_merge_worker.progress.connect(self._on_batch_progress)
         self.frame_merge_worker.finished.connect(self._on_frame_merge_finished)
+
+        self.trichrome_merge_requested.connect(self.triplet_probe_worker.run)
+        self.triplet_probe_worker.progress.connect(self._on_batch_progress)
+        self.triplet_probe_worker.placed.connect(self._on_triplet_placed)
 
         self.hdr_requested.connect(self.hdr_worker.run)
         self.hdr_worker.progress.connect(self._on_batch_progress)
@@ -1121,6 +1188,11 @@ class AppController(QObject):
         self.norm_worker.detected.connect(self._on_scenes_detected)
         self.norm_worker.cancelled.connect(self._on_normalization_cancelled)
         self.norm_worker.error.connect(self._on_normalization_error)
+        self.background_normalization_requested.connect(self.bg_norm_worker.process)
+        self.bg_norm_worker.finished.connect(self._on_background_baseline)
+        self.bg_norm_worker.progress.connect(self._on_background_baseline_progress)
+        self.bg_norm_worker.cancelled.connect(self._on_background_baseline_ended)
+        self.bg_norm_worker.error.connect(self._on_background_baseline_ended)
 
         self.batch_autocrop_requested.connect(self.batch_autocrop_worker.process)
         self.batch_autocrop_worker.progress.connect(self._on_batch_autocrop_progress)
@@ -1193,6 +1265,7 @@ class AppController(QObject):
         self.scan_worker.meter_error.connect(self.scan_meter_error.emit)
         self.capture_light_requested.connect(self.capture_worker.set_light)
         self.capture_requested.connect(self.capture_worker.run_capture)
+        self.capture_eject_requested.connect(self.capture_worker.eject_film)
         self.capture_worker.light_set.connect(self.capture_light_set.emit)
         self.capture_worker.progress.connect(self.capture_progress.emit)
         self.capture_worker.countdown.connect(self.capture_countdown.emit)
@@ -1202,9 +1275,13 @@ class AppController(QObject):
         self.capture_worker.live_view_unsupported.connect(self.capture_live_view_unsupported.emit)
         self.capture_worker.focus_magnifier_unavailable.connect(self.capture_focus_magnifier_unavailable.emit)
         self.capture_worker.finished.connect(self._on_capture_finished)
+        self.capture_worker.clipped.connect(self.capture_clipped.emit)
         self.capture_worker.cancelled.connect(self.capture_cancelled.emit)
         self.capture_worker.error.connect(self.capture_error.emit)
         self.capture_worker.status.connect(self.capture_status.emit)
+        self.capture_worker.flat_captured.connect(self._on_capture_flat)
+        self.capture_worker.strip_finished.connect(self.capture_strip_finished.emit)
+        self.capture_worker.scan_button_pressed.connect(self.capture_scan_button_pressed.emit)
         self.live_view_requested.connect(self.capture_worker.start_live_view)
         self.live_view_stop_requested.connect(self.capture_worker.stop_live_view)
         self.camera_session_close_requested.connect(self.capture_worker.close_camera_session)
@@ -1231,6 +1308,7 @@ class AppController(QObject):
         self.capture_worker.light_temp_polled.connect(self.light_temp_polled.emit)
 
         self.session.active_file_changing.connect(self._update_thumbnail_from_state)
+        self.session.frame_previews_ending.connect(self._previewed_meter_cards.clear)
         self.session.session_emptied.connect(self._render_memo.clear)
         self.session.session_emptied.connect(self._strip_memo.clear)
         self.session.file_selected.connect(self._on_file_selected_load)
@@ -1607,6 +1685,8 @@ class AppController(QObject):
             return None
         if owner in _NORM_THREAD_BATCH_OWNERS:
             self._preempt_background_thumbnail_refresh()
+        if self._background_baseline is not None:
+            self.bg_norm_worker.cancel()
         self._batch_serial += 1
         self._active_batch = owner
         self._active_batch_title = title
@@ -1657,6 +1737,7 @@ class AppController(QObject):
         self.batch_finished.emit()
         if self._pending_asset_discoveries and not self._discovery_running:
             QTimer.singleShot(0, self._start_next_asset_discovery)
+        self._background_baseline_timer.start()
         return True
 
     def _on_batch_progress(self, current: int, total: int, name: str) -> None:
@@ -1720,14 +1801,22 @@ class AppController(QObject):
         active = self.session.repo.get_global_setting("session_active_path")
         self._pending_scanned_file = active if active in paths else paths[0]
         triplets = self.session.repo.get_global_setting("session_triplets", {}) or {}
-        self.state.active_roll_id = self._roll_id_for_restored_paths(paths)
+        self.state.active_roll_id = self._restored_roll_id(paths)
+        self.state.half_frame_loose = bool(self.session.repo.get_global_setting("session_half_frame", False))
         self._announce_roll_modes(self.state.active_roll_id)
         self.request_asset_discovery(paths, auto_open=True, restore_triplets=triplets)
 
+    def _restored_roll_id(self, paths: List[str]) -> Optional[str]:
+        """The roll the saved session had open, if it still exists. A session saved
+        without that record falls back to the roll every restored path belongs to."""
+        saved = self.session.repo.get_global_setting("session_active_roll")
+        if not isinstance(saved, str):
+            return self._roll_id_for_restored_paths(paths)
+        return saved if saved and rolls.roll_for_id(self.session.repo, saved) else None
+
     def _roll_id_for_restored_paths(self, paths: List[str]) -> Optional[str]:
-        """The one roll every restored path agrees on, or None -- the roll a fresh
-        process would otherwise forget it had open, the same "only when unambiguous"
-        rule open_library_folders applies when several folders are opened at once."""
+        """The one roll every restored path agrees on, or None: the same "only when
+        unambiguous" rule open_library_folders applies when several folders are opened at once."""
         candidates = set(rolls.rolls_containing_path(self.session.repo, paths[0]))
         for path in paths[1:]:
             candidates &= set(rolls.rolls_containing_path(self.session.repo, path))
@@ -1744,6 +1833,8 @@ class AppController(QObject):
         reselect_path: Optional[str] = None,
         announce_rgb: bool = False,
         hot_folder: bool = False,
+        user_add: bool = False,
+        rgb_scan: Optional[bool] = None,
     ) -> None:
         """
         Starts asynchronous discovery of supported assets.
@@ -1760,6 +1851,12 @@ class AppController(QObject):
         `hot_folder` marks this request as coming from the Hot Folder poll, not from a
         user action — it drives `hot_folder_sequence_active`, which is what the batch
         popup checks, rather than whether the toggle happens to be on.
+
+        `user_add` marks Add Files, Add Folder and a drop: the files the open folder roll cannot
+        hold are reported.
+
+        `rgb_scan` False loads the files without Trichrome Mode grouping, for files the user just
+        took out of a triplet; None follows the roll's mode.
         """
         self.thumb_worker.cancel_pending()
         self.thumbnail_cancel_requested.emit()
@@ -1771,15 +1868,14 @@ class AppController(QObject):
             restore_triplets=restore_triplets,
             replace_existing=replace_existing,
             reselect_path=reselect_path,
-            rgb_scan=self._rgb_scan_mode_for_discovery(active_roll_id),
-            # A batch spanning several rolls has no roll-wide toggle to apply, and a
-            # "confirmed diptych" hash records whichever roll's toggle was on at the
-            # time rather than a per-file fact. Splitting waits for a roll that says so.
+            rgb_scan=self._rgb_scan_mode_for_discovery(active_roll_id) if rgb_scan is None else rgb_scan,
             half_frame=self.half_frame_mode_for_roll(active_roll_id) if active_roll_id else False,
+            half_frame_paths=frozenset() if active_roll_id else self._half_frame_paths(paths),
             half_frame_profile=self.half_frame_profile(),
             half_frame_overrides=self.half_frame_overrides(),
             hot_folder=hot_folder,
             skip_paths=rolls.excluded_paths(self.session.repo, [p for p in paths if os.path.isdir(p)]),
+            user_add=user_add,
         )
         if self._discovery_running:
             self._pending_asset_discoveries.append(request)
@@ -1811,25 +1907,25 @@ class AppController(QObject):
         self._auto_open_after_discovery = request.auto_open
         self._replace_after_discovery = request.replace_existing
         self._reselect_after_discovery = request.reselect_path
+        self._user_add_after_discovery = request.user_add
         self._active_discovery_keys = frozenset(_capture_import_key(path) for path in request.paths)
         self.set_status(tr("Scanning for assets…"))
         stitches, merges = restore_maps(self.session.repo)
-        restore_triplets = request.restore_triplets
-        if request.rgb_scan:
-            # Saved groupings skip the raw read. A requested one wins unless it names the same pair:
-            # the saved record carries the hashes that catch a changed file.
-            saved = saved_triplets(self.session.repo)
-            requested = request.restore_triplets or {}
-            restore_triplets = {
-                **saved,
-                **{red: rec for red, rec in requested.items() if list(saved.get(red, [None, None])[:2]) != list(rec[:2])},
-            }
+        # Saved groupings skip the raw read. A requested one wins unless it names the same pair: the saved record carries the hashes
+        # that catch a changed file, and the by-hand flag.
+        saved = applied_triplets(self.session.repo, request.rgb_scan)
+        requested = request.restore_triplets or {}
+        restore_triplets = {
+            **saved,
+            **{red: rec for red, rec in requested.items() if list(saved.get(red, [None, None])[:2]) != list(rec[:2])},
+        } or None
         task = AssetDiscoveryTask(
             paths=list(request.paths),
             supported_extensions=tuple(SUPPORTED_RAW_EXTENSIONS),
             rgb_scan=request.rgb_scan,
             restore_triplets=restore_triplets,
             half_frame=request.half_frame,
+            half_frame_paths=request.half_frame_paths,
             # Read as the request starts, not as it was queued: a composite made while
             # a discovery waits its turn must still be re-attached when the queue gets to it.
             restore_stitches=stitches,
@@ -1839,6 +1935,59 @@ class AppController(QObject):
             skip_paths=request.skip_paths,
         )
         self.asset_discovery_requested.emit(task)
+
+    _EXTRAS_NOTICED_KEY = "extra_paths_noticed_rolls"
+
+    def _unnoticed_extras(self, roll_id: str, entry: dict) -> List[str]:
+        """The files from other folders an older version kept in this folder roll, still on disk,
+        when the user has not been told that the roll no longer holds them."""
+        if roll_id in (self.session.repo.get_global_setting(self._EXTRAS_NOTICED_KEY, default=None) or []):
+            return []
+        return [p for p in entry.get("extra_paths", ()) if os.path.isfile(p)]
+
+    def _show_extras_notice(self) -> None:
+        """Once per roll: say that a folder roll no longer opens the files from other folders it
+        held, and offer to load them for this session."""
+        roll_id, self._extras_notice = self._extras_notice, None
+        entry = rolls.roll_for_id(self.session.repo, roll_id) if roll_id else None
+        extras = self._unnoticed_extras(roll_id, entry) if entry and roll_id == self.state.active_roll_id else []
+        if not extras:
+            return
+        noticed = list(self.session.repo.get_global_setting(self._EXTRAS_NOTICED_KEY, default=None) or [])
+        self.session.repo.save_global_setting(self._EXTRAS_NOTICED_KEY, [*noticed, roll_id])
+        body = tr(
+            "“{name}” held {value} from other folders. A folder roll now holds only the files in its folder, "
+            "so they no longer open with it. Their edits are kept.",
+            name=entry.get("name") or tr("this roll"),
+            value=count_of(len(extras), "frame"),
+        )
+        box = QMessageBox(QMessageBox.Icon.Information, tr("Folder Roll"), body, QMessageBox.StandardButton.NoButton)
+        load = box.addButton(tr("Load Them"), QMessageBox.ButtonRole.AcceptRole)
+        close = box.addButton(QMessageBox.StandardButton.Close)
+        box.setDefaultButton(close)
+        box.exec()
+        if box.clickedButton() is load:
+            self.request_asset_discovery(extras, auto_open=True, user_add=True)
+
+    def _folder_roll_add_note(self, roll_id: str, outside: List[str], returned: List[str]) -> str:
+        """What an add did to the open folder roll, when it loaded files the roll cannot hold."""
+        if not outside:
+            return ""
+        name = (rolls.roll_for_id(self.session.repo, roll_id) or {}).get("name") or tr("this roll")
+        if returned:
+            return tr(
+                "Added {value} to “{name}”. Loaded {value1} from other folders for this session only. "
+                "Use Save as Virtual Roll… to keep them in a new roll.",
+                value=count_of(len(returned), "frame"),
+                value1=count_of(len(outside), "frame"),
+                name=name,
+            )
+        return tr(
+            "Loaded {value} for this session only. The folder roll “{name}” holds only files from its own folder. "
+            "Use Save as Virtual Roll… to keep them in a new roll.",
+            value=count_of(len(outside), "frame"),
+            name=name,
+        )
 
     def _start_next_asset_discovery(self) -> None:
         if self._pending_asset_discoveries and not self._discovery_running and self._active_batch is None:
@@ -1905,17 +2054,14 @@ class AppController(QObject):
         )
 
     def open_roll(self, roll_id: str) -> None:
-        """Open a roll (folder or virtual) by id. A folder roll's own contents are
-        (re)walked as usual, the same as opening it from the tree; its extra_paths --
-        files added by hand that are not physically in the folder -- ride along in the
-        same discovery pass, since request_asset_discovery already accepts a mix of
-        folder and file paths."""
+        """Open a roll (folder or virtual) by id: a folder roll's folder, or a virtual roll's members."""
         entry = rolls.roll_for_id(self.session.repo, roll_id)
         if entry is None:
             self.set_status(tr("That roll no longer exists"), 3000)
             return
         if entry["kind"] == "folder":
-            paths = [entry["folder_path"], *entry.get("extra_paths", [])]
+            paths = [entry["folder_path"]]
+            self._extras_notice = roll_id if self._unnoticed_extras(roll_id, entry) else None
         else:
             paths = list(entry.get("member_paths", []))
         if not paths:
@@ -1932,17 +2078,139 @@ class AppController(QObject):
         if not paths:
             self.set_status(tr("Nothing loaded to save as a roll"), 3000)
             return None
+        source = self.state.active_roll_id
         roll_id = rolls.create_virtual_roll(self.session.repo, name, paths)
-        # Seed the new roll's own half-frame toggle from the ad hoc session's, so saving as
-        # a roll doesn't silently reset it to off the next time this roll is opened.
-        by_roll = dict(self.session.repo.get_global_setting(self._HALF_FRAME_MODE_BY_ROLL_KEY, default=None) or {})
-        by_roll[roll_id] = self.half_frame_mode_for_roll(None)
-        self.session.repo.save_global_setting(self._HALF_FRAME_MODE_BY_ROLL_KEY, by_roll)
-        self._save_rgb_scan_mode(self.rgb_scan_mode_for_roll(None), roll_id)
+        self._seed_roll_modes(roll_id, source)
+        moved = (False, False)
+        if source:
+            hashes = {rolls.unforked_hash(f["hash"]) for f in self.state.uploaded_files if f.get("hash")}
+            rolls.copy_roll_settings(self.session.repo, source, roll_id, hashes)
+            moved = self._carry_roll_edits(roll_id)
         self.state.active_roll_id = roll_id
+        self.session.persist_session()
+        if moved[0]:
+            self.session.asset_model.refresh()
+        if moved[1]:
+            self._reselect_active_frame()
         self._announce_roll_modes(roll_id)
-        self.set_status(tr("Saved as roll “{name}”", name=name), 3000)
+        self.set_status(tr("Saved as virtual roll “{name}”", name=name), 3000)
         return roll_id
+
+    def _seed_roll_modes(self, roll_id: str, source: Optional[str]) -> None:
+        """Half Frame and RGB Scan for a new roll: the open roll's, or the no-roll ones without one,
+        so the frames look the same once it becomes the open roll."""
+        by_roll = dict(self.session.repo.get_global_setting(self._HALF_FRAME_MODE_BY_ROLL_KEY, default=None) or {})
+        # With no roll open a frame splits by its own roll; one toggle fits the set only when
+        # every frame that can split is a half.
+        splittable = [f for f in self.state.uploaded_files if not is_composite(f)]
+        by_roll[roll_id] = (
+            self.half_frame_mode_for_roll(source)
+            if source
+            else self.state.half_frame_loose or bool(splittable) and all(f.get("half") for f in splittable)
+        )
+        self.session.repo.save_global_setting(self._HALF_FRAME_MODE_BY_ROLL_KEY, by_roll)
+        self._save_rgb_scan_mode(self.rgb_scan_mode_for_roll(source), roll_id)
+
+    def save_choice(self, roll_id: Optional[str] = None) -> tuple[str, str]:
+        """Whether Save to Folder Roll applies to *roll_id* (default: the open roll, else the frames in
+        no roll): "hidden", "ready", or "blocked" with the reason. It applies to frames or a virtual
+        roll whose files all sit directly in one folder that has no folder roll."""
+        choice, reason, _folder, _missing = self._folder_target(roll_id)
+        return choice, reason
+
+    def _folder_target(self, roll_id: Optional[str]) -> tuple[str, str, Optional[str], List[str]]:
+        """save_choice, with the folder and the folder's files the roll would leave out."""
+        roll_id = roll_id or self.state.active_roll_id
+        if roll_id:
+            entry = rolls.roll_for_id(self.session.repo, roll_id) or {}
+            paths = self._virtual_roll_files(entry) if entry.get("kind") == "virtual" else []
+        else:
+            paths = self._loaded_source_paths() if self.state.uploaded_files else []
+        if not paths:
+            return "hidden", "", None, []
+        folder, missing = rolls.folder_scope(paths)
+        if folder is None:
+            return "blocked", tr("Save to Folder Roll: the frames come from more than one folder."), None, []
+        existing = rolls.folder_roll_id_for_path(self.session.repo, folder)
+        if existing:
+            name = (rolls.roll_for_id(self.session.repo, existing) or {}).get("name") or folder
+            return "blocked", tr("“{name}” is already a folder roll, so open it from the Library.", name=name), None, []
+        return "ready", "", folder, missing
+
+    def _virtual_roll_files(self, entry: dict) -> List[str]:
+        """A virtual roll's members on disk, with the parts of its composites and triplets."""
+        members = [p for p in entry.get("member_paths", ()) if os.path.isfile(p)]
+        held = set(members)
+        parts = part_paths(c for primary, c in saved_composites(self.session.repo).items() if primary in held)
+        parts.update(p for red, t in saved_triplets(self.session.repo).items() if red in held for p in t[:2] if p)
+        return list(dict.fromkeys([*members, *sorted(parts)]))
+
+    def _loaded_source_paths(self) -> List[str]:
+        """Every file the Film Strip holds: composite parts, triplet exposures, and the duplicates it
+        turned away from the same folders (one from elsewhere does not make the frames span folders)."""
+        paths = [p for f in self.state.uploaded_files for p in source_files(f)]
+        folders = {os.path.normcase(os.path.dirname(p)) for p in paths}
+        duplicates = [p for p in sorted(self.state.duplicate_paths) if os.path.normcase(os.path.dirname(p)) in folders]
+        return list(dict.fromkeys([*paths, *duplicates]))
+
+    def save_to_folder_roll(self, roll_id: Optional[str] = None) -> Optional[str]:
+        """Save the frames as the folder roll of their folder, leaving out the folder's files they do
+        not hold; the roll becomes the open roll. A virtual roll (*roll_id*, default the open one)
+        becomes that folder roll in place. Shows the reason when it cannot apply."""
+        roll_id = roll_id or self.state.active_roll_id
+        choice, reason, folder, missing = self._folder_target(roll_id)
+        if choice != "ready" or folder is None:
+            if reason:
+                self.set_status(reason, 4000)
+            return None
+        if roll_id:
+            return self._convert_to_folder_roll(roll_id, folder, missing)
+        roll_id = rolls.create_folder_roll(self.session.repo, folder, missing)
+        self._seed_roll_modes(roll_id, None)
+        self.state.active_roll_id = roll_id
+        self.invalidate_library_walk()
+        self.session.persist_session()
+        self._announce_roll_modes(roll_id)
+        name = (rolls.roll_for_id(self.session.repo, roll_id) or {}).get("name") or folder
+        self.set_status(tr("Saved as folder roll “{name}”", name=name), 3000)
+        return roll_id
+
+    def _convert_to_folder_roll(self, roll_id: str, folder: str, missing: List[str]) -> str:
+        entry = rolls.roll_for_id(self.session.repo, roll_id) or {}
+        old_name = entry.get("name") or tr("this roll")
+        gone = sum(1 for p in entry.get("member_paths", ()) if not os.path.isfile(p))
+        name = rolls.convert_to_folder_roll(self.session.repo, roll_id, folder, missing)
+        self.invalidate_library_walk()
+        if gone:
+            message = tr(
+                "“{old}” is now the folder roll “{name}”. {value} no longer on disk left the roll.",
+                old=old_name,
+                name=name,
+                value=count_of(gone, "file"),
+            )
+        else:
+            message = tr("“{old}” is now the folder roll “{name}”", old=old_name, name=name)
+        self.set_status(message, 4000)
+        return roll_id
+
+    def _carry_roll_edits(self, roll_id: str) -> tuple[bool, bool]:
+        """Give *roll_id* its own copy of each loaded frame's edit made only in the open roll,
+        seeded from that edit as it stands, and point the frame at it. The open frame's unsaved
+        change is saved to the open roll first, so both rolls keep it. Returns (any frame
+        moved, the open frame moved)."""
+        self.session.save_active_edit()
+        current = self.state.current_file_hash
+        any_moved = moved = False
+        for asset in self.state.uploaded_files:
+            forked = asset.get("hash") or ""
+            from_hash = rolls.unforked_hash(forked)
+            if from_hash == forked or not asset.get("path"):
+                continue
+            seed = self.state.config if forked == current else self.session.config_for_asset(asset)
+            asset["hash"] = rolls.fork_edit(self.session.repo, roll_id, from_hash, asset["path"], seed)
+            any_moved = True
+            moved = moved or forked == current
+        return any_moved, moved
 
     def request_rename_roll(self, roll_id: str, new_name: str, rename_folder: bool) -> bool:
         """Rename a roll's display name, and -- only if asked -- its backing folder on
@@ -2046,8 +2314,7 @@ class AppController(QObject):
             self.set_status(tr("No frames in the library match that search"), 4000)
             return
         self.set_status(tr("{value} {frame_word} found", value=len(paths), frame_word=plural(len(paths), "frame")), 3000)
-        # An ad hoc result, not (yet) any roll -- Save as Roll in the Film Strip turns it
-        # into one.
+        # An ad hoc result, not (yet) any roll: a save in the Film Strip turns it into one.
         self.state.active_roll_id = None
         self._announce_roll_modes(None)
         # The hand-off already is the filtered result -- a semantic query left over from
@@ -2157,27 +2424,38 @@ class AppController(QObject):
         return enabled
 
     def half_frame_mode_for_roll(self, roll_id: Optional[str]) -> bool:
-        """The half-frame toggle's state for *roll_id* -- each roll remembers its own,
-        so switching rolls switches the toggle with it. An ad hoc session (no
-        recognized roll, e.g. a library search result) reads the one sticky flag it
-        always had."""
+        """The half-frame toggle's state for *roll_id*: each roll remembers its own. With no
+        roll it is this session's choice for frames in no roll, never one app-wide flag that
+        would split the next unrelated files too."""
         if roll_id:
             by_roll = self.session.repo.get_global_setting(self._HALF_FRAME_MODE_BY_ROLL_KEY, default=None) or {}
             return bool(by_roll.get(roll_id, False))
-        return bool(self.session.repo.get_global_setting("half_frame_mode", False))
+        return self.state.half_frame_loose
+
+    def _half_frame_paths(self, paths: List[str]) -> frozenset:
+        """With no roll open, the requested paths to split: each follows its own roll's toggle,
+        a search result's included, and a path in no roll follows this session's choice."""
+        repo = self.session.repo
+        by_roll = repo.get_global_setting(self._HALF_FRAME_MODE_BY_ROLL_KEY, default=None) or {}
+        roll_of = rolls.home_roll_lookup(repo)
+        split = set()
+        for path in paths:
+            roll_id = roll_of(path)
+            if bool(by_roll.get(roll_id, False)) if roll_id else self.state.half_frame_loose:
+                split.add(os.path.normcase(os.path.normpath(path)))
+        return frozenset(split)
 
     def set_half_frame_mode(self, enabled: bool) -> None:
-        """Persist the half-frame toggle -- per roll when one is active, else the
-        single sticky flag an ad hoc session always had -- and re-discover
-        already-loaded assets so the mode splits/collapses frames in place (not only
-        on the next folder load)."""
+        """Save the half-frame toggle, per roll when one is open, else for this session's
+        frames in no roll, and re-discover the loaded files so they split or join in place."""
         roll_id = self.state.active_roll_id
         if roll_id:
             by_roll = dict(self.session.repo.get_global_setting(self._HALF_FRAME_MODE_BY_ROLL_KEY, default=None) or {})
             by_roll[roll_id] = bool(enabled)
             self.session.repo.save_global_setting(self._HALF_FRAME_MODE_BY_ROLL_KEY, by_roll)
         else:
-            self.session.repo.save_global_setting("half_frame_mode", bool(enabled))
+            self.state.half_frame_loose = bool(enabled)
+            self.session.persist_session()
         self._active_diptych_memo = ("", None)
         files = self.session.state.uploaded_files
         if not files:
@@ -2560,6 +2838,7 @@ class AppController(QObject):
         Adds discovered assets to the session and starts thumbnail generation.
         """
         remember_split_scans(self.session.repo, {base_hash(a["hash"]) for a in valid_assets if a.get("half")})
+        self._background_baseline_timer.start()
         self._mark_diptychs(valid_assets)
         self._apply_roll_forks(valid_assets)
         promote_sidecars(self.session.repo, valid_assets)
@@ -2581,15 +2860,24 @@ class AppController(QObject):
         active_discovery_keys = self._active_discovery_keys
         self._active_discovery_keys = frozenset()
 
-        # Files appended (not replaced) while a roll is active join its membership, so
-        # reopening that roll later still shows what was added by hand.
+        user_add = self._user_add_after_discovery
+        self._user_add_after_discovery = False
+
+        # Files appended (not replaced) to an open virtual roll join it. A folder roll holds only
+        # its folder's files: an appended one of them leaves excluded_paths, any other stays for this session.
+        roll_note = ""
         if not replace_existing and self.state.active_roll_id:
-            rolls.add_extra_members(
+            roll_id = self.state.active_roll_id
+            loaded = {f.get("path") for f in self.state.uploaded_files}
+            added = [a["path"] for a in valid_assets if a.get("path") and a["path"] not in loaded]
+            returned = rolls.add_members(
                 self.session.repo,
-                self.state.active_roll_id,
+                roll_id,
                 [a["path"] for a in valid_assets if a.get("path")],
                 parts=[p for a in valid_assets for p in source_files(a)],
             )
+            if user_add:
+                roll_note = self._folder_roll_add_note(roll_id, rolls.outside_folder(self.session.repo, roll_id, added), returned)
         pending_scan = getattr(self, "_pending_scanned_file", None)
 
         if replace_existing and valid_assets:
@@ -2625,12 +2913,15 @@ class AppController(QObject):
                 idx = ordered[0] if ordered else 0
             self.session.select_file(idx)
             self._start_next_asset_discovery()
+            self._show_extras_notice()
             return
 
         selected_pending_scan = False
         if valid_assets:
             first_new_idx = len(self.session.state.uploaded_files)
             self.session.add_files([], validated_info=valid_assets)
+            if roll_note:
+                self.set_status(roll_note, 6000)
             self.generate_missing_thumbnails()
             self._seed_stale_thumbnails(self.session.state.uploaded_files[first_new_idx:])
             if not self._thumbnail_queue_active:
@@ -2942,6 +3233,7 @@ class AppController(QObject):
         self.state.preview_detect = None
         self.state.preview_embedded = None
         self.state.peek_frame = None
+        self.state.export_view = None
         self.state.has_ir = False
         self.state.original_res = (0, 0)
         if self.state.flat_peek:
@@ -2953,6 +3245,7 @@ class AppController(QObject):
         if self.state.embedded_peek:
             self.state.embedded_peek = False
             self.embedded_peek_changed.emit(False)
+        self._end_export_size_view()
         if self.state.flatfield_peek:
             self.state.flatfield_peek = False
             self.flatfield_peek_changed.emit(False)
@@ -3013,7 +3306,7 @@ class AppController(QObject):
                 workspace_color_space=self.state.workspace_color_space,
                 use_camera_wb=not effective_linear_raw(self.state.config.process),
                 generation=self._prefetch_gen,
-                positive_source=self.state.config.process.positive_source,
+                positive_decode=positive_decode(self.state.config.process),
                 highlight_mode=effective_highlight_reconstruction(self.state.config.process),
                 bake_camera_wb=highlight_reconstruction_bakes_wb(self.state.config.process),
                 full_resolution=self.state.hq_preview,
@@ -3209,16 +3502,16 @@ class AppController(QObject):
         half_slice = self._half_slice_for_asset(asset["path"], file_hash)
         # The render reads the base only for a whole negative frame on a roll with no picked base.
         base_settings = None
-        if half_slice is None and self.roll_film_base() is None:
+        if half_slice is None:
             config = self.session.config_for_asset(asset)
-            if render_path(config.process) is RenderPath.PRINT:
+            if self.film_base_for(asset, config.process) is None and render_path(config.process) is RenderPath.PRINT:
                 base_settings = config
         return PreviewLoadTask(
             file_path=asset["path"],
             workspace_color_space=self.state.workspace_color_space,
             use_camera_wb=not linear_raw,
             generation=generation,
-            positive_source=saved.process.positive_source if saved else False,
+            positive_decode=positive_decode(saved.process) if saved else "",
             highlight_mode=effective_highlight_reconstruction(saved.process) if saved else 0,
             bake_camera_wb=(highlight_reconstruction_bakes_wb(saved.process) if saved else False),
             full_resolution=False,
@@ -3262,8 +3555,17 @@ class AppController(QObject):
         """
         if not detected_mode or detected_mode == self.state.config.process.process_mode:
             return
-        self.state.config = with_process_mode(self.state.config, detected_mode)
+        path = self.state.current_file_path or ""
+        self.state.config = with_scanner_positive_default(with_process_mode(self.state.config, detected_mode), path)
         self.state.is_dirty = True
+        if positive_decode(self.state.config.process) and path:
+            # The buffer was decoded for the transfer; a finished image's Positive decodes by its encoding.
+            QTimer.singleShot(0, lambda: self._reload_if_open(path))
+
+    def _reload_if_open(self, path: str) -> None:
+        """A deferred reload that a frame change since has made stale does nothing."""
+        if self.state.current_file_path == path:
+            self.load_file(path, preserve_zoom=True)
 
     def _store_source_color(self, source_color: Optional[bool]) -> None:
         """Store the measured film fact once; it never changes the saved mode."""
@@ -3307,6 +3609,10 @@ class AppController(QObject):
             self._handle_zone_pin(nx, ny)
         elif self.state.active_tool == ToolMode.FILM_BASE:
             self._handle_film_base_pick(nx, ny)
+        elif self.state.active_tool == ToolMode.DMIN_PICK:
+            self._handle_bounds_pick(nx, ny, "manual_dmin")
+        elif self.state.active_tool == ToolMode.DMAX_PICK:
+            self._handle_bounds_pick(nx, ny, "manual_dmax")
 
     def set_active_tool(self, mode: ToolMode) -> None:
         if mode != ToolMode.NONE and self._diptych_blocks_canvas():
@@ -3419,10 +3725,10 @@ class AppController(QObject):
             self.zone_highlight_changed.emit()
 
     def toggle_grain_focuser(self, force: Optional[bool] = None) -> None:
-        """Grain focuser loupe. Repaint only — it magnifies the frame the canvas already
-        holds, so no re-render is needed."""
+        """Grain focuser loupe. It magnifies the export render, so turning it on starts one."""
         self.state.grain_focuser = (not self.state.grain_focuser) if force is None else bool(force)
         self.grain_focuser_changed.emit(self.state.grain_focuser)
+        self._schedule_export_view()
 
     def toggle_cursor_probe(self, force: Optional[bool] = None) -> None:
         """Densitometer chip beside the pointer. Repaint only."""
@@ -3480,11 +3786,9 @@ class AppController(QObject):
         if export_path is None or not self.state.current_file_path:
             return None
         export_conf = replace(self.state.config.export, export_path=export_path)
-        roll_root = self._roll_export_root(export_conf.output_mode, export_conf.output_subfolder)
         export_path = resolve_output_dir(
             self.state.current_file_path,
             preset_from_export_config(export_conf),
-            roll_root,
         )
         stem = os.path.splitext(os.path.basename(self.state.current_file_path))[0]
         os.makedirs(export_path, exist_ok=True)
@@ -3534,13 +3838,9 @@ class AppController(QObject):
         zeroed on the rebate. The patch is read back through the frame's window and its crosstalk
         unmix, so the roll keeps a raw base that every render unmixes like the rebate reader's.
         One click: the tool disarms, and leaving it re-renders the roll's frame above the base."""
-        from negpy.features.exposure.normalization import effective_crosstalk_matrix, log_from_val
+        from negpy.features.exposure.normalization import log_from_val
+        from negpy.features.process.fade import unmix_with_fade
 
-        roll_id = self._active_frame_roll()
-        if roll_id is None:
-            self.set_status(tr("Film Base needs a roll: this frame is in none"), 4000, "warning")
-            self.set_active_tool(ToolMode.NONE)
-            return
         bounds = self.state.last_metrics.get("final_bounds") or self.state.last_metrics.get("log_bounds")
         patch = self._sample_normalized_patch(nx, ny, radius=4)
         if bounds is None or patch is None:
@@ -3552,27 +3852,98 @@ class AppController(QObject):
             self.set_status(tr("Film Base: that spot is not flat film; click the clear rebate"), 4000, "warning")
             return
         base = logs.mean(axis=0)
-        unmix = effective_crosstalk_matrix(self.state.config.process, self.state.config.process.process_mode)
+        unmix = unmix_with_fade(self.state.config.process, self.state.config.process.process_mode)
         if unmix is not None:
+            unmix = np.asarray(unmix, dtype=np.float64)
+            if unmix.shape[1] == 4:
+                base = base - unmix[:, 3]
             try:
-                base = np.linalg.solve(np.asarray(unmix, dtype=np.float64), base)
+                base = np.linalg.solve(unmix[:, :3], base)
             except np.linalg.LinAlgError:
                 pass  # a singular matrix never reaches a render; the unmixed value is the best there is
-        if rolls.set_roll_film_base(self.session.repo, roll_id, tuple(float(v) for v in base)):
+        picked = tuple(float(v) for v in base)
+        roll_id = self.state.active_roll_id
+        if roll_id is None:
+            # With no roll open the base is this frame's own, like its Analysis Region.
+            self._set_frame_film_base(picked)
+            self.set_status(tr("Film base set for this frame"), 3000)
+        elif rolls.set_roll_film_base(self.session.repo, roll_id, picked):
             self.set_status(tr("Film base set for the roll"), 3000)
         else:
             self.set_status(tr("Film Base: this frame's roll is not in the library"), 4000, "warning")
         self.set_active_tool(ToolMode.NONE)  # leaving the uncropped tool view re-renders
 
-    def roll_film_base(self) -> Optional[tuple]:
-        """The active frame's roll's clear film base, or None."""
-        return rolls.roll_film_base(self.session.repo, self._active_frame_roll())
+    def _handle_bounds_pick(self, nx: float, ny: float, field: str) -> None:
+        """Set one picked end (manual_dmin, the thin end, or manual_dmax, the dense end) from the
+        patch median, read back through the window that rendered it, so it lands in the bounds'
+        own unmixed log space. One click: the tool disarms."""
+        from negpy.features.exposure.normalization import log_from_val
 
-    def clear_roll_film_base(self) -> None:
-        roll_id = self._active_frame_roll()
-        if roll_id is None:
+        bounds = self.state.last_metrics.get("final_bounds")
+        patch = self._sample_normalized_patch(nx, ny, radius=4)
+        if bounds is None or patch is None:
+            self.set_status(tr("Pick by Hand: click once the frame has rendered"), 3000, "warning")
             return
-        rolls.set_roll_film_base(self.session.repo, roll_id, None)
+        logs = np.asarray([log_from_val(tuple(px), bounds) for px in patch], dtype=np.float64)
+        picked = tuple(float(v) for v in np.median(logs, axis=0))
+        self._set_bounds_picks(**{field: picked, f"{field}_at": (float(nx), float(ny))})
+        self.set_status(tr("Dmin set for this frame") if field == "manual_dmin" else tr("Dmax set for this frame"), 3000)
+        self.set_active_tool(ToolMode.NONE)
+
+    def _set_bounds_picks(self, **picks: Optional[tuple]) -> None:
+        # The persisted base holds the picks once rendered, so it is measured again even under Lock Bounds.
+        conf = self.state.config
+        proc = replace(conf.process, **picks, local_floors=(0.0, 0.0, 0.0), local_ceils=(0.0, 0.0, 0.0))
+        self.apply_config(replace(conf, process=proc), persist=True)
+
+    def has_bounds_picks(self) -> bool:
+        proc = self.state.config.process
+        return proc.manual_dmin is not None or proc.manual_dmax is not None
+
+    def clear_bounds_pick(self, field: str) -> None:
+        if getattr(self.state.config.process, field) is None:
+            return
+        self._set_bounds_picks(**{field: None, f"{field}_at": None})
+        self.tool_sync_requested.emit()
+
+    def film_base_for(self, asset: dict, process: Any) -> Optional[tuple]:
+        """The clear film base a frame's readouts measure from. In an open roll, the roll's
+        picked base wins over the frame's own; with no roll open, the frame's own wins over
+        its library roll's."""
+        roll_base = rolls.roll_film_base(self.session.repo, rolls.frame_roll(self.session.repo, self.state.active_roll_id, asset))
+        if self.state.active_roll_id:
+            return roll_base or process.film_base
+        return process.film_base or roll_base
+
+    def film_base(self) -> Optional[tuple]:
+        """The active frame's film base, or None."""
+        idx = self.state.selected_file_idx
+        files = self.state.uploaded_files
+        asset = files[idx] if 0 <= idx < len(files) else {}
+        return self.film_base_for(asset, self.state.config.process)
+
+    def _set_frame_film_base(self, base: Optional[tuple]) -> None:
+        conf = self.state.config
+        self.apply_config(replace(conf, process=replace(conf.process, film_base=base)), persist=True)
+
+    def clearable_film_base(self) -> bool:
+        """Whether Clear has a base to forget: the open roll's or the frame's own. With no roll
+        open only the frame's own, as a pick there only ever sets the frame's own."""
+        if self.state.config.process.film_base is not None:
+            return True
+        roll_id = self.state.active_roll_id
+        return bool(roll_id) and rolls.roll_film_base(self.session.repo, roll_id) is not None
+
+    def clear_film_base(self) -> None:
+        """Forget the film base the active frame uses: the open roll's if it has one, else the
+        frame's own."""
+        roll_id = self.state.active_roll_id
+        if roll_id and rolls.roll_film_base(self.session.repo, roll_id) is not None:
+            rolls.set_roll_film_base(self.session.repo, roll_id, None)
+        elif self.state.config.process.film_base is not None:
+            self._set_frame_film_base(None)
+        else:
+            return
         self.tool_sync_requested.emit()
         self.request_render()
 
@@ -4299,6 +4670,9 @@ class AppController(QObject):
         self.request_render()
 
     def reset_all_peeks(self) -> None:
+        if self.state.average_peek:
+            self.state.average_peek = False
+            self.average_peek_changed.emit(False)
         if self.state.flat_peek:
             self.state.flat_peek = False
             self.flat_peek_changed.emit(False)
@@ -4308,6 +4682,7 @@ class AppController(QObject):
         if self.state.embedded_peek:
             self.state.embedded_peek = False
             self.embedded_peek_changed.emit(False)
+        self._end_export_size_view()
         if self.state.flatfield_peek:
             self.state.flatfield_peek = False
             self.flatfield_peek_changed.emit(False)
@@ -4612,7 +4987,7 @@ class AppController(QObject):
             self.request_render()
         then, self._analysis_after_crop = self._analysis_after_crop, None
         if then is not None:
-            self._request_normalization(then[0], cropped=True, detect=then[1])
+            then()
 
     def _on_batch_autocrop_cancelled(self) -> None:
         token = self._autocrop_batch_token
@@ -4758,6 +5133,7 @@ class AppController(QObject):
             self.refresh_thumbnails_for(hashes)
 
     def _on_frames_edited_offscreen(self, hashes: list[str]) -> None:
+        self.session.refresh_average_marks(set(hashes))
         if self.state.auto_thumbnail_refresh:
             self.refresh_thumbnails_for(hashes)
             return
@@ -5698,13 +6074,22 @@ class AppController(QObject):
         entry = dict(rolls.roll_scenes(self.session.repo, self.state.active_roll_id)).get(scene_id)
         return entry["name"] if entry else ""
 
+    def _roll_needed(self, message: str) -> bool:
+        """True, after saying *message*, when no roll is open for a roll-only feature."""
+        if self.state.active_roll_id:
+            return False
+        self.set_status(message, 3000)
+        return True
+
     def request_batch_normalization(self) -> None:
         """Roll Analysis: the visible frames outside every scene."""
-        self._request_normalization(None)
+        if not self._roll_needed(ROLL_ANALYSIS_NEEDS_A_ROLL):
+            self._request_normalization(None)
 
     def request_scene_analysis(self, scene_id: str) -> None:
         """Scene Analysis: one scene's loaded members, whatever the sheet filter shows."""
-        self._request_normalization(scene_id)
+        if not self._roll_needed(SCENES_NEED_A_ROLL):
+            self._request_normalization(scene_id)
 
     def _request_normalization(self, scene_id: Optional[str], *, cropped: bool = False, detect: bool = False) -> None:
         """A frame still waiting for Auto Crop would meter its film border, so those are cropped
@@ -5713,12 +6098,7 @@ class AppController(QObject):
         title = tr("Detect Scenes") if detect else tr("Roll Analysis") if scene_id is None else tr("Scene Analysis")
         if self._batch_busy(title):
             return
-        if scene_id is None:
-            in_scene = set(rolls.scene_by_hash(self.session.repo, self.state.active_roll_id))
-            visible = [self.state.uploaded_files[i] for i in self.session.asset_model.visible_actual_indices_ordered()]
-            frames = [f for f in visible if rolls.unforked_hash(f["hash"]) not in in_scene]
-        else:
-            frames = self._normalization_targets(scene_id)
+        frames = self._roll_analysis_frames() if scene_id is None else self._normalization_targets(scene_id)
         if not frames:
             return
         if detect:
@@ -5728,7 +6108,7 @@ class AppController(QObject):
             return
         waiting = [] if cropped else [f for f in frames if self._waits_for_auto_crop(f)]
         if waiting and self.request_batch_auto_crop(assets=waiting):
-            self._analysis_after_crop = (scene_id, detect)
+            self._analysis_after_crop = lambda: self._request_normalization(scene_id, cropped=True, detect=detect)
             return
         if detect:
             batch_title = tr("Detecting scenes")
@@ -5744,7 +6124,7 @@ class AppController(QObject):
 
     def request_analyze_all_scenes(self) -> None:
         """Scene Analysis for every scene of the active roll with a loaded frame, one after another."""
-        if self._batch_busy(tr("Scene Analysis")):
+        if self._roll_needed(SCENES_NEED_A_ROLL) or self._batch_busy(tr("Scene Analysis")):
             return
         queue = [
             (sid, frames)
@@ -5765,13 +6145,48 @@ class AppController(QObject):
         self._scene_queue = [sid for sid, _frames in queue[1:]]
         self._dispatch_normalization(*queue[0])
 
+    def _roll_analysis_frames(self) -> List[dict]:
+        """The frames Roll Analysis reads: the visible ones outside every scene."""
+        in_scene = set(rolls.scene_by_hash(self.session.repo, self.state.active_roll_id))
+        visible = [self.state.uploaded_files[i] for i in self.session.asset_model.visible_actual_indices_ordered()]
+        return [f for f in visible if rolls.unforked_hash(f["hash"]) not in in_scene]
+
+    def _reanalyze_targets(self) -> List[dict]:
+        state = self.state
+        return [
+            state.uploaded_files[i] for i in (state.selected_indices or [state.selected_file_idx]) if 0 <= i < len(state.uploaded_files)
+        ]
+
+    def reanalyze_selection(self) -> None:
+        """Measures each selected frame (else the open one) again on its own bounds, off its
+        roll or scene baseline. A frame with Lock Bounds is skipped."""
+        frames = [f for f in self._reanalyze_targets() if not self._config_for_batch_asset(f).process.lock_bounds]
+        if frames:
+            self._clear_local_bounds(frames)
+            self.set_status(tr("{value} measured again", value=count_of(len(frames), "frame")), 3000)
+
+    def _clear_local_bounds(self, frames: List[dict]) -> None:
+        """Puts each of *frames* on fresh own bounds: the open one measures at its next render,
+        the others at their thumbnail refresh."""
+        changed: List[str] = []
+        for f in frames:
+            if f["hash"] == self.state.current_file_hash:
+                self.session.update_config(replace(self.state.config, process=_own_bounds(self.state.config.process)), persist=True)
+                self.request_render()
+                continue
+            p = self.session.repo.load_file_settings(f["hash"]) or self.session.config_for_asset(f)
+            new_p = replace(p, process=_own_bounds(p.process))
+            self.session.push_external_history(f["hash"], p, new_p)
+            self.session.repo.save_file_settings(f["hash"], new_p, file_path=f["path"])
+            changed.append(f["hash"])
+        if changed:
+            self.session.frames_edited_offscreen.emit(changed)
+
     def request_detect_scenes(self) -> None:
         """Detect Scenes: measure the visible frames outside every scene and find the groups under
         another light than the roll's. The groups wait as found scenes for Accept or Discard."""
-        if self.state.active_roll_id is None:
-            self.set_status(tr("Save the Film Strip as a roll before grouping scenes"), 3000)
-            return
-        self._request_normalization(None, detect=True)
+        if not self._roll_needed(SCENES_NEED_A_ROLL):
+            self._request_normalization(None, detect=True)
 
     def _on_scenes_detected(self, groups: list) -> None:
         self._end_batch("normalization")
@@ -5929,10 +6344,16 @@ class AppController(QObject):
 
         if scene_id is None:
             if roll_id is not None:
-                rolls.set_roll_normalization(self.session.repo, roll_id, locked_floors, locked_ceils, outliers=outliers, axis=axis)
+                known = tuple(f["hash"] for f in targets)
+                rolls.set_roll_normalization(
+                    self.session.repo, roll_id, locked_floors, locked_ceils, outliers=outliers, axis=axis, frames=known
+                )
             message = tr("Roll analysis complete")
         else:
-            rolls.set_scene_normalization(self.session.repo, roll_id, scene_id, locked_floors, locked_ceils, outliers=outliers, axis=axis)
+            known = tuple(f["hash"] for f in targets)
+            rolls.set_scene_normalization(
+                self.session.repo, roll_id, scene_id, locked_floors, locked_ceils, outliers=outliers, axis=axis, frames=known
+            )
             self.session.refresh_scene_marks()
             message = tr("Scene “{value}” analyzed", value=self._scene_name(scene_id))
 
@@ -5969,6 +6390,251 @@ class AppController(QObject):
         self._end_batch("normalization")
         self.status_progress_requested.emit(0, 0)
         self.request_render()
+
+    def _run_background_baseline(self) -> None:
+        """Measures the roll baseline, then each scene's, one per run, without a dialog or
+        progress bar and without turning any frame's Use Average on. A scope runs while one of its
+        frames is missing from its saved baseline; a baseline saved before frames were recorded
+        stays until Roll or Scene Analysis runs."""
+        roll_id = self.state.active_roll_id
+        if roll_id is None or self._active_batch is not None or self._background_baseline is not None:
+            return
+        repo = self.session.repo
+        for scene_id in [None, *(sid for sid, _entry in rolls.roll_scenes(repo, roll_id))]:
+            frames = [f for f in self._normalization_targets(scene_id) if not self._waits_for_auto_crop(f)]
+            hashes = tuple(f["hash"] for f in frames)
+            saved = rolls.scene_normalization(repo, roll_id, scene_id) if scene_id else rolls.roll_normalization(repo, roll_id)
+            if len(frames) >= 2 and not (saved and (saved["frames"] is None or set(hashes) <= set(saved["frames"]))):
+                break
+        else:
+            return
+        self._background_baseline = (roll_id, scene_id, hashes)
+        self._on_background_baseline_progress(0, len(frames))
+        self.bg_norm_worker.arm()
+        self.background_normalization_requested.emit(
+            NormalizationTask(
+                frames=[NormalizationInput(file_info=f, config=self._config_for_batch_asset(f)) for f in frames],
+                workspace_color_space=self.state.workspace_color_space,
+                override_analysis_buffer=None,
+                override_luma_range_clip=None,
+                override_color_range_clip=None,
+                background=True,
+            )
+        )
+        self.config_updated.emit()
+
+    def measuring_baseline(self) -> bool:
+        return self._background_baseline is not None
+
+    def _on_background_baseline(self, floors: tuple, ceils: tuple, outlier_hashes: list, axis: Optional[tuple] = None) -> None:
+        """Saves the measured baseline on the roll or scene and moves the frames that already ride it."""
+        if self._background_baseline is None:
+            return
+        roll_id, scene_id, hashes = self._background_baseline
+        outliers = tuple(outlier_hashes)
+        if scene_id:
+            rolls.set_scene_normalization(self.session.repo, roll_id, scene_id, floors, ceils, outliers=outliers, axis=axis, frames=hashes)
+        else:
+            rolls.set_roll_normalization(self.session.repo, roll_id, floors, ceils, outliers=outliers, axis=axis, frames=hashes)
+        if roll_id == self.state.active_roll_id:
+            self._refresh_riding_frames(scene_id, floors, ceils, axis)
+            # Outliers moved with the new pool.
+            self.session.refresh_average_marks()
+        self._on_background_baseline_ended()
+        # Frames that arrived during the run.
+        self._background_baseline_timer.start()
+
+    def _shares_progress_bar(self) -> bool:
+        """The canvas bar belongs to a batch or a thumbnail refresh first; the background run only borrows it."""
+        return self._active_batch is None and not self._thumbnail_render_running
+
+    def _on_background_baseline_progress(self, done: int, total: int, *_args) -> None:
+        if self._background_baseline is None:
+            return
+        if self._background_baseline[1]:
+            text = tr("Scene average {index}/{total}", index=done, total=total)
+        else:
+            text = tr("Roll average {index}/{total}", index=done, total=total)
+        self.baseline_progress.emit(text)
+        if self._shares_progress_bar():
+            self.status_progress_requested.emit(done, total)
+
+    def _on_background_baseline_ended(self, *_args) -> None:
+        self._background_baseline = None
+        self.baseline_progress.emit("")
+        if self._shares_progress_bar():
+            self.status_progress_requested.emit(0, 0)
+        self.config_updated.emit()
+
+    def _refresh_riding_frames(self, scene_id: Optional[str], floors: tuple, ceils: tuple, axis: Optional[tuple]) -> None:
+        """A frame that rides Use Average on this scene's or the roll's baseline, or on none yet
+        while it belongs here, takes the new numbers; its Use Average choices stay."""
+        source = f"scene:{scene_id}" if scene_id else f"roll:{self.state.active_roll_id}"
+        own = {f["hash"] for f in self._normalization_targets(scene_id)}
+
+        def rides(p, file_hash: str) -> bool:
+            if p.lock_bounds or not (p.use_luma_average or p.use_color_average or p.use_cast_average):
+                return False
+            return p.baseline_source == source or (file_hash in own and not (p.baseline_source or p.is_locked_initialized))
+
+        values = {"locked_floors": floors, "locked_ceils": ceils, "locked_neutral_axis": axis, "baseline_source": source}
+        current = self.state.current_file_hash
+        changed: List[str] = []
+        for f in self.state.uploaded_files:
+            if f["hash"] == current:
+                continue
+            p = self.session.repo.load_file_settings(f["hash"]) or self.session.config_for_asset(f)
+            if not rides(p.process, f["hash"]):
+                continue
+            new_p = replace(p, process=replace(p.process, **values))
+            self.session.push_external_history(f["hash"], p, new_p)
+            self.session.repo.save_file_settings(f["hash"], new_p, file_path=f["path"])
+            changed.append(f["hash"])
+        if changed:
+            self.session.frames_edited_offscreen.emit(changed)
+        if current and rides(self.state.config.process, current):
+            self.session.update_config(replace(self.state.config, process=replace(self.state.config.process, **values)), persist=True)
+            self.request_render()
+
+    def set_roll_average(self, scope: Optional[str] = None, **axis: bool) -> None:
+        """Use Average on the active frame alone. An axis turned on takes the current scene or
+        roll baseline (the roll's with *scope* ``"roll"``), unless the frame carries one taken
+        from another frame."""
+        process = self.state.config.process
+        changes: dict = dict(axis)
+        if "use_luma_average" in axis or "use_color_average" in axis:
+            # The other axis re-derives per frame; roll_name drops since a picked baseline no longer applies whole.
+            changes.update(roll_name=None, **invalidate_local_bounds(process))
+        if any(axis.values()):
+            changes.update(self._saved_baseline_fields(process, scope=scope))
+        self.set_roll_default("baseline", **changes)
+
+    def average_scopes(self) -> Dict[str, str]:
+        """``{"scene": label, "roll": label}`` while the open frame is in a measured scene and the
+        roll is measured too, so it can choose either average; else empty."""
+        roll_id, file_hash = self.state.active_roll_id, self.state.current_file_hash
+        if not roll_id or not file_hash:
+            return {}
+        repo = self.session.repo
+        scene = rolls.scene_by_hash(repo, roll_id).get(rolls.unforked_hash(file_hash))
+        if not scene or not rolls.scene_normalization(repo, roll_id, scene[1]) or not rolls.roll_normalization(repo, roll_id):
+            return {}
+        return {"scene": rolls.source_label(repo, f"scene:{scene[1]}"), "roll": rolls.source_label(repo, f"roll:{roll_id}")}
+
+    def _saved_baseline_fields(self, process, file_hash: Optional[str] = None, scope: Optional[str] = None) -> dict:
+        """The scene or roll baseline a frame's Use Average reads (the active frame's by default), as
+        process fields; none for a frame with Lock Bounds or a baseline taken from another frame.
+        *scope* ``"roll"`` or ``"scene"`` overrides the frame's own choice."""
+        file_hash = file_hash or self.state.current_file_hash
+        kind = process.baseline_source.partition(":")[0]
+        if process.lock_bounds or kind not in ("", "roll", "scene") or not file_hash:
+            return {}
+        scope = scope or rolls.average_scope(process)
+        found = rolls.frame_saved_baseline(self.session.repo, self.state.active_roll_id, file_hash, scope)
+        if found is None:
+            return {}
+        saved, source = found
+        return {
+            "locked_floors": saved["floors"],
+            "locked_ceils": saved["ceils"],
+            "locked_neutral_axis": saved["axis"],
+            "baseline_source": source,
+        }
+
+    def set_selection_average(self, on: bool) -> None:
+        """Use Average (on: Luma, Color and, where it applies, Cast) or Use Own Measurement
+        (off) on each selected frame, else the open one. A frame with no baseline yet stays."""
+        current = self.state.current_file_hash
+        changed: List[str] = []
+        skipped = 0
+        for f in self._reanalyze_targets():
+            config = (
+                self.state.config
+                if f["hash"] == current
+                else self.session.repo.load_file_settings(f["hash"]) or self.session.config_for_asset(f)
+            )
+            baseline = self._saved_baseline_fields(config.process, f["hash"]) if on else {}
+            if on and not baseline:
+                skipped += 1
+                continue
+            cast = on and config.process.process_mode == ProcessMode.C41 and baseline.get("locked_neutral_axis") is not None
+            axes = {"use_luma_average": on, "use_color_average": on, "use_cast_average": cast}
+            if f["hash"] == current:
+                self.set_roll_average(**axes)
+                continue
+            process = replace(config.process, **axes, roll_name=None, **invalidate_local_bounds(config.process), **baseline)
+            new_config = replace(config, process=process)
+            self.session.push_external_history(f["hash"], config, new_config)
+            self.session.repo.save_file_settings(f["hash"], new_config, file_path=f["path"])
+            self._lock_roll_card_for(f, f["hash"], new_config, "baseline")
+            changed.append(f["hash"])
+        if changed:
+            self.session.frames_edited_offscreen.emit(changed)
+        if skipped:
+            self.set_status(tr("{value} without an average yet kept their own measurement", value=count_of(skipped, "frame")), 4000)
+
+    def toggle_average_peek(self, force: Optional[bool] = None) -> None:
+        """Print the frame on the roll average without changing the edit. Opens with the frame's
+        own averages, or Luma and Color (and Cast where it applies) when it uses none."""
+        if self.state.preview_raw is None:
+            return
+        target = (not self.state.average_peek) if force is None else force
+        if target == self.state.average_peek:
+            return
+        process = self.state.config.process
+        if target:
+            if not self._saved_baseline_fields(process):
+                self.set_status(tr("No average for this frame yet"), 3000)
+                self.average_peek_changed.emit(False)
+                return
+            self.exit_compare()
+            self.reset_all_peeks()
+            self._clear_test_strip()
+            axes = {f: bool(getattr(process, f)) for f in _AVERAGE_FIELDS}
+            if not any(axes.values()):
+                axes = {"use_luma_average": True, "use_color_average": True, "use_cast_average": self._cast_average_applies()}
+            self.state.average_peek_axes = axes
+            self.state.average_peek_scope = rolls.average_scope(process)
+        self.state.average_peek = target
+        self.average_peek_changed.emit(target)
+        if target:
+            self._render_average_peek()
+        else:
+            self.request_render()
+
+    def _cast_average_applies(self) -> bool:
+        process = self.state.config.process
+        return process.process_mode == ProcessMode.C41 and self._saved_baseline_fields(process).get("locked_neutral_axis") is not None
+
+    def set_average_peek_axes(self, **axes: bool) -> None:
+        if not self.state.average_peek:
+            return
+        self.state.average_peek_axes = {**self.state.average_peek_axes, **axes}
+        self.average_peek_changed.emit(True)
+        self._render_average_peek()
+
+    def set_average_peek_scope(self, scope: Optional[str]) -> None:
+        if not self.state.average_peek:
+            return
+        self.state.average_peek_scope = scope
+        self.average_peek_changed.emit(True)
+        self._render_average_peek()
+
+    def _render_average_peek(self) -> None:
+        process = self.state.config.process
+        axes = self.state.average_peek_axes
+        fields = self._saved_baseline_fields(process, scope=self.state.average_peek_scope or "scene") if any(axes.values()) else {}
+        peek = replace(process, **axes, **fields)
+        self.request_render(readback_metrics=False, config_override=replace(self.state.config, process=peek))
+
+    def keep_average_peek(self) -> None:
+        """Apply: the peek's averages become the frame's, as one edit."""
+        if not self.state.average_peek:
+            return
+        axes = dict(self.state.average_peek_axes)
+        self.state.average_peek = False
+        self.average_peek_changed.emit(False)
+        self.set_roll_average(scope=self.state.average_peek_scope or "scene", **axes)
 
     def request_reset_roll(self) -> None:
         """Reset every visible frame to its own bare defaults -- Reset Settings, applied
@@ -6029,12 +6695,11 @@ class AppController(QObject):
         return [rolls.unforked_hash(h) for h in self._selected_frame_hashes()]
 
     def _edit_scenes(self, edit: Callable[[str], Any]) -> Any:
-        roll_id = self.state.active_roll_id
-        if roll_id is None:
-            self.set_status(tr("Save the Film Strip as a roll before grouping scenes"), 3000)
+        if self._roll_needed(SCENES_NEED_A_ROLL):
             return None
-        result = edit(roll_id)
+        result = edit(self.state.active_roll_id)
         self.session.refresh_scene_marks()
+        self._background_baseline_timer.start()
         return result
 
     def request_group_as_scene(self, name: str) -> Optional[str]:
@@ -6075,6 +6740,7 @@ class AppController(QObject):
     _ROLL_CARDS = (
         "film",
         "sensor",
+        "fade",
         "process",
         "baseline",
         "demosaic",
@@ -6089,6 +6755,7 @@ class AppController(QObject):
     _ROLL_CARD_LABELS = {
         "film": tr("Film Mode"),
         "sensor": tr("Calibration"),
+        "fade": tr("Fade Restoration"),
         "demosaic": tr("Raw Decode"),
         "baseline": tr("Roll Analysis"),
         "process": tr("Metering"),
@@ -6157,32 +6824,37 @@ class AppController(QObject):
         through (rolls.frame_roll). No-op with no frame, or a frame in no roll."""
         if not self.state.current_file_hash:
             return
-        roll_id = self._active_frame_roll()
+        idx = self.state.selected_file_idx
+        files = self.state.uploaded_files
+        asset = files[idx] if 0 <= idx < len(files) else {}
+        self._lock_roll_card_for(asset, self.state.current_file_hash, self.state.config, card_key)
+
+    def _lock_roll_card_for(self, asset: dict, file_hash: str, config: WorkspaceConfig, card_key: str) -> None:
+        """_lock_roll_card for any frame, given its config."""
+        roll_id = rolls.frame_roll(self.session.repo, self.state.active_roll_id, asset)
         if roll_id is None:
             return
         defaults = rolls.roll_defaults(self.session.repo, roll_id)
         # A field the roll has never set at all cannot "match" -- there is nothing yet
         # to differ from, and treating that as a match would hide a card's first-ever
         # edit from Apply until every one of its fields happened to get a roll default.
-        current = self._card_values(self.state.config, card_key)
+        current = self._card_values(config, card_key)
         matches_roll = all(name in defaults and rolls.same_value(value, defaults[name]) for name, value in current.items())
         diverged = not matches_roll
-        file_hash = rolls.unforked_hash(self.state.current_file_hash)
+        file_hash = rolls.unforked_hash(file_hash)
         if diverged == (card_key in rolls.frame_override_cards(self.session.repo, roll_id, file_hash)):
             return
         rolls.set_frame_override(self.session.repo, roll_id, file_hash, card_key, diverged)
 
-    def _active_frame_roll(self) -> Optional[str]:
-        idx = self.state.selected_file_idx
-        files = self.state.uploaded_files
-        asset = files[idx] if 0 <= idx < len(files) else {}
-        return rolls.frame_roll(self.session.repo, self.state.active_roll_id, asset)
-
     def set_process_mode(self, mode: str) -> None:
         """Switches Film Mode for the active frame, locking the "film" card away from
         the roll the instant it changes and was not already -- same as any other
-        Roll-tab card (set_roll_default). Apply to Whole Roll pushes it out."""
-        self.apply_config(with_process_mode(self.state.config, mode), persist=True)
+        Roll-tab card (set_roll_default). Apply to Whole Roll pushes it out. A switch to
+        Slide starts a scanner file Positive."""
+        config = with_process_mode(self.state.config, mode)
+        if config.process.process_mode != self.state.config.process.process_mode:
+            config = with_scanner_positive_default(config, self.state.current_file_path or "")
+        self.apply_config(config, persist=True)
         self._lock_roll_card("film")
 
     def set_positive_source(self, checked: bool) -> None:
@@ -6193,6 +6865,14 @@ class AppController(QObject):
             # The shortcut still reaches the hidden button.
             return
         self.apply_config(with_positive_source(self.state.config, checked), persist=True)
+        self._lock_roll_card("film")
+
+    def set_source_encoding(self, encoding: str) -> None:
+        """Sets the active frame's Source Encoding, locking the "film" card away from the roll
+        like Positive: one scanner and one workflow usually make a whole roll."""
+        if str(self.state.config.process.source_encoding) == encoding:
+            return
+        self.apply_config(with_source_encoding(self.state.config, encoding), persist=True)
         self._lock_roll_card("film")
 
     def set_roll_default(self, card_key: str, persist: bool = True, readback_metrics: bool = True, **changes) -> None:
@@ -6904,6 +7584,122 @@ class AppController(QObject):
         self.session.asset_model.refresh()
         forget_composite(self.session.repo, asset["path"])
 
+    def _discovery_busy(self) -> bool:
+        """A loading run that ends after a triplet changes would load an absorbed exposure again."""
+        if not (self._discovery_running or self._pending_asset_discoveries):
+            return False
+        self.set_status(tr("Wait until the files finish loading"), 4000, kind="warning")
+        return True
+
+    def set_triplet(self, red: str, green: str, blue: str, align: bool = True, index: Optional[int] = None) -> None:
+        """Join three exposures into one triplet frame, made by hand.
+
+        Every loaded frame that holds one of the three files gives way, as does *index*, the frame
+        Edit Trichrome opened on. Their other files return as frames of their own."""
+        from negpy.kernel.image.logic import calculate_file_hash
+
+        files = self.state.uploaded_files
+        wanted = {red, green, blue}
+        if self._discovery_busy():
+            return
+        if not all(os.path.isfile(p) for p in wanted):
+            self.set_status(tr("A file for red, green or blue does not exist"), 4000, kind="warning")
+            return
+        if len(wanted) != 3:
+            self.set_status(tr("Pick three different files for red, green and blue"), 4000, kind="warning")
+            return
+        opened = files[index] if index is not None and 0 <= index < len(files) else None
+        if opened is not None and not can_edit_triplet(opened):
+            self.set_status(tr("Edit Trichrome does not work on a stitch, an HDR merge, a diptych or a half frame"), 4000, kind="warning")
+            return
+        if any(wanted & set(source_files(f)) for f in files if not can_edit_triplet(f)):
+            self.set_status(tr("A file is already part of a stitch, an HDR merge, a diptych or a half frame"), 4000, kind="warning")
+            return
+        self.session.save_active_edit()
+        indices = {i for i, f in enumerate(files) if wanted & set(source_files(f))}
+        if opened is not None:
+            indices.add(index)
+        replaced = [files[i] for i in sorted(indices)]
+        released = [p for f in replaced for p in source_files(f) if p not in wanted and os.path.exists(p)]
+        # remember_triplets drops only a record that shares a file with the new one.
+        forget_triplets(self.session.repo, [f["path"] for f in replaced if f.get("green_path") and f["path"] != red])
+        known = {}
+        for f in replaced:
+            known.update({f.get("green_path"): f.get("green_hash"), f.get("blue_path"): f.get("blue_hash")})
+            known[f["path"]] = rolls.unforked_hash(f["hash"])
+
+        def file_hash(path: str) -> str:
+            return known.get(path) or calculate_file_hash(path)
+
+        red_entry = next((f for f in replaced if f["path"] == red), {})
+        asset = {
+            "name": os.path.splitext(os.path.basename(red))[0] + " (RGB)",
+            "path": red,
+            "hash": file_hash(red),
+            "legacy_hash": red_entry.get("legacy_hash", ""),
+            "mtime": red_entry.get("mtime") or os.path.getmtime(red),
+            "green_path": green,
+            "blue_path": blue,
+            "green_hash": file_hash(green),
+            "blue_hash": file_hash(blue),
+            "align": bool(align),
+            "triplet_by_hand": True,
+        }
+        self._apply_roll_forks([asset])
+        if not indices:
+            return
+        self.session.apply_composite(sorted(indices), asset)
+        if released:
+            self.request_asset_discovery(released, rgb_scan=False)
+        self.generate_missing_thumbnails()
+
+    def request_trichrome_merge(self) -> None:
+        """Join the three selected frames into one triplet; a background read finds red, green and blue."""
+        if self._batch_busy(tr("Merge Exposures (Trichrome)")) or self._discovery_busy():
+            return
+        files = self.state.uploaded_files
+        indices = trichrome_merge_indices(files, self.state.selected_indices)
+        if not indices:
+            self.set_status(tr("Select three single frames to merge as a trichrome"), 4000)
+            return
+        if self._begin_batch("trichrome_merge", tr("Reading the three exposures"), abortable=False) is None:
+            return
+        self.trichrome_merge_requested.emit(tuple(files[i]["path"] for i in indices))
+
+    def _on_triplet_placed(self, result: dict) -> None:
+        self._end_batch("trichrome_merge")
+        triplet = result["triplet"]
+        if triplet is None:
+            if result["reason"] == "picture":
+                message = tr("The three frames do not seem to show the same picture. Use Edit Trichrome… to join them anyway.")
+            else:
+                message = tr("Could not tell red, green and blue apart. Use Edit Trichrome… to pick them by hand.")
+            self.set_status(message, 8000, kind="warning")
+            return
+        # The selection can change during the read, so the frames are found again by path.
+        loaded = {f["path"] for f in self.state.uploaded_files if not composite_kind(f)}
+        if not set(result["paths"]) <= loaded:
+            self.set_status(tr("A frame changed during the merge. Select the three frames again."), 4000, kind="warning")
+            return
+        self.set_triplet(triplet.red, triplet.green, triplet.blue)
+
+    def request_split_triplet(self) -> None:
+        """Turn the active triplet back into its three exposures. Each keeps its own edit; the red one
+        keeps the triplet's, whose hash it shares."""
+        idx = self.state.selected_file_idx
+        if not (0 <= idx < len(self.state.uploaded_files)):
+            return
+        asset = self.state.uploaded_files[idx]
+        if not is_plain_triplet(asset):
+            return
+        self.session.save_active_edit()
+        paths = [p for p in (asset["path"], asset["green_path"], asset["blue_path"]) if os.path.exists(p)]
+        forget_triplets(self.session.repo, [asset["path"]])
+        self._drop_dissolved_composite(idx)
+        self._pending_scanned_file = asset["path"]
+        # Without grouping: Trichrome Mode would join the three again at once.
+        self.request_asset_discovery(paths, rgb_scan=False)
+
     def request_unstitch(self) -> None:
         """Dissolve the active stitched composite back into its part frames.
 
@@ -7144,6 +7940,8 @@ class AppController(QObject):
         if not roll_id or not path or not from_hash or rolls.unforked_hash(from_hash) != from_hash:
             return
         is_active = from_hash == self.state.current_file_hash
+        if is_active:
+            self.session.end_frame_previews()
         seed = self.state.config if is_active else self.session.config_for_asset(asset)
         asset["hash"] = rolls.fork_edit(self.session.repo, roll_id, from_hash, path, seed)
         self.session.asset_model.refresh()
@@ -7177,6 +7975,24 @@ class AppController(QObject):
         picked = [files[i] for i in indices if 0 <= i < len(files)]
         gone = {p for a in picked for p in source_files(a)}
         return [i for i, a in enumerate(files) if a.get("path") in gone] if self.state.active_roll_id else []
+
+    def removed_frame_count(self, roll_id: str) -> int:
+        """How many frames Remove from Roll took out of a folder roll, of those still on disk."""
+        paths = rolls.removed_paths(self.session.repo, roll_id)
+        if not paths:
+            return 0
+        triplets = applied_triplets(self.session.repo, self.rgb_scan_mode_for_roll(roll_id))
+        return frame_count(paths, saved_composites(self.session.repo), triplets)
+
+    def restore_removed_frames(self, roll_id: str) -> None:
+        """Bring back every frame Remove from Roll took out of a folder roll; the open roll loads them."""
+        count = self.removed_frame_count(roll_id)
+        paths = rolls.restore_removed(self.session.repo, roll_id)
+        self.invalidate_library_walk()
+        if paths and roll_id == self.state.active_roll_id:
+            self.request_asset_discovery(paths)
+        name = (rolls.roll_for_id(self.session.repo, roll_id) or {}).get("name") or tr("this roll")
+        self.set_status(tr("Restored {value} to “{name}”", value=count_of(count, "frame"), name=name), 3000)
 
     def request_remove_from_roll(self, indices: List[int]) -> None:
         """Take the frames at *indices* out of the active roll and the Film Strip, with
@@ -7232,6 +8048,11 @@ class AppController(QObject):
         self._last_capture_req = req
         self.capture_worker.arm()
         self.capture_requested.emit(req)
+
+    def eject_film(self, port: str) -> None:
+        """Move the strip out of a light with a film transport, on the capture thread."""
+        self._ensure_capture_thread()
+        self.capture_eject_requested.emit(port)
 
     def cancel_capture(self) -> None:
         self.capture_worker.cancel()
@@ -7295,6 +8116,12 @@ class AppController(QObject):
         defaults = rolls.roll_defaults(self.session.repo, roll_id)
         if not all(key in defaults and rolls.same_value(value, defaults[key]) for key, value in wanted.items()):
             rolls.set_roll_defaults(self.session.repo, roll_id, **wanted)
+
+    def _on_capture_flat(self, path: str) -> None:
+        """A strip's bare-light reference: save it as the roll's Flat Field profile, which its frames take."""
+        req = getattr(self, "_last_capture_req", None)
+        roll = req.roll_name if req is not None else os.path.splitext(os.path.basename(path))[0]
+        self.save_flatfield_profile(f"{roll} (Lento Dock)", path)
 
     def _on_capture_finished(self, paths: list) -> None:
         """Feed the captured frame(s) into NegPy. An RGB triplet → RGB-Scan, C-41; a single-capture
@@ -7602,6 +8429,9 @@ class AppController(QObject):
         if config_override is None and self.state.flat_peek:
             self.state.flat_peek = False
             self.flat_peek_changed.emit(False)
+        if config_override is None and self.state.average_peek:
+            self.state.average_peek = False
+            self.average_peek_changed.emit(False)
         if config_override is None and (self.state.negative_peek or self.state.embedded_peek) and not self._peek_shows(self.state.config):
             self.reset_all_peeks()
 
@@ -7690,7 +8520,7 @@ class AppController(QObject):
             split_axis=str(dip[0].get("split_axis") or "x") if dip is not None else "x",
             gain_slices=self._preview_gain_slices(dip),
             source_orientation=self.state.preview_orientation,
-            film_base=self.roll_film_base(),
+            film_base=self.film_base(),
         )
 
         self._cancel_neighbor_prefetch()
@@ -7790,6 +8620,7 @@ class AppController(QObject):
             or st.flat_peek
             or st.embedded_peek
             or st.flatfield_peek
+            or st.export_size_view
             or st.active_tool in UNCROPPED_PREVIEW_TOOLS
         ):
             return
@@ -7823,6 +8654,7 @@ class AppController(QObject):
             if self.state.embedded_peek:
                 self.state.embedded_peek = False
                 self.embedded_peek_changed.emit(False)
+            self._end_export_size_view()
             if self.state.flatfield_peek:
                 self.state.flatfield_peek = False
                 self.flatfield_peek_changed.emit(False)
@@ -7841,6 +8673,8 @@ class AppController(QObject):
             self.reset_all_peeks()
         if self.state.flatfield_peek:
             self._paint_flatfield_peek()
+        elif self.state.average_peek:
+            self._render_average_peek()
         elif self.state.flat_peek:
             self.request_render(readback_metrics=False, config_override=flat_master_config(self.state.config))
         else:
@@ -7917,6 +8751,7 @@ class AppController(QObject):
             if self.state.embedded_peek:
                 self.state.embedded_peek = False
                 self.embedded_peek_changed.emit(False)
+            self._end_export_size_view()
             if self.state.flatfield_peek:
                 self.state.flatfield_peek = False
                 self.flatfield_peek_changed.emit(False)
@@ -8017,6 +8852,7 @@ class AppController(QObject):
             if self.state.embedded_peek:
                 self.state.embedded_peek = False
                 self.embedded_peek_changed.emit(False)
+            self._end_export_size_view()
             if self.state.flatfield_peek:
                 self.state.flatfield_peek = False
                 self.flatfield_peek_changed.emit(False)
@@ -8070,9 +8906,10 @@ class AppController(QObject):
         # point of the view.
         self._store_peek_frame(img, splash=True, crop_preview_full=context.crop_preview_full)
 
-    def _store_peek_frame(self, buffer: np.ndarray, splash: bool, crop_preview_full: bool) -> None:
+    def _store_peek_frame(self, buffer: np.ndarray, splash: bool, crop_preview_full: bool, **keys: Any) -> None:
         """Put a painted peek on the canvas, beside the print in last_metrics. `interactive` is
-        False: a prior Flat Peek render can leave it True, and right_panel then skips the histogram."""
+        False: a prior Flat Peek render can leave it True, and right_panel then skips the histogram.
+        `keys` overrides the defaults below."""
         self.state.peek_frame = {
             "base_positive": buffer,
             "content_rect": None,
@@ -8081,8 +8918,124 @@ class AppController(QObject):
             "splash": splash,
             "proof": False,
             "interactive": False,
+            **keys,
         }
         self.image_updated.emit()
+
+    def _paint_export_view(self) -> None:
+        """Put the export render on the canvas. A print, so it takes the soft proof. Its long edge
+        stands in for the scan's, so the zoom readout counts export pixels."""
+        view = self.state.export_view
+        if view is None:
+            return
+        self._store_peek_frame(
+            view["buffer"],
+            splash=False,
+            crop_preview_full=False,
+            content_rect=view["content_rect"],
+            render_long_edge=max(self.state.original_res or (0, 0)),
+            proof=True,
+            export_view=True,
+        )
+
+    def toggle_export_size_view(self, force: Optional[bool] = None) -> None:
+        """Show the frame as it exports, at the export size, without changing the edit. It follows
+        each edit once its export render lands. Exclusive with the peeks, the compare view and the
+        test strip."""
+        if self.state.preview_raw is None:
+            return
+        target = (not self.state.export_size_view) if force is None else force
+        if target == self.state.export_size_view:
+            return
+        if target:
+            self.exit_compare()
+            self.reset_all_peeks()
+            self._clear_test_strip()
+        self.state.export_size_view = target
+        self.export_size_view_changed.emit(target)
+        if target and self.state.export_view is not None:
+            self._paint_export_view()
+        elif target:
+            self._schedule_export_view()
+        else:
+            self.request_render()
+
+    def _end_export_size_view(self) -> None:
+        if self.state.export_size_view:
+            self.state.export_size_view = False
+            self.export_size_view_changed.emit(False)
+
+    def _export_view_wanted(self) -> bool:
+        st = self.state
+        return (st.export_size_view or st.grain_focuser) and st.preview_raw is not None and bool(st.current_file_path)
+
+    def _export_view_task(self) -> tuple[tuple, ExportTask]:
+        """The export of the open frame with the Export panel's settings, as Export would run it,
+        and the key that tells a later edit apart."""
+        st = self.state
+        params = flat_master_config(st.config) if st.flat_output else st.config
+        export_conf = replace(st.config.export, icc_input_path=self.effective_input_icc(), icc_output_path=st.icc_output_path)
+        if st.flat_output:
+            export_conf = flat_export_config(export_conf)
+        file_info = next(
+            (f for f in st.uploaded_files if f.get("hash") == st.current_file_hash),
+            {"name": os.path.basename(st.current_file_path or ""), "path": st.current_file_path, "hash": st.current_file_hash},
+        )
+        file_info, diptych = self._diptych_task(file_info)
+        bounds_override = None
+        if diptych is None:
+            with st.metrics_lock:
+                bounds_override = st.last_metrics.get("log_bounds")
+        task = ExportTask(
+            file_info=file_info,
+            params=params,
+            export_settings=preset_from_export_config(export_conf),
+            gpu_enabled=st.gpu_enabled,
+            bounds_override=bounds_override,
+            diptych=diptych,
+        )
+        return (file_info.get("hash"), file_info.get("half"), params, export_conf, diptych, st.gpu_enabled), task
+
+    def _schedule_export_view(self) -> None:
+        """Drop an export render the edit has moved past and start the timer for a new one. Runs
+        after each render, so the export uses that render's bounds."""
+        if not self._export_view_wanted():
+            self.state.export_view = None
+            return
+        view = self.state.export_view
+        if view is not None and view["key"] != self._export_view_task()[0]:
+            self.state.export_view = None
+            self.export_view_ready.emit()
+        if self.state.export_view is None:
+            self._export_view_timer.start()
+
+    def _dispatch_export_view(self) -> None:
+        if self._export_view_busy or not self._export_view_wanted() or self.state.export_view is not None:
+            return
+        if self._export_view_thread is None:
+            self._export_view_thread = QThread()
+            self._export_view_worker = ExportViewWorker()
+            self._export_view_worker.moveToThread(self._export_view_thread)
+            self._export_view_requested.connect(self._export_view_worker.render)
+            self._export_view_worker.finished.connect(self._on_export_view_done)
+            self._export_view_thread.start()
+        key, task = self._export_view_task()
+        self._export_view_busy = True
+        self._export_view_requested.emit(key, task)
+
+    def _on_export_view_done(self, key: tuple, result: Optional[tuple]) -> None:
+        self._export_view_busy = False
+        if not self._export_view_wanted():
+            return
+        if result is not None and key == self._export_view_task()[0]:
+            buffer, content_rect = result
+            self.state.export_view = {"key": key, "buffer": buffer, "content_rect": content_rect}
+            self.export_view_ready.emit()
+            if self.state.export_size_view:
+                self._paint_export_view()
+        elif result is not None:
+            # The edit moved on while this one rendered.
+            self._export_view_timer.start()
 
     def toggle_embedded_peek(self, force: Optional[bool] = None) -> None:
         """Show the camera's embedded preview, without changing the saved edit.
@@ -8113,6 +9066,7 @@ class AppController(QObject):
             if self.state.flatfield_peek:
                 self.state.flatfield_peek = False
                 self.flatfield_peek_changed.emit(False)
+            self._end_export_size_view()
             self._clear_test_strip()
 
         self.state.embedded_peek = target
@@ -8203,6 +9157,7 @@ class AppController(QObject):
                 if getattr(self.state, flag):
                     setattr(self.state, flag, False)
                     signal.emit(False)
+            self._end_export_size_view()
             self._clear_test_strip()
 
         self.state.flatfield_peek = target
@@ -8330,28 +9285,6 @@ class AppController(QObject):
             return None
         return export_path
 
-    def _roll_export_root(self, output_mode: ExportPresetOutputMode, subfolder: str) -> Optional[str]:
-        """Base folder for Subfolder of Source, redirected from the active roll's own
-        (non-existent) folder to the data folder when it is a virtual roll — files
-        gathered from a library search or picked by hand share no folder to build a
-        subfolder under. None for a folder roll, no active roll, or any other mode,
-        which already resolve correctly per file.
-
-        Warns once, since the redirect departs from what the DESTINATION picker shows.
-        """
-        if output_mode != ExportPresetOutputMode.SUBFOLDER_OF_SOURCE or not self.state.active_roll_id:
-            return None
-        entry = rolls.roll_for_id(self.session.repo, self.state.active_roll_id)
-        if entry is None or entry.get("kind") != "virtual":
-            return None
-        name = path_safe(entry.get("name", "")) or "Untitled Roll"
-        root = os.path.join(get_default_user_dir(), name)
-        destination = os.path.join(root, subfolder) if subfolder else root
-        self.set_status(
-            tr('"{name}" has no single folder, so it exports to {destination}', name=name, destination=destination), 6000, kind="warning"
-        )
-        return root
-
     def history_steps(self) -> List[Dict[str, Any]]:
         """Rows for the History panel: one dict {index, name, detail, is_current, undone} per edit step."""
         file_hash = self.state.current_file_hash
@@ -8460,14 +9393,13 @@ class AppController(QObject):
             preset_from_export_config(replace(self.state.config.export, export_path=export_path)),
             export_fmt=ExportFormat.JXL if linear_fmt == "jxl" else ExportFormat.TIFF,
         )
-        roll_root = self._roll_export_root(delivery.output_mode, delivery.output_subfolder)
         taken: set[str] = set()
         tasks = []
         for f in supported:
             params = self._batch_params_for(f)
             stitch = params.stitch if params.stitch.stitch_enabled else None
             frames = hdr_frame_paths(f)
-            out_dir = resolve_output_dir(f["path"], delivery, roll_root)
+            out_dir = resolve_output_dir(f["path"], delivery)
             # Same naming rule as a normal export: the bracket's first frame, suffixed so
             # the merge does not write over that frame's own linear output. No border and no
             # half: a linear dump is the whole decoded source, whatever the print crop says.
@@ -8527,9 +9459,6 @@ class AppController(QObject):
         if export_path is None:
             return
 
-        params = self.state.config
-        if self.state.flat_output:
-            params = flat_master_config(params)
         export_conf = replace(
             self.state.config.export,
             export_path=export_path,
@@ -8538,7 +9467,6 @@ class AppController(QObject):
         )
         if self.state.flat_output:
             export_conf = flat_export_config(export_conf)
-        roll_root = self._roll_export_root(export_conf.output_mode, export_conf.output_subfolder)
         source_exif = self.state.source_exif.get(self.state.current_file_hash or "")
 
         # Reuse the asset dict from uploaded_files so the half-frame fields reach the
@@ -8560,6 +9488,10 @@ class AppController(QObject):
         if self.state.bake_on_export:
             self._bake_auto_density_grade_for_export([file_info])
 
+        params = self.state.config
+        if self.state.flat_output:
+            params = flat_master_config(params)
+
         bounds_override = None
         if diptych is None and file_info.get("hash") == self.state.current_file_hash:
             with self.state.metrics_lock:
@@ -8577,7 +9509,6 @@ class AppController(QObject):
                     metadata_config=self.state.config.metadata,
                     working_color_space=self.state.workspace_color_space,
                     diptych=diptych,
-                    roll_export_root=roll_root,
                 )
             ]
         )
@@ -8597,7 +9528,6 @@ class AppController(QObject):
             return
 
         current_export = replace(self.state.config.export, export_path=export_path)
-        roll_root = self._roll_export_root(current_export.output_mode, current_export.output_subfolder)
         icc_output = self.state.icc_output_path
 
         if files is None:
@@ -8612,11 +9542,11 @@ class AppController(QObject):
         if not self._confirm_unopened_frames(files):
             return
 
-        if self.state.config.export.export_sidecars_enabled:
-            self._write_edit_sidecars(files)
-
         if self.state.bake_on_export:
             self._bake_auto_density_grade_for_export(files)
+
+        if self.state.config.export.export_sidecars_enabled:
+            self._write_edit_sidecars(files)
 
         flat = self.state.flat_output
 
@@ -8660,7 +9590,6 @@ class AppController(QObject):
                     metadata_config=metadata_config,
                     working_color_space=self.state.workspace_color_space,
                     diptych=diptych,
-                    roll_export_root=roll_root,
                 )
             )
 
@@ -8773,11 +9702,11 @@ class AppController(QObject):
         if not self._confirm_unopened_frames(files):
             return
 
-        if self.state.config.export.export_sidecars_enabled:
-            self._write_edit_sidecars(files)
-
         if self.state.bake_on_export:
             self._bake_auto_density_grade_for_export(files)
+
+        if self.state.config.export.export_sidecars_enabled:
+            self._write_edit_sidecars(files)
 
         tasks = self._build_preset_export_tasks(files, presets)
         if tasks:
@@ -8827,9 +9756,8 @@ class AppController(QObject):
         if export_path is None:
             return None
         export_conf = replace(self.state.config.export, export_path=export_path)
-        roll_root = self._roll_export_root(export_conf.output_mode, export_conf.output_subfolder)
         # The sheet covers the whole roll, so the source-relative modes follow the first frame.
-        return resolve_output_dir(visible_files[0]["path"], preset_from_export_config(export_conf), roll_root)
+        return resolve_output_dir(visible_files[0]["path"], preset_from_export_config(export_conf))
 
     _CONTACT_SHEET_SETTINGS_KEY = "contact_sheet_settings"
 
@@ -8869,7 +9797,9 @@ class AppController(QObject):
         except Exception:
             library = None
         roll_id = self.state.active_roll_id
-        film_format, frame_size = infer_format(frames, self.half_frame_mode_for_roll(roll_id) if roll_id else False)
+        # With no roll open a frame splits by its own roll, so the halves loaded decide.
+        half = self.half_frame_mode_for_roll(roll_id) if roll_id else any(f.get("half") for f in pending["assets"])
+        film_format, frame_size = infer_format(frames, half)
         label = roll_label_text(self._contact_sheet_roll_name(frames), frames, library)
         settings = ContactSheetSettings.from_dict(self.session.repo.get_global_setting(self._CONTACT_SHEET_SETTINGS_KEY, None))
         roll_baseline = rolls.roll_normalization(self.session.repo, roll_id) if roll_id else None
@@ -8982,9 +9912,10 @@ class AppController(QObject):
         self.set_status(", ".join(parts), 6000 if failed else 4000)
 
     def _baked_exposure_config(self, params: WorkspaceConfig, meters: Dict[str, Any]) -> Optional[WorkspaceConfig]:
-        """Freeze Auto Density / Auto Grade to this frame's metered values, or None when there is
-        nothing to freeze: no meters, or both autos already off. A freeze is a config change, not a
-        pixel write, so it renders identically and no render version moves."""
+        """Freeze the on Auto Density / Auto Grade to this frame's metered values, or None when
+        there is nothing to freeze. Each auto freezes only when its main value metered (density for
+        Auto Density, grade for Auto Grade), so a flag never turns off without its value fixed. A
+        freeze is a config change, not a pixel write, so it renders identically."""
         if not meters:
             return None
         exposure = params.exposure
@@ -8993,15 +9924,20 @@ class AppController(QObject):
         shown = shown_values(params, meters)
         if not shown:
             return None
-        return replace(
-            params,
-            exposure=replace(
-                exposure,
-                **shown,
-                auto_exposure=False,
-                auto_normalize_contrast=False,
-            ),
-        )
+        fields: Dict[str, Any] = {}
+        if "density" in shown:
+            fields["density"] = shown["density"]
+            fields["auto_exposure"] = False
+        if "grade" in shown:
+            fields["grade"] = shown["grade"]
+            if "highlight_density" in shown:
+                fields["highlight_density"] = shown["highlight_density"]
+            if "shadow_density" in shown:
+                fields["shadow_density"] = shown["shadow_density"]
+            fields["auto_normalize_contrast"] = False
+        if not fields:
+            return None
+        return replace(params, exposure=replace(exposure, **fields))
 
     def _params_for_file(self, f: dict) -> Optional[WorkspaceConfig]:
         """The config one file freezes from: the active frame's live config (unsaved edits
@@ -9088,15 +10024,20 @@ class AppController(QObject):
         self.set_status(", ".join(parts), 6000 if failed else 4000)
 
     def _bake_auto_density_grade_for_export(self, files: list[dict]) -> None:
-        """Freeze Auto Density / Auto Grade for each exported file into the DB before the export
-        runs. The export renders with the live config, which is identical to the frozen config, so
-        the output is unchanged; the freeze makes the saved edit independent of the meters."""
+        """Freeze Auto Density / Auto Grade in each exported file's saved edit, so it no longer
+        reads the meters; the frozen values render the same pixels. The open frame goes through
+        the live config, because the next save would overwrite a DB-only write."""
+        current_hash = self.state.current_file_hash or ""
         for f in files:
             baked_cfg = self._baked_config_for_file(f)
             if baked_cfg is None:
                 continue
             try:
-                self.session.repo.save_file_settings(f["hash"], baked_cfg, file_path=f["path"])
+                if f["hash"] == current_hash:
+                    self.session.update_config(baked_cfg, persist=True, render=False, record_history=True)
+                    self.config_updated.emit()
+                else:
+                    self.session.repo.save_file_settings(f["hash"], baked_cfg, file_path=f["path"])
             except Exception as exc:
                 logger.warning("Bake auto density/grade failed for %s: %s", f.get("path", ""), exc)
 
@@ -9303,9 +10244,12 @@ class AppController(QObject):
             self._paint_embedded_peek()
         elif self.state.flatfield_peek:
             self._paint_flatfield_peek()
+        elif self.state.export_size_view and self.state.export_view is not None:
+            self._paint_export_view()
         else:
             self.state.peek_frame = None
             self.image_updated.emit()
+        self._schedule_export_view()
 
         # By reference, because display buffers are read-only downstream. After the repaint:
         # overwriting an entry frees the texture the canvas has just stopped sampling.
@@ -9673,6 +10617,10 @@ class AppController(QObject):
         self._cleaned_up = True
         self._render_debounce.stop()
         self._cursor_readout_timer.stop()
+        self._export_view_timer.stop()
+        if self._export_view_thread is not None:
+            self._export_view_thread.quit()
+            self._export_view_thread.wait()
         if self.render_thread.isRunning():
             self.render_thread.quit()
             self.render_thread.wait()
@@ -9698,6 +10646,7 @@ class AppController(QObject):
         self.thumbnail_render_worker.cancel(self._thumbnail_render_generation)
         if self.norm_thread.isRunning():
             self.norm_worker.cancel()
+            self.bg_norm_worker.cancel()
             self.norm_thread.quit()
             self.norm_thread.wait()
         if self.discovery_thread.isRunning():
@@ -9725,6 +10674,8 @@ class AppController(QObject):
         # Memo-owned textures outlive the pool, so they must die before the device.
         self._render_memo.clear()
         self.render_worker.destroy_all()
+        if self._export_view_worker is not None:
+            self._export_view_worker.destroy()
 
         # All GPU-touching threads are now joined; release the wgpu device.
         GPUDevice.destroy_singleton()

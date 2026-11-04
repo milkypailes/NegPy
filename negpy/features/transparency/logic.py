@@ -38,17 +38,21 @@ from typing import Any, Dict, Mapping, Optional, Tuple
 import negpy_core
 import numpy as np
 
-from negpy.domain.types import ImageBuffer
+from negpy.domain.types import LUMA_R, LUMA_G, LUMA_B, ImageBuffer
 from negpy.features.exposure.logic import (
     _fast_sigmoid,
     effective_grade_range,
+    cast_solve_inputs,
     grade_to_slope,
+    neutral_axis_affine,
+    normalize_refs,
     per_channel_dye_separation,
     per_channel_toe_shoulder,
     per_channel_widths,
     slope_to_grade,
 )
 from negpy.features.exposure.models import EXPOSURE_CONSTANTS, ExposureConfig
+from negpy.features.exposure.normalization import LogNegativeBounds, measure_neutral_axis_from_log
 from negpy.features.process.models import ProcessConfig, per_channel_point_offsets
 from negpy.kernel.image.validation import ensure_image
 
@@ -56,6 +60,16 @@ from negpy.kernel.image.validation import ensure_image
 #: decoder's white level (density 0), so the mapping is anchored to the capture, not to
 #: frame content. That is what keeps a bracketed set rendering as a bracketed set.
 TRANSFER_DENSITY_RANGE = 3.0
+
+#: Luma percentiles of a Positive frame's meter grid that span Cast Removal's neutral-axis window.
+POSITIVE_AXIS_PERCENTILES = (1.0, 99.0)
+#: Narrowest Positive window, in decades: a flatter frame takes the fixed window.
+POSITIVE_AXIS_MIN_RANGE = 1e-3
+#: Decades above the window's dark end that a cell must clear to count in the retry window.
+POSITIVE_AXIS_FLOOR_MARGIN = 0.1
+# Cast Removal pivots on the anchored white only when the midtone sits at least this far under it:
+# a shorter lever arm turns a small midtone cast into a large gain on every darker tone.
+STAIN_PIVOT_MIN_ARM = 0.5
 
 #: Dye Separation's channel cap: a soft ceiling at the higher of this density and the
 #: pixel's lightest channel plus the spread below. Mirrored in transfer.wgsl.
@@ -450,11 +464,43 @@ def apply_transfer_curve(
     return ensure_image(negpy_core.apply_transfer_curve(np.ascontiguousarray(img_norm, dtype=np.float32), params))
 
 
+def transfer_cast_affine(
+    bounds: Any, neutral_axis_refs: Any, slider_strength: float, white_target: Optional[float]
+) -> Tuple[Tuple[float, float, float], Tuple[float, float, float]]:
+    """Cast Removal's per-channel (gain, offset) on normalized density; one source for the CPU and the GPU.
+    With Remove Stain on, the anchored white (log `white_target` on every channel) is neutral by construction,
+    so the line runs through the midtone and that white, unless the midtone is within STAIN_PIVOT_MIN_ARM of it."""
+    strength, axis = cast_solve_inputs(bounds, neutral_axis_refs, slider_strength)
+    if axis is not None and white_target is not None and white_target - float(neutral_axis_refs[0][1]) >= STAIN_PIVOT_MIN_ARM:
+        axis = (axis[0], normalize_refs((white_target,) * 3, bounds.floors, bounds.ceils), axis[2])
+    return neutral_axis_affine(axis, strength)
+
+
 def transfer_point_offsets(process: ProcessConfig) -> Tuple[Tuple[float, float, float], Tuple[float, float, float]]:
     """White/Black Point on the fixed window, negated: a positive reverses the floor/ceil
     roles. Single source for the CPU base and the GPU uniform pack."""
     wp3, bp3 = per_channel_point_offsets(process)
     return (-wp3[0], -wp3[1], -wp3[2]), (-bp3[0], -bp3[1], -bp3[2])
+
+
+def source_channels_first(process: ProcessConfig, cam_xyz: Optional[list]) -> bool:
+    """True when the density stage acts on a Positive source profile's own channels, so its
+    primaries convert after it. A camera matrix always applies before the log."""
+    from negpy.features.process.capture_color import is_source_profile
+    from negpy.features.process.path import RenderPath, render_path
+
+    return is_source_profile(cam_xyz) and render_path(process) is RenderPath.POSITIVE
+
+
+def density_stage_matrices(
+    process: ProcessConfig, cam_xyz: Optional[list], cam: Optional[np.ndarray], unmix: Optional[np.ndarray]
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    """(before the log, after the density matrix): where the source-to-working 3x3 *cam* applies.
+    A Positive source's primaries convert after the crosstalk unmix, fade and stain offset, which
+    act on the source's own channels; the conversion mixes them. Else it applies before the log."""
+    if cam is not None and unmix is not None and source_channels_first(process, cam_xyz):
+        return None, cam
+    return cam, None
 
 
 def transfer_bounds(density_range: float = TRANSFER_DENSITY_RANGE) -> Tuple[Tuple[float, ...], Tuple[float, ...]]:
@@ -465,3 +511,51 @@ def transfer_bounds(density_range: float = TRANSFER_DENSITY_RANGE) -> Tuple[Tupl
     converge on the same render.
     """
     return (0.0, 0.0, 0.0), (-density_range, -density_range, -density_range)
+
+
+def _grid_luma(grid: np.ndarray) -> np.ndarray:
+    """Luma-weighted mean of the per-channel log densities, one value per grid cell."""
+    luma = LUMA_R * grid[..., 0] + LUMA_G * grid[..., 1] + LUMA_B * grid[..., 2]
+    return np.ascontiguousarray(luma, dtype=np.float32).ravel()
+
+
+def _positive_window(bright: float, dark: float) -> Optional[Tuple[Tuple[float, ...], Tuple[float, ...]]]:
+    if np.isfinite(dark) and np.isfinite(bright) and bright - dark > POSITIVE_AXIS_MIN_RANGE:
+        return (float(bright),) * 3, (float(dark),) * 3
+    return None
+
+
+def transfer_axis_bounds(grid: np.ndarray, positive: bool) -> Tuple[Tuple[float, ...], Tuple[float, ...]]:
+    """
+    The (floors, ceils) Cast Removal's neutral-axis bands are placed in on the transfer path.
+    A Positive file has no sensor white to anchor to, so its window spans the percentiles of
+    its luma-weighted log density, the same on all three channels so the cast stays
+    measurable. Any other frame, or a flat one, takes `transfer_bounds()`.
+    """
+    if positive:
+        dark, bright = negpy_core.percentiles(_grid_luma(grid), list(POSITIVE_AXIS_PERCENTILES))
+        window = _positive_window(bright, dark)
+        if window is not None:
+            return window
+    return transfer_bounds()
+
+
+def measure_transfer_neutral_axis(grid: np.ndarray, positive: bool) -> Optional[tuple]:
+    """
+    Cast Removal's neutral axis on the transfer path, measured in `transfer_axis_bounds`.
+    A Positive frame that finds none is measured once more with the dark end taken over the
+    cells above `POSITIVE_AXIS_FLOOR_MARGIN` of it, so a black border or clipped black that
+    filled the shadow band falls outside the window.
+    """
+    bounds = transfer_axis_bounds(grid, positive)
+    refs = measure_neutral_axis_from_log(grid, LogNegativeBounds(*bounds), None, 0.0, exclude_subjects=False)
+    if refs is not None or not positive or bounds == transfer_bounds():
+        return refs
+    luma = _grid_luma(grid)
+    above = np.ascontiguousarray(luma[luma > bounds[1][0] + POSITIVE_AXIS_FLOOR_MARGIN])
+    if above.size == 0:
+        return None
+    window = _positive_window(bounds[0][0], negpy_core.percentiles(above, [POSITIVE_AXIS_PERCENTILES[0]])[0])
+    if window is None:
+        return None
+    return measure_neutral_axis_from_log(grid, LogNegativeBounds(*window), None, 0.0, exclude_subjects=False)
