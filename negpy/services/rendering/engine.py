@@ -1,3 +1,4 @@
+from dataclasses import replace
 from typing import Optional, Any, Callable, Tuple
 
 import numpy as np
@@ -30,15 +31,18 @@ from negpy.features.exposure.normalization import (
     geometry_kwargs,
     normalized_roi,
 )
-from negpy.features.process.fade import fade_white_target
+from negpy.features.process.fade import fade_white_target, render_white_space, with_fade_white
 from negpy.features.process.hue import apply_hue_trim
-from negpy.features.process.path import RenderPath, render_path
+from negpy.features.process.path import RenderPath, is_mono, render_path
+from negpy.features.transparency.logic import slide_exposure, slide_mono_weights
 from negpy.features.transparency.processor import TransferProcessor, TransparencyBaseProcessor
 from negpy.features.exposure.papers import effective_paper_profile
 from negpy.features.cyanotype.processor import CyanotypeProcessor
 from negpy.features.lith.processor import LithProcessor
 from negpy.features.sabattier.processor import SabattierProcessor
 from negpy.features.toning.processor import ToningProcessor
+from negpy.features.altprocess.models import AltProcess
+from negpy.features.process.models import FADE_RENDER_FIELDS, ProcessMode
 from negpy.features.lab.logic import apply_clahe
 from negpy.features.lab.processor import PhotoLabProcessor
 from negpy.features.finish.processor import FinishProcessor, rebate_tone
@@ -54,19 +58,20 @@ def base_processor(settings: WorkspaceConfig) -> Any:
     """The base stage's normalization: the negative's measured stretch, or a slide's fixed window."""
     if render_path(settings.process) is RenderPath.PRINT:
         return NormalizationProcessor(settings.process)
-    return TransparencyBaseProcessor(settings.process, settings.exposure.cast_removal_strength)
+    return TransparencyBaseProcessor(settings.process, slide_exposure(settings.process, settings.exposure).cast_removal_strength)
 
 
-def exposure_processor(settings: WorkspaceConfig) -> Any:
+def exposure_processor(settings: WorkspaceConfig, white_space: str = "") -> Any:
     """The exposure stage's curve: the print or a slide's transfer, or the Flat master on either base."""
     if settings.exposure.render_intent == RenderIntent.FLAT or render_path(settings.process) is RenderPath.PRINT:
         return PhotometricProcessor(
             printed_exposure(settings.process, settings.exposure), settings.local, collapse_weights(settings.process, settings.exposure)
         )
     return TransferProcessor(
-        settings.exposure,
+        slide_exposure(settings.process, settings.exposure),
         settings.process.positive_source,
-        fade_white_target(settings.process),
+        fade_white_target(settings.process, white_space),
+        slide_mono_weights(settings.process, settings.exposure),
     )
 
 
@@ -77,7 +82,8 @@ def print_stages(settings: WorkspaceConfig, img: ImageBuffer, context: PipelineC
     img = LithProcessor(settings.altproc, paper).process(img, context)
     img = CyanotypeProcessor(settings.altproc).process(img, context)
     img = SabattierProcessor(settings.altproc, paper).process(img, context)
-    return ToningProcessor(settings.toning, settings.altproc.alt_process).process(img, context)
+    alt = settings.altproc.alt_process if settings.process.process_mode == ProcessMode.BW else AltProcess.NONE
+    return ToningProcessor(settings.toning, alt, is_mono(settings.process)).process(img, context)
 
 
 _WEDGE_PATCH_PX = 16
@@ -241,19 +247,13 @@ class DarkroomEngine:
             settings.process.crosstalk_matrix,
             context.metrics.get("film_base"),  # the roll's picked base: the stage reads the densities above it
             settings.process.crosstalk_process,
-            settings.process.fade_ratio_r,
-            settings.process.fade_ratio_g,
-            settings.process.fade_ratio_b,
-            settings.process.fade_white_anchor,
-            settings.process.fade_white_r,
-            settings.process.fade_white_g,
-            settings.process.fade_white_b,
+            *(getattr(settings.process, f) for f in FADE_RENDER_FIELDS),
             settings.process.lock_bounds,
             settings.process.use_cast_average,
             settings.process.locked_neutral_axis,
             distortion_k1,
             # The transparency branch meters its neutral axis only when Cast Removal is on.
-            settings.exposure.cast_removal_strength > 0.0,
+            slide_exposure(settings.process, settings.exposure).cast_removal_strength > 0.0,
             # Auto Density metering reads retuned targets from EXPOSURE_CONSTANTS, which no config
             # hash sees, so the revision keys them in. Re-running base sets pipeline_changed, so the
             # exposure stage follows.
@@ -340,7 +340,11 @@ class DarkroomEngine:
         timing.lap("diffusion")
 
         def run_exposure(img_in: ImageBuffer, ctx: PipelineContext) -> ImageBuffer:
-            img_out = exposure_processor(settings).process(img_in, ctx)
+            # The base stage reports a white it measured for itself (`resolve_fade_white`).
+            measured = replace(settings, process=with_fade_white(settings.process, ctx.metrics.get("fade_white")))
+            img_out = exposure_processor(
+                measured, render_white_space(settings.process, ctx.process_mode, ctx.cam_xyz, ctx.camera_wb)
+            ).process(img_in, ctx)
             # Rides this stage: it needs the print, and its own stage would re-run everything behind
             # it on a drag. Stays inside the flat intent below, being a capture fix, not a look.
             return apply_hue_trim(img_out, settings.process.hue_trim)
@@ -354,6 +358,7 @@ class DarkroomEngine:
                 without_curves(without_levels(settings.exposure)),
                 settings.local,
                 settings.process.hue_trim,
+                settings.process.slide_bw,
                 collapse_weights(settings.process, settings.exposure),
             ),
             "exposure",
@@ -386,7 +391,7 @@ class DarkroomEngine:
             timing.lap("CLAHE")
 
             def run_lab(img_in: ImageBuffer, ctx: PipelineContext) -> ImageBuffer:
-                return PhotoLabProcessor(settings.lab).process(img_in, ctx)
+                return PhotoLabProcessor(settings.lab, is_mono(settings.process)).process(img_in, ctx)
 
             current_img, pipeline_changed = self._run_stage(current_img, settings.lab, "lab", run_lab, context, pipeline_changed)
             timing.lap("lab")

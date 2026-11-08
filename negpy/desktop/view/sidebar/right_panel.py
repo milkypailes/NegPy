@@ -37,10 +37,8 @@ from negpy.desktop.view.widgets.charts import (
 from negpy.desktop.view.widgets.collapsible import CollapsibleSection, fit_pane, make_section
 from negpy.desktop.view.widgets.fold import Fold, group_fold
 from negpy.desktop.view.widgets.gear_library_panel import GearLibraryPanel
-from negpy.desktop.view.widgets.granular_settings_dialog import open_apply_dialog
 from negpy.desktop.view.widgets.tab_header import TabHeader
-from negpy.desktop.settings_catalog import roll_card_rows
-from negpy.features.process.models import ProcessMode
+from negpy.features.process.path import is_mono
 from negpy.desktop.view.widgets.stats import NegativeStatsWidget, ZonePlacementRows
 from negpy.desktop.view.widgets.overflow_bar import OverflowBar
 from negpy.desktop.view.widgets.panel_tab import PanelTab
@@ -50,23 +48,12 @@ _FILM_BASE_TIP = tr(
 )
 _SCAN_BASE_TIP = tr("Base Relative: line up each channel at its film base, so the channels compare at one height.")
 
-# The Roll tab's cards that own settings, for its header's Apply picker.
-_ROLL_TAB_CARDS = (
-    "film",
-    "sensor",
-    "fade",
-    "baseline",
-    "process",
-    "demosaic",
-    "lens",
-    "flatfield",
-)
-
 # ControlsPanel sections built into the Roll tab (_build_roll_page): reveal_section routes them to the Roll group.
 _ROLL_SECTION_ATTRS = frozenset(
     {
         "assembly_section",
         "sensor_section",
+        "fade_section",
         "demosaic_section",
         "baseline_section",
         "process_section",
@@ -415,18 +402,19 @@ class RightPanel(QWidget):
         page_layout.setContentsMargins(0, 0, 0, 0)
         page_layout.setSpacing(THEME.space_lg)
 
-        self.roll_tab_header = TabHeader(tr("Roll"))
+        self.roll_tab_header = TabHeader(tr("Roll"), linked=True)
         self.roll_tab_header.bind(
             (
                 cp.film_section,
                 cp.demosaic_section,
                 cp.optics_section,
                 cp.sensor_section,
+                cp.fade_section,
                 cp.process_section,
                 cp.baseline_section,
             )
         )
-        self.roll_tab_header.apply_requested.connect(self._apply_roll_tab)
+        self.roll_tab_header.apply_requested.connect(cp.push_roll_cards)
         self.roll_tab_header.roll_revert_requested.connect(lambda: cp.revert_cards_to_roll(tuple(key for key, _ in cp._roll_sections())))
         self.controls_panel.modified_synced.connect(self.roll_tab_header.refresh)
         page_layout.addWidget(self.roll_tab_header)
@@ -437,6 +425,7 @@ class RightPanel(QWidget):
             cp.demosaic_section,
             cp.optics_section,
             cp.sensor_section,
+            cp.fade_section,
             cp.process_section,
             cp.baseline_section,
             cp.assembly_section,
@@ -456,12 +445,6 @@ class RightPanel(QWidget):
         if group == "frame":
             return self._frame_tab_headers.get(self._tab_keys[self._active_index])
         return None
-
-    def _apply_roll_tab(self) -> None:
-        """Every Roll card's settings in one picker. The cards themselves stay roll
-        defaults; this carries their current values onto other frames, the same as the
-        Film Strip's own apply with a narrower list."""
-        open_apply_dialog(self, self.controller.session, rows=roll_card_rows(*_ROLL_TAB_CARDS))
 
     def _build_scan_page(self) -> QWidget:
         """Scanner choice and cards in a scroll area; the active scanner's footer stays pinned below."""
@@ -670,7 +653,7 @@ class RightPanel(QWidget):
         self.parade_widget.set_overlay(standard and self.parade_overlay_btn.isChecked())
 
     def _scope_scale_key(self) -> str:
-        bw = self.controller.state.config.process.process_mode == ProcessMode.BW
+        bw = is_mono(self.controller.state.config.process)
         return "vectorscope_log_bw" if bw else "vectorscope_log_color"
 
     def _scope_log(self) -> bool:
@@ -946,12 +929,12 @@ class RightPanel(QWidget):
         """The scan parade's per-channel stretch ends (0..1 up the panel) and its caption, which
         names the unmix when the parade reads unmixed density."""
         from negpy.features.exposure.analysis import scan_density_axis
-        from negpy.features.exposure.normalization import crosstalk_unmix_active
+        from negpy.features.exposure.normalization import effective_crosstalk_matrix
         from negpy.features.process.fade import fade_matrix
 
         config = self.controller.state.config
         mode = config.process.process_mode
-        unmixed = crosstalk_unmix_active(config.process, mode)
+        unmixed = effective_crosstalk_matrix(config.process, mode) is not None
         restored = not unmixed and fade_matrix(config.process) is not None
         caption = tr("Scan density")
         if self.scan_base_btn.isChecked():

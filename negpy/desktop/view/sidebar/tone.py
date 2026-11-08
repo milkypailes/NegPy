@@ -254,16 +254,21 @@ class ToneSidebar(BaseSidebar):
         self.layout.addWidget(self.levels_hist)
         self.levels_in_low_spin = QSpinBox()
         self.levels_in_low_spin.setRange(0, 255)
+        self.levels_in_low_spin.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
         self.levels_in_high_spin = QSpinBox()
         self.levels_in_high_spin.setRange(0, 255)
+        self.levels_in_high_spin.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
         self.levels_out_low_spin = QSpinBox()
         self.levels_out_low_spin.setRange(0, 255)
+        self.levels_out_low_spin.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
         self.levels_out_high_spin = QSpinBox()
         self.levels_out_high_spin.setRange(0, 255)
+        self.levels_out_high_spin.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
         self.levels_gamma_spin = QDoubleSpinBox()
         self.levels_gamma_spin.setRange(0.10, 10.0)
         self.levels_gamma_spin.setDecimals(2)
         self.levels_gamma_spin.setSingleStep(0.05)
+        self.levels_gamma_spin.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
         # Buttonless, content-width entries like the slider values: the markers are
         # the mouse path, these are for exact entry (typing, arrow keys when focused).
         for spin, sample in (
@@ -273,7 +278,6 @@ class ToneSidebar(BaseSidebar):
             (self.levels_out_high_spin, "255"),
             (self.levels_gamma_spin, "10.00"),
         ):
-            spin.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
             text = spin.fontMetrics().horizontalAdvance(sample)
             frame = 2 * spin.style().pixelMetric(QStyle.PixelMetric.PM_DefaultFrameWidth)
             # QSS padding (4px) and border (1px) each side on top of the frame.
@@ -526,7 +530,6 @@ class ToneSidebar(BaseSidebar):
         )
         return channel_pages(self.ch_btn, self.state.config.exposure, [(*row, f"{row[-1]}_trim") for row in rows])
 
-
     def _curve_field(self, base: str) -> str:
         idx = self._channel_index()
         return base if idx == 0 else f"{base}_trim_{_CH_SUFFIX[idx - 1]}"
@@ -687,9 +690,7 @@ class ToneSidebar(BaseSidebar):
         conf = self.state.config.exposure
         self.block_signals(True)
         try:
-            from negpy.features.process.models import ProcessMode
-
-            mode = self.state.config.process.process_mode
+            from negpy.features.process.path import is_mono
 
             # On the transfer path (an as-captured Slide, or any Positive frame) the render
             # starts from the capture, so the paper model has nothing to act on. Density,
@@ -707,7 +708,7 @@ class ToneSidebar(BaseSidebar):
             for w in (self.split_grade_fold.content, self.aids_fold.content, self.hold_black_action):
                 w.setVisible(not transfer)
             # Per-layer trims are meaningless on a single-emulsion B&W paper.
-            is_bw = mode == ProcessMode.BW
+            is_bw = is_mono(self.state.config.process)
             if is_bw:
                 self.ch_btn.setCurrentIndex(0)
             self.ch_btn.setVisible(not is_bw)

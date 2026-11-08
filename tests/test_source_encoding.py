@@ -275,7 +275,7 @@ def _hydrating_session(monkeypatch, tmp_path, saved=None):
     session = DesktopSessionManager.__new__(DesktopSessionManager)
     session.state = AppState()
     session.repo = repo
-    session._apply_sticky_settings = lambda c, only_global=False: c if only_global else with_process_mode(c, ProcessMode.E6)
+    session._apply_sticky_settings = lambda c, only_global=False, path="": c if only_global else with_process_mode(c, ProcessMode.E6)
     monkeypatch.setattr(session_mod, "load_or_promote", lambda *a, **k: saved)
     return session
 
@@ -316,7 +316,7 @@ def _fake_controller(config: WorkspaceConfig, path: str):
     fake = SimpleNamespace(
         state=SimpleNamespace(config=config, current_file_path=path),
         apply_config=lambda c, persist=False: applied.append(c),
-        _lock_roll_card=lambda _key: None,
+        _lock_roll_card=lambda *_args: None,
     )
     return fake, applied
 

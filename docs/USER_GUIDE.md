@@ -59,21 +59,21 @@ For the math behind each step, read [PIPELINE.md](PIPELINE.md).
 
 On a slider, click the value to type a number, drag the name to adjust (**Shift** for fine steps), and double-click to reset. A chevron hides fine-tune controls; a dot on a closed fold, a card or a tab marks a changed value. On a dropdown, **‹** and **›** step through the choices. Each card has a reset arrow and an **ⓘ** that opens its part of this guide.
 
-A tab with several cards has a bar such as **3 of 5 cards edited**, with reset, **Reset to Roll**, **Apply** (to the selection or the roll) and collapse for the whole tab.
+A tab with several cards has a bar such as **3 of 5 cards edited**, with reset, **Reset to Roll**, **Apply** and collapse for the whole tab. On the Roll and Metadata tabs, **Apply** gives the roll every card this frame changed. On a Frame tab, it copies the tab to other frames.
 
 ### Frame or roll
 
-Each card header has **Frame** (amber) and **Roll** (red). The lit one shows where the card's values live.
+Each card on the **Roll** and **Metadata** tabs has **Frame** (amber) and **Roll** (red). The lit one shows where the card's values live.
 
-*   On a **Roll** tab or **Metadata** card, the card follows the roll until you edit it on this frame. **Roll** pushes this frame's values to the roll; **Frame** keeps them on this frame only.
-*   On a **Frame** card, **Roll** copies your changes to the selection or the whole roll.
+*   The card follows the roll until you edit it on this frame. **Roll** gives the roll this frame's values; **Frame** keeps them on this frame only.
 *   **Reset to Roll** puts the roll's values back on the card.
+*   A card on a **Frame** tab holds this frame's own values. Its copy button, **Apply to Frames**, copies them once to the selection or the whole roll.
 
-Right-click a card header for **Copy Card Settings** and **Undo Apply to Roll**. Frames that are not one roll show only **Frame** until you save them as a roll.
+Right-click a card header for **Copy Card Settings** and **Undo Change to Several Frames**. After an Apply, Paste, Reset or Roll push to several frames, the message strip above the picture also offers **Undo**, which puts every frame back at once. It works until your next edit. Frames that are not one roll show only **Frame** until you save them as a roll.
 
 ### What carries to the next frame
 
-A new frame gets the roll's film type, and the crop, print stock and Lab settings of the frame before it. The look (brightness, color, dodge and burn, toning) starts clean. **Preferences → Session & Storage → Persistent Settings…** sets what carries.
+A new frame gets the roll's film type, and the crop, print stock and Lab settings of the last frame you edited. The look (brightness, color, dodge and burn, toning) starts clean. **Preferences → Session & Storage → Persistent Settings…** sets what carries. Optics and Recovery carry to camera RAW frames only.
 
 **Reset Settings** returns a frame to the defaults. It does not change the scanning choices on the **Setup** card.
 
@@ -81,7 +81,7 @@ A new frame gets the roll's film type, and the crop, print stock and Lab setting
 
 *   **Before / After** (`\`, or the **Print** menu): splits the canvas between the default conversion and your edit. Hold `\` to see the default alone. To compare with an earlier version, right-click it in **History**.
 *   **Peeks**: hold `N` for the scan as loaded (the negative), `M` for the flat master, and `P` for the camera's own JPEG. The **Print** menu has them too.
-*   **Roll Average** (`U`, or the **Print** menu): prints this frame on the average and changes nothing. The bar has **Luma**, **Color** and **Cast**; right-click one to turn them all on or off. On a frame in a scene, **Scene** and **Roll** choose which average. **Apply** saves them to the frame.
+*   **Roll Average** (`U`, or the **Print** menu): prints this frame on the average and changes nothing. The bar has **Luma**, **Color** and **Cast**; right-click one to turn them all on or off. The averages the frame has now show after **Applied**. On a frame in a scene, **Scene** and **Roll** choose which average. **Apply** saves them to the frame. The view stays open when you go to the next frame.
 *   **Roll Average** button (filmstrip icon on the toolbar): opens the **Roll Average** bar. It is lit while the frame uses an average. Right-click turns every average on or off at once, as one edit. An amber icon marks a frame far from the roll color.
 *   **Export Size** (**Print** menu): shows the frame as it exports, at the size the **Export** panel sets, at 100%. Use it to judge sharpening and grain. It updates a moment after each edit.
 *   **Grain Focuser** (`Shift+L`, **Overlays** menu): a magnifier at the pointer that shows the exported pixels at their true size, with a sharpness number.
@@ -132,15 +132,15 @@ The **Film Strip** under the canvas shows the open frames in one row. Drag its t
 
 The toolbar's **Roll** row holds:
 
-*   The roll's name and its count of frames, keepers and rejects.
+*   The roll's name and count of frames, keepers and rejects.
 *   The **filter box**: type part of a file name, or terms such as `film:portra iso:>=400` (below). The search button, or **Enter**, searches the whole library.
-*   **Sort**: by name, date or scene.
+*   **Sort**: name, date, scene or frame number.
 *   **Sheet filter**: all frames, keepers only, hide rejected, or unmarked only. The button is highlighted while a filter hides frames.
 *   **Roll Settings** (the tag): gear and film details for this frame, the selection or the roll.
 *   **Apply**: copies chosen settings of this frame to the selection or the roll.
-*   **⋮**: **Add Files…**, **Add Folder…**, **Save to Folder Roll**, **Save as Virtual Roll…**, **Update Thumbnails**, **Hot Folder** (loads new files that a scanner saves in the newest frame's folder), **Unload…**, **Unload All…** (empties the Film Strip; the roll stays in the Library), **Reset Roll to Defaults…**, **Restore Removed Frames…** and **Film Strip Guide…**.
+*   **⋮**: **Add Files…**, **Add Folder…**, **Save to Folder Roll**, **Save as Virtual Roll…**, **Update Thumbnails**, **Hot Folder** (loads new files that a scanner saves in the newest frame's folder), **Unload…**, **Unload All…** (empties the Film Strip; the roll stays in the Library), **Reset Frames to Defaults…**, **Restore Removed Frames…** and **Film Strip Guide…**.
 
-The grid button opens the **Light Table** (`Shift+G`): the whole roll in rows, for sorting. A click selects a frame, and a double-click or `Enter` opens it. The toolbar acts on the selected frames: **Keep**, **Reject**, rotate and flip, **Auto Crop** and **Export**, and ⋯ holds the rest of the right-click menu. Its **Frames per Row** slider, `+` and `-`, or `Ctrl` with the wheel change the frame size. `Esc` goes back.
+The grid button opens the **Light Table** (`Shift+G`): the whole roll in rows, for sorting. A click selects a frame, and a double-click or `Enter` opens it. The toolbar acts on the selected frames: **Keep**, **Reject**, rotate and flip, **Auto Crop** and **Export**, and ⋯ holds the rest of the right-click menu. Its **Frames per Row** slider, `+` and `-`, or `Ctrl` with the wheel change the frame size. `Esc` goes back, and so does a canvas tool or peek.
 
 #### Filtering
 
@@ -162,15 +162,15 @@ Terms combine: `film:portra iso:>=400 -rejected:`. Metadata terms match only fra
 
 Right-click a frame, or use the shortcuts, to **Keep** it (a check) or **Reject** it (a cross; the frame dims and batch exports skip it). Your files never change.
 
-A film mark in the top-right corner means the frame prints on the roll average; it is amber when the frame's color is far from that average. A mark in the bottom-left corner means the frame is built from several files (a stitch, HDR merge, Trichrome or half frame); hover it for the name. An exclamation mark means the file did not open (click to retry); a small amber dot means the thumbnail is out of date.
+A film mark in the top-right corner means the frame prints on the roll average; it is amber when the frame's color is far from that average. A picture mark beside it means the frame keeps its own value on a Roll tab card, so a change to the roll does not reach it; hover it to see which cards. A mark in the bottom-left corner means the frame is built from several files (a stitch, HDR merge, Trichrome or half frame), or a Blend or Single Exposure capture shot it; hover it for the name. An exclamation mark means the file did not open (click to retry); a small amber dot means the thumbnail is out of date.
 
-The right-click menu also copies, pastes and resets settings, applies them to other frames, reanalyzes frames ([§10.5](#105-metering-negative--positive)), puts the selection on the roll average or back on its own measurement, shows the file in its folder, and moves files to the Trash (the edit stays).
+The right-click menu also copies, pastes and resets settings, applies them to other frames, reanalyzes frames ([§10.6](#106-metering-negative--positive)), puts the selection on the roll average or back on its own measurement, shows the file in its folder, and moves files to the Trash (the edit stays).
 
 ### Stitch and HDR
 
 *   **Stitch**: select overlapping shots of one large negative, then right-click → **Stitch Selected Frames**. **Unstitch** separates them again.
 *   **HDR** (slides): select a bracket of exposures one stop apart, then right-click → **Merge Exposures (HDR)**. Right-click the merged frame → **Render Exposure** to pick the exposure it shows, or use the **Render Exposure** slider on the Metering card. **Unmerge Exposures** separates them. Bracket both ways around your metered shot.
-*   **Merge Frame to TIFF Negative…** saves a stitch as one file ([§10.7](#107-frame-assembly)).
+*   **Merge Frame to TIFF Negative…** saves a stitch as one file ([§10.8](#108-frame-assembly)).
 
 ### Scenes
 
@@ -221,7 +221,7 @@ The **Readouts** fold holds numbers about the scan. An amber value is a warning;
 
 ## 4. Geometry tab
 
-Two cards: **Crop** sets the part of the picture you keep, and **Straighten** turns and levels it. Both hold this frame's own values. Their **Roll** button copies them to the selection or the whole roll ([§1](#frame-or-roll)).
+Two cards: **Crop** sets the part of the picture you keep, and **Straighten** turns and levels it. Both hold this frame's own values. Their **Apply to Frames** button copies them to the selection or the whole roll ([§1](#frame-or-roll)).
 
 <!-- panel:autocrop -->
 ### 4.1 Crop
@@ -269,7 +269,7 @@ Corrects the color of the print, as the color filters of a darkroom enlarger do.
 *   **Cyan / Magenta / Yellow**: shift the color between cyan and red, magenta and green, or yellow and blue.
 *   **Ring-around** (`Shift+F`): shows the picture as a grid of slightly different colors. Click the one that looks right. `Esc` closes it.
 *   **Cast Removal**: removes a color cast that differs between the dark and bright parts of the picture. It starts at 0.5 (half) on color negatives and at 0 on slides. Leaves, sky and water do not count as gray, so they keep their color.
-*   **Filter**: a colored filter, as on the camera lens for black-and-white film. It shows only on a color negative printed in B&W, and replaces the controls above. Each filter darkens the colors opposite to its own. Yellow #8, Deep Yellow #15, Orange #21 and Red #25 make a blue sky darker, step by step. Red also makes leaves dark and skin pale. Yellow-Green #11 and Green #58 make leaves lighter and skin darker. None gives the look of a normal black-and-white film.
+*   **Filter**: a colored filter, as on the camera lens for black-and-white film. It shows only on a color negative or color slide in B&W, and replaces the controls above. Each filter darkens the colors opposite to its own. Yellow #8, Deep Yellow #15, Orange #21 and Red #25 make a blue sky darker, step by step. Red also makes leaves dark and skin pale. Yellow-Green #11 and Green #58 make leaves lighter and skin darker. None gives the look of a normal black-and-white film.
 
 <!-- panel:tone -->
 ### 5.2 Tone: brightness and contrast
@@ -291,7 +291,7 @@ How light or dark the print is, and how much contrast it has.
     *   **Contrast Mask**: opens up large dark areas and holds back large bright ones, and keeps fine detail. In the darkroom, a printer gets this with a soft, blurred mask placed on the negative. In digital printing, Fujifilm Frontier scanners get a similar effect with HyperTone. Areas far from mid-gray change most, so a low-contrast frame changes little.
 *   **Global / R / G / B**: R, G or B applies the grades to one color only, for a cast that differs between shadows and highlights.
 
-**White Point** and **Black Point** are on the Roll tab's **Metering** card ([§10.5](#105-metering-negative--positive)).
+**White Point** and **Black Point** are on the Roll tab's **Metering** card ([§10.6](#106-metering-negative--positive)).
 
 <!-- panel:paper -->
 ### 5.3 Paper Response: the paper
@@ -386,7 +386,7 @@ A flash of light during development. The light tones reverse toward gray, and th
 
 Toners are chemical baths that change the color of a B&W print. Split Toning adds color to any print.
 
-**Chemical Toning** (B&W negatives) acts in the order shown:
+**Chemical Toning** (B&W negatives and B&W slides) acts in the order shown:
 
 *   **Selenium**: deeper, cooler blacks.
 *   **Sepia**: warm brown, from the highlights down.
@@ -438,7 +438,7 @@ Your most-used sliders in one place. It is empty until you fill it: click **Edit
 
 Saved settings you can apply to other frames.
 
-*   **Apply** (or double-click a preset): applies the selected preset to this frame.
+*   **Apply** (or double-click a preset): applies the selected preset to this frame, the selected frames or the whole roll.
 *   **Save…**: choose which of the current settings to keep as a new preset. A preset can hold the Crop and Optics settings with the Flat Field profile, but never one frame's crop, rotation or flips.
 *   **Pen** and **Trash**: edit or delete the selected preset.
 
@@ -472,9 +472,10 @@ These cards hold what the frames of a roll share: the film, how it was scanned a
 
 What the film is and how you scanned it. These choices decide which cards and controls show.
 
-*   **Color / B&W / Slide**: color negative (C-41), a black-and-white print, or slide (E-6 and similar). B&W prints a B&W negative or a color negative in black and white. On a color negative, the Filtration card then gives a contrast Filter.
-*   **Positive** (Slide only): for a file that is already a positive, such as a scanned print or another app's export. NegPy then skips inversion and metering. A Slide that is not a camera RAW, such as a TIFF, JPEG, JXL or a Pakon, Noritsu, Coolscan or Flextight scan, starts Positive. Turn it off to give a faded scan the slide tone curve. A JXL loads as linear.
-*   **Encoding** (Positive TIFF): how the samples encode light. **Auto** reads the file's ICC profile, else takes linear above 8 bits and sRGB at 8 bits. **Linear** is a scanner's linear output, such as Nikon Scan with color management off. **2.2** is a 2.2 gamma in Adobe RGB primaries. Auto skips a scanner's own calibration profile and reads the file as untagged. Pick Linear or 2.2 to match the scanner software.
+*   **Color / B&W / Slide**: color negative (C-41), a black-and-white print, or slide (E-6 and similar). B&W prints any negative in black and white. On a color negative, the Filtration card then gives a contrast Filter.
+*   **Positive** (Slide only): for a file that is already a positive, such as a scanned print or another app's export. NegPy then skips inversion and metering. A Slide that is not a camera RAW, such as a TIFF, JPEG, JXL or a Pakon, Noritsu, Coolscan or Flextight scan, starts Positive. Turn it off to give a faded scan the slide tone curve.
+*   **B&W** (Slide only): renders the slide in black and white, for B&W reversal film such as Scala. A color slide then gets the Filter.
+*   **Encoding** (Positive TIFF): how the samples encode light. **Auto** reads the file's ICC profile, else takes linear above 8 bits and sRGB at 8 bits. **Linear** is a scanner's linear output, such as Nikon Scan with color management off. **2.2** is a 2.2 gamma in Adobe RGB primaries. Pick Linear or 2.2 to match the scanner software.
 *   **Camera / Film Scanner**: what you scanned with. NegPy reads it from each file (a camera RAW is a camera) until you pick one. Your pick holds for every frame and sets the Scan tab's scanner.
 *   **White Light / Narrowband Light** (not for a B&W negative): the light behind the negative. White light is a lightbox or LED panel. Narrowband is a light with pure red, green and blue, such as a Scanlight.
 
@@ -489,7 +490,7 @@ How a camera RAW file is turned into pixels. Shown for a camera.
 
 *   **Camera WB / Linear RAW**: Camera WB uses the camera's white balance. Linear RAW decodes neutral, for narrowband light. Setup sets it for you.
 *   **Preview** / **Export**: the demosaic method, which fills in the colors each sensor pixel cannot see. **Auto** is fast on screen and uses **AHD** for export. **VNG** is smooth and **PPG** fast. **DCB** and **DHT** keep more fine detail but can turn grain into patterns. **AAHD** softens edges. Only the methods in your LibRaw build are listed.
-*   **Recovery** (slides): rebuilds blown highlights in a camera RAW. **Blend** suits sun and sky. **Reconstruct** is stronger but can get the color wrong.
+*   **Recovery** (slides): rebuilds blown highlights in a camera RAW. **Blend** suits sun and sky. **Reconstruct** is stronger but can get the color wrong. A new film scanner frame starts with Recovery off.
 
 <!-- panel:optics -->
 ### 10.3 Optics
@@ -509,7 +510,7 @@ Removes uneven light, such as darker corners, with a shot of the bare light sour
 *   **Apply Flat Field**: applies the selected profile to this roll.
 *   **Check Flat Field**: shows how well the profile evens out its own shot. Even gray is good; a band or patch shows where it is off.
 
-A frame keeps its own profile unless it follows its roll, so each light and film format can have one. A new frame, or a frame whose profile is missing, takes the last profile you chose.
+A frame keeps its own profile unless it follows its roll, so each light and film format can have one. A new camera frame, or a camera frame whose profile is missing, takes the last profile you chose on a camera frame. A new film scanner frame starts with no Optics corrections. With Film Scanner set, this card shows only on a frame that holds one.
 
 <!-- panel:sensor -->
 ### 10.4 Calibration: colors from your scanning setup
@@ -519,50 +520,54 @@ Corrects color errors that come from your light, camera and film.
 **Sensor Crosstalk Profile** (a Single Exposure under narrowband light, Linear RAW): removes the color that leaks between the sensor's channels. Run **Roll Analysis** again after a change.
 
 *   **Profile**: the sensor crosstalk profile. Your own `.toml` profiles go in `<Documents>/NegPy/sensor/`.
-*   **Method**: **Two-Scale** (default) removes the leak and keeps very strong colors from speckling. **Linear** is exact, but strong colors can speckle. **Density** has no speckle, but strong colors are a little duller.
-*   **Calibrate**: makes a profile from three shots of the bare light (red, green and blue), from files or a tethered camera (see CAMERA_SCANNING.md).
+*   **Method**: **Two-Scale** (default) removes the leak with no speckle. **Linear** is exact, but strong colors can speckle. **Density** has no speckle, but dulls strong colors a little.
+*   **Calibrate**: makes a profile from three shots of the bare light (red, green, blue), from files or a tethered camera (see CAMERA_SCANNING.md).
 
-**Crosstalk** (color film): film dyes, your light and your sensor mix the colors a little, and a matrix separates them again. Run **Roll Analysis** again after a change.
+**Crosstalk** (color film): film dyes, light and sensor mix the colors a little, and a matrix separates them. Run **Roll Analysis** again after a change.
 
-*   **Matrix**: the matrices for this film type. Those marked *(approx)* come from film data sheets and are a starting point. Your own `.toml` files go in `<Documents>/NegPy/crosstalk/` (see CROSSTALK.md). The slider button opens the editor; **+** makes a new matrix. No slide matrix comes with NegPy.
-*   **Strength**: how much of the matrix to apply.
+*   **Matrix**: the matrices for this film type. An *(approx)* matrix comes from a data sheet. Your own `.toml` files go in `<Documents>/NegPy/crosstalk/` (see CROSSTALK.md). The slider button opens the editor; **+** makes a new matrix. No slide matrix comes with NegPy.
+*   **Strength**: how strongly the matrix applies.
 *   The swatch button opens **Measure from Chart** (color negatives): it measures a matrix from a ColorChecker 24 or SpyderCheckr 24 shot on the film. Drag the four dots onto the corner patches.
 
-**Hue Trim** (camera with narrowband light): turns all colors around the color wheel, for a light that makes yellows orange or greens olive. Keep 0 for white light. It also works on slides, where the sensor crosstalk profile does not.
+**Hue Trim** (camera with narrowband light): turns all hues, for a light that makes yellows orange or greens olive. Keep 0 for white light. Unlike the sensor profile, it also works on slides.
 
-#### 10.4.1 Fade Restoration: faded slides
+<!-- panel:fade -->
+### 10.5 Fade Restoration: faded slides
 
-Gives a faded slide its dye layers back.
+Gives a faded slide its dye layers back. The card shows only for slides.
 
-*   **Red Survival**: how much red dye is left. Lower it until the contrast comes back.
-*   **Green Survival** / **Blue Survival**: the same for green and blue, against red.
-*   **Remove Stain**: makes yellowed clear areas white, and runs Estimate. Try it when Estimate turns its icon amber.
-*   **Estimate**: sets the sliders from the grays in this frame. **Midtone** suits a badly faded slide. **Gray Range** suits a mild fade with deep shadows.
+*   **Estimate**: sets Gray Mix and the Survivals.
+*   **Restore Range** (icon beside Estimate): on, sets Red Survival from the frame's range; Estimate keeps it.
+*   **Red Survival**: how much red dye is left. Lower it until contrast returns.
+*   **Green Survival** / **Blue Survival**: the same, measured against red.
+*   **Remove Stain**: whitens yellowed clear areas and estimates again. Turn it on when Estimate suggests it.
+*   **Gray Mix**: changes which grays Estimate trusts. Drag it if colors look off.
+*   **Crossover**: removes a color shift between shadows and highlights. Set it on a frame with clear grays, then click **Roll** on the card.
 
 <!-- panel:process -->
-### 10.5 Metering: negative → positive
+### 10.6 Metering: negative → positive
 
 To turn a negative into a positive, NegPy measures its darkest and brightest parts (the black and white points) and the color of the film. These controls set what it measures.
 
-*   **Reanalyze Frame**: measures this frame, or each selected frame, again from its current crop. The frame then uses its own bounds, not the roll or scene baseline.
+*   **Measure Alone**: takes this frame, or each selected frame, off the roll or scene average and measures it on its own, from its current crop.
 *   **Draw Region**: draw an area, and NegPy measures only that area. Double-click inside or press `Enter` to confirm, and `Esc` puts back the region you had before. **×** clears it.
 *   **Analysis Buffer**: ignores a border around the frame when measuring, so film edges and holders do not count.
 *   **Clipping**: how much of the print is pure black or pure white.
 *   **Lock Bounds**: keeps this frame's black and white points, even when the crop or Roll Analysis changes.
 *   **Luma Range Clip** (fold): how tightly black and white are set. Positive gives more contrast, for dense or foggy negatives. Negative keeps more shadow and highlight detail.
 *   **Color Clip** (fold): how tightly the color balance is set.
-*   **Dmin** / **Dmax** (Pick by Hand fold): for a frame that NegPy measures badly. Click **Dmin**, then the film base or the deepest shadow, to set the black point. Click **Dmax**, then the brightest highlight, to set the white point. Each **×** clears its own point.
+*   **Dmin** / **Dmax** (Pick by Hand fold): for a frame that NegPy measures badly. Click **Dmin**, then the film base or the deepest shadow, to set the black point. Click **Dmax**, then the brightest highlight, to set the white point. Each **×** clears its own point. Both are off while the frame prints on the roll average.
 *   **White Point** / **Black Point** (fold): move the measured white and black points. A positive white point brightens the print; a positive black point lifts the blacks. **R / G / B** moves one color only.
 
-A **slide** needs no inversion: the tone controls shape the picture directly. Auto Density and Auto Grade start off; turn them on for a faded slide. In Lightroom terms, Exposure is Print Density (lower is brighter), Contrast is ISO-R Grade, and Shadows and Highlights are Shadows and Highlights Density.
+A **slide** needs no inversion: the tone controls shape the picture directly. Auto Density and Auto Grade start off; turn them on for a faded slide. On a slide, Draw Region sets the area that Estimate, Remove Stain, Cast Removal, Auto Density and Auto Grade measure. Draw it before you click Estimate. In Lightroom terms, Exposure is Print Density (lower is brighter), Contrast is ISO-R Grade, and Shadows and Highlights are Shadows and Highlights Density.
 
 <!-- panel:baseline -->
-### 10.6 Roll Analysis
+### 10.7 Roll Analysis
 
-Measures the whole roll once and shares the result, so the frames of one film print alike. NegPy measures the roll and each scene on its own, as frames arrive, but no frame uses a baseline until you turn on an average. With no roll open, the card is grayed out: open or save a roll first.
+Measures the whole roll once and shares the result, so the frames of one film print alike. NegPy measures the roll and each scene as frames arrive, and again after a crop or Metering change. No frame uses a baseline until you turn on an average. With no roll open, the card is grayed out: open or save a roll first.
 
-*   **Reanalyze**: measures every loaded frame (except scene and locked frames) saves the average as the roll's baseline and turns the averages on for those frames. Frames very different from the rest keep their own. It first crops the frames that wait for Auto Crop.
-*   **Use This Frame**: makes this frame's measurement the roll's baseline.
+*   **Reanalyze**: measures every visible frame outside a scene, saves the average as the roll's baseline and turns the averages on for the roll and its new frames. Frames far from the rest keep their own.
+*   **Use This Frame**: makes this frame's own measurement the roll's baseline; Cast turns off.
 *   **Use Average**: right-click any of the three to turn every average on or off. **Luma** uses the roll's black and white points, **Color** the roll's color balance, and **Cast** (color negatives) the roll's gray balance for Cast Removal. With Cast on, a frame shot under a different light keeps some of that light, as on a Frontier print. A magenta cast stays, a warm or green cast stays in part, and a blue cast goes. With Luma and Color on, the roll prints evenly; with both off, each frame is measured on its own.
 *   **Baseline**: says where the baseline came from (roll, scene or frame). It warns when there is none, when it is out of date, or when this frame's color is far from the average.
 *   **Rolls**: pick another roll's saved baseline. A ticked roll has one.
@@ -570,7 +575,7 @@ Measures the whole roll once and shares the result, so the frames of one film pr
 *   **Detect Scenes**: finds the groups of frames under another light than the roll, in any frame order, and shows them on the Light Table. Each group waits under **Found**. To change a group, drag frames onto another group, or onto a frame with no scene to leave them out; right-click › **Scene** does the same. Give it a name, then **Accept** it as a scene with its own baseline, or **Discard** it.
 
 <!-- panel:assembly -->
-### 10.7 Frame Assembly
+### 10.8 Frame Assembly
 
 How files become frames. Each roll keeps its own settings here.
 
@@ -723,7 +728,7 @@ On the **Alongside Exports** tab. A contact sheet shows the whole roll as film s
 *   **Contact Sheet…**: opens the sheet. Drag an edge of the paper to resize it.
 *   **Film format**: 35mm, 35mm Half Frame or 120 (with **Frame size** for 120).
 *   **Paper**, **Width**, **Height** and **DPI**: the sheet's size and resolution. The default paper holds a 36-exposure roll.
-*   **Order**: by file name, by date, or by scene with a new strip or row for each scene.
+*   **Order**: by file name, by date, by roll and frame number, or by scene with a new strip or row for each scene.
 *   **Print**: **As Edited**, or **Straight Proof**: the whole roll at one exposure and normal contrast, so you see which negatives are thin or dense.
 *   **Pick Frames**: click a frame to leave it out or put it back. Rejects start out.
 *   **Edge Print**: the film maker's markings along the edges, such as the film name, frame numbers and the colored lines a stock prints by its perforations.
@@ -738,7 +743,7 @@ Sheets are saved as `contact_sheet.jpg` (`contact_sheet_1of2.jpg` and on for a l
 
 The **Proof** tab shows on screen how the picture will look when printed on a given printer and paper. It changes the preview only, never the export. Paper cannot show colors as bright as a screen, so a correct proof looks duller.
 
-*   **Proof on Screen** (`Shift+P`): turns the proof on or off.
+*   **Proof on Screen** (`Shift+P`): turns the proof on or off. While it is on, the frame info above the photo shows **Proof** and the profile.
 *   **Preset**: a saved printer and paper setup.
 *   **Profile**: the printer or paper profile. It follows the export profile until you pick one.
 *   **Intent**: **Relative Colorimetric** keeps printable colors exact and clips the rest. **Perceptual** compresses all colors, which suits very colorful pictures. **Saturation** is for charts and graphics.
@@ -767,7 +772,7 @@ Scan film straight into NegPy. The **Scanner** card picks the scanner; the tab t
 
 NegPy keeps macOS and Windows awake while it scans. On Linux, turn off automatic suspend before a long roll.
 
-**Plustek**: the OpticFilm 8200i SE, 8100 V2, 8300i SE and 7600i v1 work; for other models, try SANE. On Windows, set up the USB driver first ([PLUSTEK_WINDOWS.md](PLUSTEK_WINDOWS.md)). **Coolscan**: needs no SANE. On Linux, USB needs a udev rule for vendor `04b0`.
+**Plustek**: the OpticFilm 8200i SE, 8100 V2, 8300i SE, 7600i v1 and 7600i v2 work; for other models, try SANE. On Windows, set up the USB driver first ([PLUSTEK_WINDOWS.md](PLUSTEK_WINDOWS.md)). **Coolscan**: needs no SANE. On Linux, USB needs a udev rule for vendor `04b0`.
 
 <!-- panel:scan_quality -->
 ### Film & Quality
@@ -775,7 +780,7 @@ NegPy keeps macOS and Windows awake while it scans. On Linux, turn off automatic
 *   **Film**: Color negative, B&W negative, Slide or Kodachrome. It sets frame detection, metering, and whether infrared is offered.
 *   **Film format**: the frame length (135, 66, 645 and others). **Auto** works where the holder sets it.
 *   **Resolution** and **Bit depth**: the scan's dpi and bits per channel.
-*   **Scan mode** (Plustek): **Multi-Pass** averages several scans for less noise; **Adaptive Multi-Exposure** combines a short and a long exposure for more range. Plustek scanners do not offer them at 7200 dpi.
+*   **Scan mode** (Plustek): **Multi-Pass** averages several scans for less noise; **Adaptive Multi-Exposure** combines a short and a long exposure for more range, with the long exposure set from each frame; **Fixed Multi-Exposure** uses the scanner's one long exposure on every frame, as SilverFast does (8200i SE, 8100 V2 and 8300i SE). The 7600i v2 offers Adaptive Multi-Exposure but not Multi-Pass.
 *   **Samples** (Coolscan): reads each line several times, for less noise in the shadows. Slower.
 *   **Infrared**: **IR** scans an infrared channel, for dust removal on the Retouch card. **ICE** (Coolscan) removes the dust in the scanner instead. A scanner without ICE shows one **IR** toggle. Not for B&W or Kodachrome.
 *   **Superfine** (Coolscan): scans one line per pass. Slower.
@@ -814,8 +819,10 @@ Shown while a Scanlight is connected. A preset holds the light levels and the ca
     *   **Calibrate on the Film Base…**: place the rectangle on clear film and run it. NegPy finds the light levels and the shutter.
     *   **Set by Hand**: set the sliders yourself, then save them as a preset. With no camera connected, it saves no exposure, and a scan uses the camera's own.
 *   **Red**, **Green**, **Blue**, **White**: the light levels (0 to 255). **Light On** turns the light on to frame the film, or off.
-*   **Capture mode**: **Trichrome** takes one exposure per color and joins them; **Single Exposure** takes one exposure with all three colors on.
-*   **Create Sensor Crosstalk Profile** (Single Exposure): also saves a sensor crosstalk profile for this preset (see Calibration, §10.4).
+*   **Capture mode**: **Trichrome** takes one exposure per color and joins them; **Single Exposure** takes one exposure with all three colors on. **Blend** holds the camera open in Bulb and turns on red, green and blue in turn, for one file. A Trichrome or Blend preset can switch between the two.
+*   **Shutter release** (Blend): what holds the shutter open. **USB** uses the camera's own bulb control. **Cable** uses a release cable in the Scanlight's 3.5mm jack, for exposures up to 2.55 s.
+*   **Sensor profile** (Blend preset with no profile of its own): the sensor crosstalk profile for its scans. Scan waits for one. The vials button makes one.
+*   **Create Sensor Crosstalk Profile** (Single Exposure or Blend): also saves a sensor crosstalk profile that this preset's scans use (see Calibration, §10.4).
 *   **ISO**, **Shutter**, **Aperture**: the preset's exposure. A change holds until you pick the preset again. The gauge button meters.
 *   **IR Shutter** and **Infrared** (lights with infrared LEDs): adds an infrared exposure to each scan for dust removal, saved as an `_IR` file. It needs a camera that sees infrared (full-spectrum or converted) and manual focus. Color film only.
 *   **Channel Delay**: a pause between the red, green and blue exposures, for cameras that need it.
@@ -849,7 +856,7 @@ Shows the whole strip, to place and pick the frames before the scan. **Apply Fra
 
 ### Interface
 
-*   **Language**: English, Simplified Chinese, Japanese, Korean or German, after a restart.
+*   **Language**: English, Simplified Chinese, Japanese, Korean, German, Vietnamese or Norwegian Bokmål, after a restart.
 *   **UI scale**: 80% to 120%, after a restart.
 *   **Canvas background**: from black to white. Mid gray is best for judging a print.
 *   **Sticky Zoom**: keeps the zoom when you change frames. **Reverse Scroll Zoom**: scroll up zooms out.
@@ -866,7 +873,8 @@ Shows the whole strip, to place and pick the frames before the scan. **Apply Fra
 *   **Search by Meaning**: find frames by description (§2).
 *   **Update Thumbnails Automatically**: renders out-of-date thumbnails again in the background, when a roll opens and after a change to many frames. Off (the default), the frames get an amber dot until you use **Update Thumbnails**.
 *   **Preview size**: the canvas resolution. Higher is sharper and uses more memory.
-*   **Preview cache**, **HQ buffers**, **Rendered frames** and **GPU texture cap**: how much memory NegPy uses. Lower them on a computer with little memory, or if exports run out of GPU memory.
+*   **Preview cache**, **Preview cache limit**, **HQ buffers** and **Rendered frames**: how much memory NegPy uses. Each row shows the recommendation for this computer. You can set a higher value, and the hint then turns amber.
+*   **GPU texture cap**: the largest image the GPU loads at once. At 0, an integrated GPU uses 6144 px and other GPUs have no limit. A value here replaces that limit. Lower it if exports run out of GPU memory.
 *   **Reduce Export Memory Use**: exports in smaller pieces, for a computer where exports run out of GPU memory.
 *   **Show GPU Memory Warning**: tells you when an HQ preview is reduced to fit.
 

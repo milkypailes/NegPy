@@ -5,7 +5,15 @@ from dataclasses import replace
 
 import pytest
 
-from negpy.desktop.settings_catalog import all_rows, apply_selected_fields, preset_summary, roll_card_rows, selected_flat_dict
+from negpy.desktop.settings_catalog import (
+    CATALOG,
+    all_rows,
+    apply_selected_fields,
+    preset_config,
+    preset_summary,
+    roll_card_rows,
+    selected_flat_dict,
+)
 from negpy.domain.models import WorkspaceConfig
 from negpy.features.process.models import DemosaicMode, ProcessMode
 from negpy.services.assets.rolls import card_fields
@@ -45,11 +53,19 @@ def test_positive_source_row_is_catalogued():
     assert data == {"positive_source": True}
 
 
-@pytest.mark.parametrize("card", ["film", "sensor", "demosaic", "process", "baseline", "lens", "flatfield"])
+@pytest.mark.parametrize("card", ["film", "sensor", "fade", "demosaic", "process", "baseline", "lens", "flatfield"])
 def test_every_roll_card_field_has_a_row(card):
     """Copy Card Settings, Paste and the Roll tab's Apply offer only catalog rows."""
     listed = {f for r in roll_card_rows(card) for f in r.fields}
     assert set(card_fields(card)) <= listed
+
+
+def test_calibration_and_fade_restoration_copy_apart():
+    """Each card's Copy Card Settings and its picker group hold only its own rows."""
+    fade = {f for r in roll_card_rows("fade") for f in r.fields}
+    sensor = {f for r in roll_card_rows("sensor") for f in r.fields}
+    assert not fade & sensor
+    assert {title for title, rows in CATALOG if any(f in fade for r in rows for f in r.fields)} == {"Fade Restoration"}
 
 
 def test_pasting_highlight_recovery_remeters():
@@ -125,3 +141,67 @@ def test_preset_summary_lists_a_deliberately_default_value():
 
 def test_preset_summary_empty_for_no_data():
     assert preset_summary({}) == ""
+
+
+def _faded(white: tuple, space: str) -> WorkspaceConfig:
+    base = WorkspaceConfig()
+    r, g, b = white
+    process = replace(
+        base.process, fade_ratio_g=0.8, fade_ratio_b=0.6, fade_white_r=r, fade_white_g=g, fade_white_b=b, fade_white_space=space
+    )
+    return replace(base, process=process)
+
+
+def test_a_pasted_fade_keeps_the_targets_camera_raw_white():
+    """A camera RAW's white moves with each frame's exposure, so Paste and Apply copy only the survivals."""
+    source = _faded((-0.6, -0.55, -0.65), "cam")
+    target = _faded((-0.3, -0.25, -0.35), "cam")
+    out = apply_selected_fields(source, target, [_row("Fade Restoration")]).process
+    assert (out.fade_ratio_g, out.fade_ratio_b) == (0.8, 0.6)
+    assert (out.fade_white_r, out.fade_white_g, out.fade_white_b, out.fade_white_space) == (-0.3, -0.25, -0.35, "cam")
+
+
+def test_a_fade_preset_keeps_the_targets_camera_raw_white():
+    data = selected_flat_dict(_faded((-0.6, -0.55, -0.65), "cam"), [_row("Fade Restoration")])
+    target = replace(WorkspaceConfig(), process=replace(WorkspaceConfig().process, fade_white_r=-0.3, fade_white_space="cam"))
+    out = apply_selected_fields(preset_config(data), target, [_row("Fade Restoration")]).process
+    assert out.fade_ratio_b == 0.6
+    assert (out.fade_white_r, out.fade_white_space) == (-0.3, "cam")
+
+
+def test_a_pasted_scanner_white_copies():
+    """A scanner white is the file's full scale, the same on every frame, as on a roll."""
+    out = apply_selected_fields(_faded((-0.05, -0.1, -0.3), ""), WorkspaceConfig(), [_row("Fade Restoration")]).process
+    assert (out.fade_white_r, out.fade_white_g, out.fade_white_b) == (-0.05, -0.1, -0.3)
+
+
+def test_a_color_stock_on_a_bw_frame_is_no_edit_to_apply():
+    from dataclasses import replace
+
+    from negpy.desktop.settings_catalog import catalog_sections
+    from negpy.features.process.models import ProcessMode
+    from negpy.kernel.system.config import DEFAULT_WORKSPACE_CONFIG as cfg
+
+    def stock_edited(config):
+        rows = [entry for _title, entries in catalog_sections(config) for entry in entries]
+        return next(edited for row, _value, edited in rows if row.fields == ("paper_profile",))
+
+    color = replace(cfg, exposure=replace(cfg.exposure, paper_profile="frontier"))
+    assert stock_edited(color)
+    assert not stock_edited(replace(color, process=replace(color.process, process_mode=ProcessMode.BW)))
+
+
+def test_a_pasted_fade_carries_its_crossover_table():
+    """The table travels with the strength, as on a Roll push."""
+    import json
+
+    table = tuple(float(i) / 100 for i in range(16))
+    source = replace(
+        WorkspaceConfig(),
+        process=replace(_faded((0.0, 0.0, 0.0), "").process, fade_crossover=0.5, fade_crossover_table=table, fade_crossover_space="tag"),
+    )
+    out = apply_selected_fields(source, WorkspaceConfig(), [_row("Fade Restoration")]).process
+    assert (out.fade_crossover, out.fade_crossover_table, out.fade_crossover_space) == (0.5, table, "tag")
+    data = json.loads(json.dumps(selected_flat_dict(source, [_row("Fade Restoration")])))
+    out = apply_selected_fields(preset_config(data), WorkspaceConfig(), [_row("Fade Restoration")]).process
+    assert out.fade_crossover_table == table and isinstance(out.fade_crossover_table, tuple)

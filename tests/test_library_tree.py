@@ -1100,6 +1100,7 @@ def test_relocate_roll_failure_warns_and_does_not_reload(widget, tree_dirs, monk
     assert len(warned) == 1
     assert reloaded == []
 
+
 def test_a_folder_row_shared_by_two_folders_deletes_the_rolls_of_both(widget, tmp_path, monkeypatch):
     for parent in ("a", "b"):
         (tmp_path / parent / "scans" / f"roll_{parent}").mkdir(parents=True)

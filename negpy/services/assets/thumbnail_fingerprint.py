@@ -12,7 +12,7 @@ from typing import Any, Optional
 from negpy.domain.models import WorkspaceConfig
 
 # Bump in any change that alters rendered pixels for unchanged settings, a changed default included.
-THUMBNAIL_RENDER_VERSION = 31
+THUMBNAIL_RENDER_VERSION = 32
 
 # Marks a thumbnail made from the source preview, which runs none of the frame's settings.
 QUICK = "quick"
@@ -38,6 +38,8 @@ _UNHASHED_FIELDS: dict[str, frozenset[str]] = {
             "film_base",
             "manual_dmin_at",
             "manual_dmax_at",
+            "fade_auto_red",
+            "fade_neutrals_mix",
         }
     ),
     "lab": frozenset({"sharpen", "sharpen_method", "sharpen_radius", "sharpen_masking", "sharpen_auto_masking", "chroma_denoise"}),

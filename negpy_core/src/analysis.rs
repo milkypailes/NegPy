@@ -154,20 +154,101 @@ pub fn unmix_log(img: &[f32], m: [[f32; 3]; 3], dst: &mut [f32]) {
     );
 }
 
-/// `relog_matrix_image`: a 3x3 matrix on each pixel of an HxWx3 log image, in linear light. Each
-/// value goes to 10^v, each row is float32 products summed in channel order with no `mul_add`, and
-/// the log clamps below at 1e-6 as `log_density_open` does.
-pub fn relog_matrix(img: &[f32], m: [[f32; 3]; 3], dst: &mut [f32]) {
+/// `apply_crossover`: each pixel of an HxWx3 log image plus the row of `bins` its own mean log
+/// selects, linear between rows. `pos` runs over `lo..lo + span` in float32 in the order of
+/// `normalization.wgsl`, with no `mul_add`, so the engines agree.
+pub fn apply_crossover(img: &[f32], bins: &[[f32; 3]], lo: f32, span: f32, dst: &mut [f32]) {
+    let last = bins.len().saturating_sub(1);
+    let top = last as f32;
     crate::par_zip(
         dst.as_chunks_mut::<3>().0,
         img.as_chunks::<3>().0,
         move |d, p| {
-            let lin = p.map(|v| crate::mathf::exp10_f64(v as f64) as f32);
-            *d = m.map(|r| {
-                crate::mathf::log10f((lin[0] * r[0] + lin[1] * r[1] + lin[2] * r[2]).max(1e-6))
-            });
+            let m = (p[0] + p[1] + p[2]) * (1.0f32 / 3.0f32);
+            let pos = if span > 0.0 {
+                ((m - lo) / span).clamp(0.0, 1.0) * top
+            } else {
+                0.0
+            };
+            let i0 = (pos as usize).min(last);
+            let i1 = (i0 + 1).min(last);
+            let f = pos - i0 as f32;
+            let (a, b) = (bins[i0], bins[i1]);
+            *d = [0, 1, 2].map(|c| p[c] + (a[c] * (1.0 - f) + b[c] * f));
         },
     );
+}
+
+/// `unmix_log_image` with an anchor: each channel is capped at its anchor before the 3x3, and the
+/// amount the pixel is above the anchor in every channel, if any, is added to each channel after.
+/// Light past the film carries no dye, so it passes through the density matrix as a neutral. Each
+/// channel then takes its `offset`, the affine's last column, as `unmix_log_image` adds it after.
+pub fn unmix_log_anchored(
+    img: &[f32],
+    m: [[f32; 3]; 3],
+    anchor: [f32; 3],
+    offset: [f32; 3],
+    dst: &mut [f32],
+) {
+    crate::par_zip(
+        dst.as_chunks_mut::<3>().0,
+        img.as_chunks::<3>().0,
+        move |d, p| {
+            let over = (p[0] - anchor[0])
+                .min(p[1] - anchor[1])
+                .min(p[2] - anchor[2]);
+            let excess = over.max(0.0);
+            let q = [
+                p[0].min(anchor[0]),
+                p[1].min(anchor[1]),
+                p[2].min(anchor[2]),
+            ];
+            let r = m.map(|r| q[0] * r[0] + q[1] * r[1] + q[2] * r[2] + excess);
+            *d = [r[0] + offset[0], r[1] + offset[1], r[2] + offset[2]];
+        },
+    );
+}
+
+/// `relog_matrix_image`: a 3x3 matrix on each pixel of an HxWx3 log image, in linear light. Each
+/// value goes to 10^v, each row is float32 products summed in channel order with no `mul_add`, and
+/// the log clamps below at 1e-6 as `log_density_open` does.
+pub fn relog_matrix(img: &[f32], m: [[f32; 3]; 3], dst: &mut [f32]) {
+    const BLOCK: usize = 1 << 14;
+    dst.as_chunks_mut::<3>()
+        .0
+        .par_chunks_mut(BLOCK)
+        .zip(img.as_chunks::<3>().0.par_chunks(BLOCK))
+        .for_each(move |(d, p)| {
+            for (d, p) in d.chunks_mut(RELOG_RUN).zip(p.chunks(RELOG_RUN)) {
+                relog_run(p, m, d);
+            }
+        });
+}
+
+/// Pixels per `relog_run`: each step runs as a flat loop over a run, one channel at a time, so it
+/// vectorizes.
+const RELOG_RUN: usize = 256;
+
+#[multiversion(targets("x86_64+avx2+fma", "aarch64+neon"))]
+fn relog_run(px: &[[f32; 3]], m: [[f32; 3]; 3], out: &mut [[f32; 3]]) {
+    let n = px.len();
+    let mut lin = [[0f32; RELOG_RUN]; 3];
+    for (c, lin) in lin.iter_mut().enumerate() {
+        for (l, p) in lin[..n].iter_mut().zip(px) {
+            *l = crate::mathf::exp10_f64(p[c] as f64) as f32;
+        }
+    }
+    let mut row = [0f32; RELOG_RUN];
+    for (k, r) in m.iter().enumerate() {
+        for (i, v) in row[..n].iter_mut().enumerate() {
+            *v = crate::mathf::log10f(
+                (lin[0][i] * r[0] + lin[1][i] * r[1] + lin[2][i] * r[2]).max(1e-6),
+            );
+        }
+        for (o, v) in out.iter_mut().zip(&row[..n]) {
+            o[k] = *v;
+        }
+    }
 }
 
 /// `normalize_log_image`: `(v - floor) / (ceil - floor)` per channel of an HxWx3 log image,
@@ -1142,6 +1223,12 @@ pub fn roi_from_measured_border(
 // Smallest fraction of a film-box side the tier refinement may keep. A rebate never takes half
 // a side, so anything below this is a broken occupancy run, not a frame.
 const TIER_MIN_KEEP: f64 = 0.5;
+// A run ends at the picture edge only when clear rebate lies past it: some line within this
+// fraction of the side holds at most this occupancy. The clearest line, not the mean, because a
+// tilted edge spreads across lines and a narrow frame gap leads into the next picture. A dip in
+// a high-key picture keeps more occupancy than this on every line.
+const TIER_EDGE_REACH: f64 = 0.03;
+const TIER_EDGE_MAX_OCCUPANCY: f64 = 0.25;
 
 /// `_smooth_signal(signal, window)`: `np.convolve(signal, ones(window) / window, "same")` in
 /// NumPy's float32 arithmetic. A full-overlap output of a window up to 11 goes through NumPy's
@@ -1264,6 +1351,19 @@ fn longest_run_above(profile: &[f64], threshold: f64) -> Option<(i64, i64)> {
     Some((best.0, best.1 + 1))
 }
 
+/// Whether a line just past each end of the half-open run reads as clear rebate. An end at the
+/// edge of the box has no lines past it and passes.
+fn run_ends_at_rebate(profile: &[f64], (start, end): (i64, i64)) -> bool {
+    let reach = py_round(TIER_EDGE_REACH * profile.len() as f64).max(3);
+    let clear = |band: &[f64]| {
+        band.is_empty()
+            || band.iter().copied().fold(f64::INFINITY, f64::min) <= TIER_EDGE_MAX_OCCUPANCY
+    };
+    let before = (start - reach).max(0) as usize..start as usize;
+    let after = end as usize..((end + reach) as usize).min(profile.len());
+    clear(&profile[before]) && clear(&profile[after])
+}
+
 /// `_estimate_tier_levels(lum, film_roi)`: (bed, rebate, image, ring spread), or None.
 fn estimate_tier_levels(
     lum: &[f32],
@@ -1331,6 +1431,8 @@ pub fn refine_film_roi_by_tiers(
     let (hl, hr) = longest_run_above(&col_occ, 0.55)?;
     if ((vb - vt) as f64) < TIER_MIN_KEEP * bh as f64
         || ((hr - hl) as f64) < TIER_MIN_KEEP * bw as f64
+        || !run_ends_at_rebate(&row_occ, (vt, vb))
+        || !run_ends_at_rebate(&col_occ, (hl, hr))
     {
         return None;
     }
@@ -1812,6 +1914,23 @@ pub fn diffusion_tail(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unmix_log_anchored_passes_light_past_the_anchor_as_a_neutral() {
+        let m = [[2.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 0.5]];
+        let anchor = [-0.4, -0.5, -0.6];
+        let img = [-1.0, -1.0, -1.0, 0.0, 0.0, 0.0, -0.2, -0.8, 0.0];
+        let mut out = [0f32; 9];
+        unmix_log_anchored(&img, m, anchor, [0.0; 3], &mut out);
+        assert_eq!(&out[..3], &[-2.0, -1.0, -0.5]);
+        // Above the anchor in every channel by at least 0.4: capped, then 0.4 added to each.
+        assert_eq!(&out[3..6], &[-0.8 + 0.4, -0.5 + 0.4, -0.3 + 0.4]);
+        // Below the anchor in green: capped where above, nothing added.
+        assert_eq!(&out[6..], &[-0.8, -0.8, -0.3]);
+        // The offset joins each channel last.
+        unmix_log_anchored(&img, m, anchor, [0.25, -0.5, 1.0], &mut out);
+        assert_eq!(&out[..3], &[-2.0 + 0.25, -1.0 - 0.5, -0.5 + 1.0]);
+    }
 
     #[test]
     fn unmix_log_keeps_negative_densities_and_sums_in_channel_order() {

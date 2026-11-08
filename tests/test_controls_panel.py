@@ -7,12 +7,11 @@ sidebar in the app, so no test here constructs a real one.
 """
 
 from dataclasses import replace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 from negpy.desktop.session import AppState
-from negpy.desktop.settings_catalog import rows_for_fields
 from negpy.desktop.settings_catalog import TONE_FIELDS
-from negpy.desktop.view.sidebar.controls_panel import _DEMOSAIC_FIELDS, _SENSOR_FIELDS, ControlsPanel
+from negpy.desktop.view.sidebar.controls_panel import _DEMOSAIC_FIELDS, _FADE_FIELDS, _SENSOR_FIELDS, ControlsPanel
 from negpy.features.exposure.models import ExposureConfig
 from negpy.features.process.models import DemosaicMode, ProcessConfig, ProcessMode
 from negpy.kernel.system.config import DEFAULT_WORKSPACE_CONFIG
@@ -23,6 +22,7 @@ def _panel_stub(*, active_roll_id="roll1", locked_cards=()) -> MagicMock:
     panel._ROLL_CARD_LABELS = ControlsPanel._ROLL_CARD_LABELS
     panel.film_section = MagicMock()
     panel.sensor_section = MagicMock()
+    panel.fade_section = MagicMock()
     panel.demosaic_section = MagicMock()
     panel.baseline_section = MagicMock()
     panel.process_section = MagicMock()
@@ -33,7 +33,6 @@ def _panel_stub(*, active_roll_id="roll1", locked_cards=()) -> MagicMock:
     panel._frame_sections = lambda: ControlsPanel._frame_sections(panel)
     panel.controller.state.active_roll_id = active_roll_id
     panel.controller.locked_roll_cards.side_effect = lambda: set(locked_cards)
-    panel.controller.frame_section_scopes.side_effect = lambda keys: {key: "frame" for key in keys}
     return panel
 
 
@@ -95,7 +94,7 @@ def test_sync_scope_buttons_names_every_overridden_card():
 
     ControlsPanel._sync_scope_buttons(panel)
 
-    panel.roll_override_summary.setText.assert_called_once_with("This frame overrides: Calibration, Metering")
+    panel.roll_override_summary.setText.assert_called_once_with("Keeps its own value on: Calibration, Metering")
     panel.roll_override_summary.setVisible.assert_called_once_with(True)
 
 
@@ -104,7 +103,7 @@ def test_sync_scope_buttons_names_film_mode_too():
 
     ControlsPanel._sync_scope_buttons(panel)
 
-    panel.roll_override_summary.setText.assert_called_once_with("This frame overrides: Film Mode")
+    panel.roll_override_summary.setText.assert_called_once_with("Keeps its own value on: Film Mode")
 
 
 def test_sync_scope_buttons_marks_only_the_diverged_card_as_frame():
@@ -117,26 +116,23 @@ def test_sync_scope_buttons_marks_only_the_diverged_card_as_frame():
         assert _scope(section) == "roll"
 
 
-def test_sync_scope_buttons_reads_each_frame_cards_own_scope():
-    """A frame card reads Roll only once a whole-roll apply put its values there and the
-    frame still matches them."""
+def test_frame_cards_carry_no_scope_pair():
+    """A frame card's values are always this frame's own; its copy button is Apply to Frames."""
     panel = _panel_stub()
-    panel.controller.frame_section_scopes.side_effect = lambda keys: {key: "roll" if key == "tone" else "frame" for key in keys}
 
     ControlsPanel._sync_scope_buttons(panel)
 
-    assert _scope(panel.tone_section) == "roll"
-    assert _scope(panel.finish_section) == "frame"
+    panel.tone_section.set_scope_buttons.assert_not_called()
+    panel.tone_section.set_roll_revert.assert_not_called()
 
 
 def test_sync_scope_buttons_disables_rather_than_hides_the_pair_with_no_roll_open():
-    """Frame cards answer the same way Roll-tab cards do: the pair stays readable so the
-    scope is stated, and only the half with nothing to act on is turned off."""
+    """The pair stays readable so the scope is stated, and only the half with nothing to act on is turned off."""
     panel = _panel_stub(active_roll_id=None)
 
     ControlsPanel._sync_scope_buttons(panel)
 
-    for section in (panel.tone_section, panel.sensor_section):
+    for section in (panel.film_section, panel.sensor_section):
         assert section.set_scope_buttons.call_args[0][0] is True
         assert section.set_scope_buttons.call_args.kwargs["roll_enabled"] is False
 
@@ -146,7 +142,7 @@ def test_sync_scope_buttons_names_the_optics_card_once():
 
     ControlsPanel._sync_scope_buttons(panel)
 
-    panel.roll_override_summary.setText.assert_called_once_with("This frame overrides: Optics")
+    panel.roll_override_summary.setText.assert_called_once_with("Keeps its own value on: Optics")
 
 
 def test_optics_reads_frame_when_either_of_its_cards_is_locked():
@@ -181,31 +177,6 @@ def test_a_roll_card_routes_both_halves_to_the_controller():
     panel.controller.set_card_scope.reset_mock()
     ControlsPanel._on_scope_selected(panel, "process", "frame")
     panel.controller.set_card_scope.assert_called_once_with("process", "frame")
-
-
-def test_a_whole_roll_apply_from_a_frame_card_is_recorded():
-    """The record is what lets the card read Roll afterwards; a selection apply is not
-    roll-wide and leaves it alone."""
-    panel = _panel_stub()
-    rows = [r for r in rows_for_fields(("dye_separation",))]
-
-    with patch("negpy.desktop.view.sidebar.controls_panel.open_apply_dialog", return_value=(rows, "roll")):
-        ControlsPanel._on_scope_selected(panel, "tone", "roll")
-    panel.controller.record_roll_apply.assert_called_once_with(rows)
-
-    panel.controller.record_roll_apply.reset_mock()
-    with patch("negpy.desktop.view.sidebar.controls_panel.open_apply_dialog", return_value=(rows, "selection")):
-        ControlsPanel._on_scope_selected(panel, "tone", "roll")
-    panel.controller.record_roll_apply.assert_not_called()
-
-
-def test_a_cancelled_apply_records_nothing():
-    panel = _panel_stub()
-
-    with patch("negpy.desktop.view.sidebar.controls_panel.open_apply_dialog", return_value=None):
-        ControlsPanel._on_scope_selected(panel, "tone", "roll")
-
-    panel.controller.record_roll_apply.assert_not_called()
 
 
 def test_reset_process_fields_only_touches_the_given_fields():
@@ -339,13 +310,20 @@ def test_sync_modified_dots_leaves_the_scanning_setup_uncounted():
     panel.process_section.set_modified.assert_called_once_with(0)
 
 
-def test_resetting_calibration_restores_the_fade_survivals():
+def _faded_panel() -> MagicMock:
     panel = MagicMock()
     panel.controller.state = AppState()
     cfg = DEFAULT_WORKSPACE_CONFIG
-    panel.controller.state.config = replace(cfg, process=replace(cfg.process, fade_ratio_r=0.5, fade_ratio_g=0.6, fade_ratio_b=0.7))
+    panel.controller.state.config = replace(
+        cfg, process=replace(cfg.process, fade_ratio_r=0.5, fade_ratio_g=0.6, fade_ratio_b=0.7, hue_trim=3.0)
+    )
+    return panel
 
-    ControlsPanel._reset_process_fields(panel, _SENSOR_FIELDS)
+
+def test_resetting_fade_restoration_restores_the_survivals_and_keeps_hue_trim():
+    panel = _faded_panel()
+
+    ControlsPanel._reset_process_fields(panel, _FADE_FIELDS)
 
     process = panel.controller.apply_config.call_args[0][0].process
     defaults = DEFAULT_WORKSPACE_CONFIG.process
@@ -354,6 +332,35 @@ def test_resetting_calibration_restores_the_fade_survivals():
         defaults.fade_ratio_g,
         defaults.fade_ratio_b,
     )
+    assert process.hue_trim == 3.0
+
+
+def test_resetting_calibration_keeps_the_fade_survivals():
+    panel = _faded_panel()
+
+    ControlsPanel._reset_process_fields(panel, _SENSOR_FIELDS)
+
+    process = panel.controller.apply_config.call_args[0][0].process
+    assert (process.fade_ratio_r, process.fade_ratio_g, process.fade_ratio_b, process.hue_trim) == (0.5, 0.6, 0.7, 0.0)
+
+
+def test_fade_restoration_has_its_own_scope_pair():
+    panel = _panel_stub(locked_cards={"fade"})
+
+    ControlsPanel._sync_scope_buttons(panel)
+
+    assert _scope(panel.fade_section) == "frame"
+    assert _scope(panel.sensor_section) == "roll"
+    panel.roll_override_summary.setText.assert_called_once_with("Keeps its own value on: Fade Restoration")
+
+
+def test_each_card_pushes_only_its_own_roll_card():
+    panel = _panel_stub()
+
+    ControlsPanel._on_scope_selected(panel, "fade", "roll")
+    ControlsPanel._on_scope_selected(panel, "sensor", "roll")
+
+    assert [c.args for c in panel.controller.set_card_scope.call_args_list] == [("fade", "roll"), ("sensor", "roll")]
 
 
 def test_a_card_reset_leaves_the_scanning_setup_alone():
@@ -447,15 +454,13 @@ def test_reset_film_fields_does_nothing_at_the_defaults():
 
 def test_sync_scope_buttons_offers_reset_to_roll_where_the_controller_finds_one():
     panel = _panel_stub(locked_cards=("process",))
-    panel.controller.roll_revert_cards.side_effect = lambda keys: {"process", "lens", "tone"} & set(keys)
+    panel.controller.roll_revert_cards.side_effect = lambda keys: {"process", "lens"} & set(keys)
 
     ControlsPanel._sync_scope_buttons(panel)
 
     panel.process_section.set_roll_revert.assert_called_with(True)
     panel.optics_section.set_roll_revert.assert_called_with(True)
     panel.film_section.set_roll_revert.assert_called_with(False)
-    panel.tone_section.set_roll_revert.assert_called_with(True)
-    panel.lab_section.set_roll_revert.assert_called_with(False)
 
 
 def test_the_frame_half_does_not_promise_a_rejoin():
@@ -541,15 +546,15 @@ def _card_menu(monkeypatch, key: str):
 
     monkeypatch.setattr(cp, "QMenu", FakeMenu)
     panel = SimpleNamespace(_roll_sections=lambda: (("optics", None), ("demosaic", None)), controller=MagicMock())
-    panel.controller.can_undo_roll_push.return_value = False
+    panel.controller.can_undo_batch.return_value = False
     cp.ControlsPanel._show_card_menu(panel, key, SimpleNamespace(toggle_button=MagicMock()), QPoint())
     return panel, actions
 
 
-def test_a_roll_card_menu_offers_undo_only_for_its_own_cards(monkeypatch):
+def test_a_card_menu_offers_the_batch_undo(monkeypatch):
     panel, actions = _card_menu(monkeypatch, "optics")
-    assert [a.text for a in actions] == ["Copy Card Settings", "Undo Apply to Roll"]
-    panel.controller.can_undo_roll_push.assert_called_once_with(("lens", "flatfield"))
+    assert [a.text for a in actions] == ["Copy Card Settings", "Undo Change to Several Frames"]
+    panel.controller.can_undo_batch.assert_called_once_with()
     assert not actions[1].enabled
 
 
@@ -566,7 +571,7 @@ def test_a_frame_card_menu_copies_that_card(monkeypatch):
     from negpy.desktop.settings_catalog import frame_card_rows
 
     panel, actions = _card_menu(monkeypatch, "lab")
-    assert [a.text for a in actions] == ["Copy Card Settings"]
+    assert [a.text for a in actions] == ["Copy Card Settings", "Undo Change to Several Frames"]
     actions[0].slot()
     panel.controller.session.copy_card_settings.assert_called_once_with(frame_card_rows("lab"))
 
@@ -578,3 +583,12 @@ def test_the_crop_card_copies_a_crop_with_its_auto_crop():
     fields = {f for row in frame_card_rows("autocrop") for f in row.fields}
     assert {"crop_rect", "crop_detect_key", "crop_from_auto", "autocrop_ratio", "autocrop_mode"} <= fields
     assert not fields & {f for row in frame_card_rows("geometry") for f in row.fields}
+
+
+def test_a_roll_card_reset_settles_its_lock():
+    panel = MagicMock()
+    panel.controller.state.config = DEFAULT_WORKSPACE_CONFIG
+
+    ControlsPanel._reset_process_fields(panel, ("analysis_buffer",), ("process",))
+
+    panel.controller.sync_roll_card_locks.assert_called_once_with(("process",), DEFAULT_WORKSPACE_CONFIG)
