@@ -204,6 +204,17 @@ def creation_order(frames: Sequence[SheetFrame]) -> list[int]:
     return sorted(range(len(frames)), key=key)
 
 
+def frame_order(frames: Sequence[SheetFrame]) -> list[int]:
+    """Indices by the frame's Roll and Frame No. from its metadata, the name a tie."""
+
+    def key(index: int) -> tuple[Any, ...]:
+        meta = frames[index].config.metadata
+        num = meta.capture_frame
+        return (meta.capture_roll.casefold(), num if num is not None else 0, frames[index].name.lower())
+
+    return sorted(range(len(frames)), key=key)
+
+
 def _crop_fractions(config: WorkspaceConfig) -> tuple[float, float]:
     rect = config.geometry.crop_rect
     if not rect:
@@ -345,7 +356,7 @@ def film_color_type(frame: SheetFrame, library: Any = None) -> Optional[FilmColo
     if process.process_mode == ProcessMode.BW:
         return FilmColorType.BW_NEGATIVE
     if process.process_mode == ProcessMode.E6 and not process.positive_source:
-        return FilmColorType.COLOR_SLIDE
+        return FilmColorType.BW_SLIDE if process.slide_bw else FilmColorType.COLOR_SLIDE
     return None
 
 

@@ -39,7 +39,7 @@ class TestHydration(unittest.TestCase):
         session.state = AppState()
         session.repo = MagicMock()
         session.repo.get_global_setting.side_effect = lambda k, default=None: {"last_process_mode": sticky_mode}.get(k, default)
-        session._apply_sticky_settings = lambda c, only_global=False: (
+        session._apply_sticky_settings = lambda c, only_global=False, path="": (
             c if only_global else replace(c, process=replace(c.process, process_mode=sticky_mode))
         )
         import negpy.desktop.session as mod
@@ -247,7 +247,7 @@ class TestHdrSeedHydration(unittest.TestCase):
         session.state = AppState()
         session.repo = MagicMock()
         session.repo.get_global_setting.side_effect = lambda k, default=None: default
-        session._apply_sticky_settings = lambda c, only_global=False: c
+        session._apply_sticky_settings = lambda c, only_global=False, path="": c
         import negpy.desktop.session as mod
 
         orig = mod.load_or_promote
@@ -353,7 +353,7 @@ class TestResetSettingsOnAComposite(unittest.TestCase):
         orig = mod.load_or_promote
         mod.load_or_promote = lambda *a, **k: None
         try:
-            session._apply_sticky_settings = lambda c, only_global=False: c
+            session._apply_sticky_settings = lambda c, only_global=False, path="": c
             fresh = session._hydrate_asset_config(asset)
         finally:
             mod.load_or_promote = orig
@@ -432,7 +432,7 @@ class TestStitchGetsTheSameTreatment(unittest.TestCase):
         session.state = AppState()
         session.repo = MagicMock()
         session.repo.get_global_setting.side_effect = lambda k, default=None: default
-        session._apply_sticky_settings = lambda c, only_global=False: (
+        session._apply_sticky_settings = lambda c, only_global=False, path="": (
             c if only_global else replace(c, process=replace(c.process, process_mode=sticky_mode))
         )
         import negpy.desktop.session as mod
@@ -484,8 +484,8 @@ class TestMergeIsOfferedOnlyForTransparencies:
 
     Color negative holds ~5-6 stops between base and Dmax and an ordinary black-and-white
     negative nearer 4, both inside one capture; a transparency runs to 10-12, which is what
-    the merge exists for. Hidden on C-41, disabled with a reason on B&W, because reversal
-    monochrome (Scala, dr5, Fomapan R) really is a transparency and is simply not wired up.
+    the merge exists for. Hidden on C-41, disabled with a reason on B&W, which points reversal
+    monochrome (Scala, dr5, Fomapan R) to Slide with B&W on.
     """
 
     def _menu_labels(self, mode):

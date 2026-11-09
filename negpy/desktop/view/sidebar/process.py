@@ -143,7 +143,13 @@ class ProcessSidebar(BaseSidebar):
             conf.positive_source,
             (tr("Positive, slides only: the file is already a positive, such as a scanned print or another app's export.")),
         )
-        mode_col.addWidget(self.positive_source_btn)
+        # "&&": QPushButton reads a single "&" as a mnemonic and hides it.
+        self.slide_bw_btn = self._labeled_toggle("fa5s.adjust", tr("B&W").replace("&", "&&"), conf.slide_bw, "")
+        slide_row = QHBoxLayout()
+        slide_row.setSpacing(THEME.space_sm)
+        slide_row.addWidget(self.positive_source_btn, 1)
+        slide_row.addWidget(self.slide_bw_btn, 1)
+        mode_col.addLayout(slide_row)
 
         self.source_encoding_btn = StepCombo.of(
             [tr(SOURCE_ENCODING_LABELS[enc]) for enc in SourceEncoding],
@@ -176,7 +182,9 @@ class ProcessSidebar(BaseSidebar):
         analysis_col.setSpacing(THEME.space_sm)
         self.analysis_buffer_slider = CompactSlider(tr("Analysis Buffer"), 0.0, 0.25, conf.analysis_buffer)
         self.reanalyze_frame_btn = self._labeled_action(
-            "fa5s.redo", tr("Reanalyze Frame"), tr("Reanalyze Frame: measure this frame again from its current crop.")
+            "fa5s.redo",
+            tr("Measure Alone"),
+            tr("Measure Alone: take this frame off the roll average and measure it on its own, from its current crop."),
         )
         self.analysis_header = section_subheader(tr("ANALYSIS"))
         analysis_col.addLayout(header_actions(self.analysis_header, self.lock_bounds_btn))
@@ -189,7 +197,7 @@ class ProcessSidebar(BaseSidebar):
             "fa5s.vector-square",
             tr("Draw Region"),
             tr("Draw a region on the picture for NegPy to measure, then double-click inside it to confirm."),
-            tr("Clear Region: measure with the Analysis Buffer again."),
+            tr("Clear Region: let NegPy pick the area to measure."),
         )
         self.clear_analysis_region_btn = self.analysis_region_btn.clear_btn
         tools_row = QHBoxLayout()
@@ -318,6 +326,7 @@ class ProcessSidebar(BaseSidebar):
         self.color_range_clip_slider.valueCommitted.connect(lambda v: self._on_color_range_clip_changed(v, persist=True))
 
         self.positive_source_btn.toggled.connect(self._on_positive_source_toggled)
+        self.slide_bw_btn.toggled.connect(self.controller.set_slide_bw)
         self.source_encoding_btn.currentIndexChanged.connect(self._on_source_encoding_changed)
         self.use_luma_avg_btn.toggled.connect(self._on_use_luma_average_toggled)
         self.use_color_avg_btn.toggled.connect(self._on_use_color_average_toggled)
@@ -448,9 +457,9 @@ class ProcessSidebar(BaseSidebar):
         self.reanalyze_frame_btn.setEnabled(on_selection or not locked)
         if on_selection:
             n = count_of(len(self.state.selected_indices), "frame").title()
-            tip = tr("Reanalyze {value}: measure each selected frame again on its own bounds.", value=n)
+            tip = tr("Measure {value} Alone: take each selected frame off the roll average and measure it on its own.", value=n)
         else:
-            tip = tr("Reanalyze Frame: measure this frame again from its current crop.")
+            tip = tr("Measure Alone: take this frame off the roll average and measure it on its own, from its current crop.")
         self.reanalyze_frame_btn.setToolTip(wrap_tooltip(tip))
 
     def _on_reanalyze_frame(self) -> None:
@@ -499,6 +508,8 @@ class ProcessSidebar(BaseSidebar):
 
             self.positive_source_btn.setVisible(is_e6)
             self.positive_source_btn.setChecked(conf.positive_source)
+            self.slide_bw_btn.setVisible(is_e6)
+            self.slide_bw_btn.setChecked(conf.slide_bw)
             path = self.state.current_file_path or ""
             encodes = os.path.splitext(path)[1].lower() in _ENCODED_EXTENSIONS
             self.source_encoding_row.setVisible(is_e6 and conf.positive_source and encodes)
@@ -525,17 +536,22 @@ class ProcessSidebar(BaseSidebar):
             has_region = conf.analysis_rect is not None
             self.analysis_region_btn.setChecked(self.state.active_tool == ToolMode.ANALYSIS_DRAW)
             self.clear_analysis_region_btn.setVisible(has_region)
+            # Both axes on the roll average leave nothing for a hand pick to move.
+            rides = conf.use_luma_average and conf.use_color_average
             for btn, hint, mode, picked in (
                 (self.dmin_btn, self.dmin_hint, ToolMode.DMIN_PICK, conf.manual_dmin),
                 (self.dmax_btn, self.dmax_hint, ToolMode.DMAX_PICK, conf.manual_dmax),
             ):
                 btn.setChecked(self.state.active_tool == mode)
+                btn.setEnabled(not rides)
                 btn.clear_btn.setVisible(picked is not None)
                 hint.setText(_picked_densities(picked))
+            if rides:
+                self.dmin_hint.setText(tr("Off while this frame prints on the roll average: turn off Luma and Color to pick by hand."))
 
+            # Draw Region stays: the slide meters, Estimate and Remove Stain read it too.
             for w in (
                 self.analysis_buffer_slider,
-                self.analysis_region_btn,
                 self.pick_fold.content,
                 self.avg_header,
                 self.use_luma_avg_btn,
@@ -600,6 +616,7 @@ class ProcessSidebar(BaseSidebar):
             self.luma_range_clip_slider,
             self.color_range_clip_slider,
             self.positive_source_btn,
+            self.slide_bw_btn,
             self.source_encoding_btn,
             self.ch_btn,
             self.white_point_slider,

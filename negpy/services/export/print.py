@@ -253,16 +253,16 @@ class PrintService:
             if export_settings.paper_aspect_ratio == AspectRatio.ORIGINAL:
                 if img_w >= img_h:
                     target_w = max(10, paper_long_px - 2 * border_px)
-                    target_h = int(target_w / img_aspect)
+                    target_h = target_w * img_h // img_w
                     if short_target:
                         target_h = max(10, int(export_settings.export_target_edge_px) - border_y_px)
-                        target_w = int(target_h * img_aspect)
+                        target_w = target_h * img_w // img_h
                 else:
                     target_h = max(10, paper_long_px - border_y_px)
-                    target_w = int(target_h * img_aspect)
+                    target_w = target_h * img_w // img_h
                     if short_target:
                         target_w = max(10, int(export_settings.export_target_edge_px) - 2 * border_px)
-                        target_h = int(target_w / img_aspect)
+                        target_h = target_w * img_h // img_w
                 paper_w = target_w + 2 * border_px
                 paper_h = target_h + border_y_px
             else:

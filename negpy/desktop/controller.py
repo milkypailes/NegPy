@@ -5,7 +5,7 @@ import os
 import time
 from collections import Counter
 from dataclasses import dataclass, fields, replace
-from typing import Any, Callable, Collection, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Callable, Collection, Dict, List, NamedTuple, Optional, Set, Tuple, Union
 
 import negpy_core
 import numpy as np
@@ -27,7 +27,6 @@ from negpy.desktop.session import (
     ToolMode,
     REVERTIBLE_TOOLS,
     UNCROPPED_PREVIEW_TOOLS,
-    _source_effective_bounds,
     can_edit_triplet,
     composite_kind,
     is_plain_triplet,
@@ -114,6 +113,7 @@ from negpy.domain.models import (
     preset_from_export_config,
     resolve_preset_export,
 )
+from negpy.services.assets.capture_modes import BLEND, SINGLE, record_capture_mode
 from negpy.services.assets.composites import (
     forget_composite,
     frame_count,
@@ -201,7 +201,6 @@ from negpy.features.geometry.models import (
     crops_frame,
     squares_on_arm,
     with_auto_crop,
-    with_auto_crop_field,
 )
 from negpy.features.geometry.skew import squared_geometry
 from negpy.features.geometry.processor import CropProcessor, GeometryProcessor
@@ -219,16 +218,15 @@ from negpy.features.process.models import (
     with_film_fields,
     with_source_encoding,
     with_positive_source,
+    with_slide_bw,
     with_process_mode,
 )
 from negpy.infrastructure.loaders.source_kind import with_scanner_positive_default
 from negpy.desktop.settings_catalog import (
+    ROLL_CARD_LABELS,
     BOUNDS_INPUT_FIELDS,
-    FRAME_CARD_FIELDS,
     changed_settings,
-    frame_card_rows,
-    section_of_field,
-    selected_flat_dict,
+    meter_inputs_key,
 )
 from negpy.services.assets.thumbnails import asset_thumbnail_key
 from negpy.services.assets.thumbnail_fingerprint import (
@@ -274,6 +272,16 @@ _BUSY_TOAST_MS = 30000
 # Batch owners that share norm_thread (and its CPU) with the background thumbnail
 # refresh — the only ones a running refresh actually needs to get out of the way of.
 _NORM_THREAD_BATCH_OWNERS = frozenset({"autocrop", "normalization"})
+
+
+class BackgroundBaseline(NamedTuple):
+    """A background Roll Average run: where it saves, which frames it pools and their meter inputs."""
+
+    roll_id: str
+    scene_id: Optional[str]
+    hashes: Tuple[str, ...]
+    inputs: Dict[str, str]
+    remeasured: bool
 
 
 # A keep_preview reload (same file, e.g. a mode switch) skips the spinner so a fast
@@ -758,7 +766,6 @@ class AppController(QObject):
         self._export_start_time = 0.0
         self._export_errors: list[str] = []
         # (roll id, pushing frame, pushed cards, their roll fields before the push)
-        self._roll_push_undo: Optional[tuple] = None
         self._frame_merge_trash = True
         self._discovery_running = False
         self._auto_open_after_discovery = False
@@ -781,9 +788,11 @@ class AppController(QObject):
         self._batch_serial = 0
         self._active_batch_token: Optional[int] = None
         self._normalization_scope: Optional[str] = None
+        self._normalization_measured: Optional[Set[str]] = None
         self._scene_queue: List[str] = []
-        # (roll id, frame hashes) of the running background Roll Analysis.
-        self._background_baseline: Optional[Tuple[str, Tuple[str, ...]]] = None
+        # (roll id, scene id, frame hashes, their meter inputs, whether a baseline existed) of the
+        # running background Roll Analysis.
+        self._background_baseline: Optional[BackgroundBaseline] = None
         self._background_baseline_timer = QTimer(self)
         self._background_baseline_timer.setSingleShot(True)
         self._background_baseline_timer.setInterval(2000)
@@ -972,6 +981,7 @@ class AppController(QObject):
         self._crop_bounds_dirty = False
         # (tool, file hash, config) when Crop or Draw Region opened: what Esc puts back.
         self._tool_entry: Optional[Tuple[ToolMode, Optional[str], WorkspaceConfig]] = None
+        self._average_peek_hash: Optional[str] = None  # the frame the average peek prints; a plain render on another carries it
         self._peek_sections: Optional[tuple] = None  # _peek_hidden_sections() when a scan peek opened; a render of others ends it
         self._keystone_lines: Dict[str, Tuple[Tuple[float, float], Tuple[float, float]]] = {}
         self._zone_preview_shown = False
@@ -1126,6 +1136,10 @@ class AppController(QObject):
         self.set_status(tr("Brush Size {size} px", size=size), 1500)
 
     def _connect_signals(self) -> None:
+        # A lock moves with an edit, a push, a paste or a reset; each ends in config_updated.
+        self.config_updated.connect(self.session.refresh_own_marks)
+        # A crop or Metering edit can leave the roll average out of date; the run checks each frame's inputs.
+        self.config_updated.connect(self._background_baseline_timer.start)
         self.render_requested.connect(self.render_worker.process)
         self.strip_requested.connect(self.render_worker.build_strip)
         self.pick_better_requested.connect(self.render_worker.build_pick_better)
@@ -2343,6 +2357,11 @@ class AppController(QObject):
                 "last_linear_raw": linear_raw,
             }
         )
+        # Before the reload: an unlocked Raw Decode takes the roll's decode on load, so a roll on the old one undoes the rig.
+        repo = self.session.repo
+        for roll_id in {r for a in self.session.state.uploaded_files if (r := rolls.frame_roll(repo, self.state.active_roll_id, a))}:
+            if "linear_raw" in rolls.roll_defaults(repo, roll_id):
+                self._set_roll_cards(roll_id, self.state.config, linear_raw=linear_raw)
 
         def with_rig(config: WorkspaceConfig) -> WorkspaceConfig:
             exposure = config.exposure
@@ -3180,10 +3199,10 @@ class AppController(QObject):
         # now, with no spinner and no toasts, and let the real render refresh the metrics.
         target_hash = self._file_hash_for_path(file_path)
         self._expected_render_key = self._render_memo_key()
-        # An uncropped-preview tool skips the memo: its filed pixels are a cropped print.
+        # An uncropped-preview tool and the average peek skip the memo: it holds the frame's own cropped print.
         memo = (
             self._render_memo.get(target_hash, self._expected_render_key)
-            if target_hash and self.state.active_tool not in UNCROPPED_PREVIEW_TOOLS
+            if target_hash and self.state.active_tool not in UNCROPPED_PREVIEW_TOOLS and not self.state.average_peek
             else None
         )
 
@@ -3450,7 +3469,10 @@ class AppController(QObject):
         self.preview_loaded.emit()
         self.config_updated.emit()
         self._first_render_t0 = time.perf_counter()
-        self.request_render()
+        if self.state.average_peek:
+            self._carry_average_peek()
+        else:
+            self.request_render()
         self._neighbor_prefetch_generation = self._prefetch_gen
 
     def _schedule_prefetch_neighbors(self) -> None:
@@ -3839,7 +3861,7 @@ class AppController(QObject):
         unmix, so the roll keeps a raw base that every render unmixes like the rebate reader's.
         One click: the tool disarms, and leaving it re-renders the roll's frame above the base."""
         from negpy.features.exposure.normalization import log_from_val
-        from negpy.features.process.fade import unmix_with_fade
+        from negpy.features.process.fade import render_white_space, fade_density
 
         bounds = self.state.last_metrics.get("final_bounds") or self.state.last_metrics.get("log_bounds")
         patch = self._sample_normalized_patch(nx, ny, radius=4)
@@ -3852,7 +3874,11 @@ class AppController(QObject):
             self.set_status(tr("Film Base: that spot is not flat film; click the clear rebate"), 4000, "warning")
             return
         base = logs.mean(axis=0)
-        unmix = unmix_with_fade(self.state.config.process, self.state.config.process.process_mode)
+        unmix = fade_density(
+            self.state.config.process,
+            self.state.config.process.process_mode,
+            render_white_space(self.state.config.process, self.state.config.process.process_mode, *self._effective_cam_xyz()),
+        ).matrix
         if unmix is not None:
             unmix = np.asarray(unmix, dtype=np.float64)
             if unmix.shape[1] == 4:
@@ -6047,7 +6073,7 @@ class AppController(QObject):
             None,
             title,
             tr(
-                "{sheet_note}{crop_status}\n{crop_warning}\n\n{summary} A frame whose color is far from the rest keeps its own exposure and color.\n\nTwo settings from the image you have open right now are applied to every file before averaging:\n  • Analysis Buffer: shrinks the analyzed region inward, excluding a margin around the edges (film borders, light leaks, the scanner mask). A frame with its own drawn analysis region meters that region instead.\n  • Luma Range Clip: how aggressively the highlight/shadow tails are clipped when setting each file's bounds.\nSet both on the current frame before running.\n\nContinue?",
+                "{sheet_note}{crop_status}\n{crop_warning}\n\n{summary} A frame whose color is far from the rest keeps its own exposure and color.\n\nEach frame is measured with its own Metering settings, as the roll average is measured in the background.\n\nContinue?",
                 sheet_note=sheet_note,
                 crop_status=crop_status,
                 crop_warning=crop_warning,
@@ -6060,12 +6086,11 @@ class AppController(QObject):
 
     def _dispatch_normalization(self, scene_id: Optional[str], frames: List[dict], detect: bool = False) -> None:
         self._normalization_scope = scene_id
+        # Only the frames measured take the result: a frame the Sheet filter hid stays as it was.
+        self._normalization_measured = {f["hash"] for f in frames}
         task = NormalizationTask(
             frames=[NormalizationInput(file_info=a, config=self._config_for_batch_asset(a)) for a in frames],
             workspace_color_space=self.state.workspace_color_space,
-            override_analysis_buffer=self.state.config.process.analysis_buffer,
-            override_luma_range_clip=self.state.config.process.luma_range_clip,
-            override_color_range_clip=self.state.config.process.color_range_clip,
             detect=detect,
         )
         self.normalization_requested.emit(task)
@@ -6171,13 +6196,16 @@ class AppController(QObject):
         changed: List[str] = []
         for f in frames:
             if f["hash"] == self.state.current_file_hash:
-                self.session.update_config(replace(self.state.config, process=_own_bounds(self.state.config.process)), persist=True)
+                before = self.state.config
+                self.session.update_config(replace(before, process=_own_bounds(before.process)), persist=True)
+                self._lock_roll_card("baseline", before)
                 self.request_render()
                 continue
             p = self.session.repo.load_file_settings(f["hash"]) or self.session.config_for_asset(f)
             new_p = replace(p, process=_own_bounds(p.process))
             self.session.push_external_history(f["hash"], p, new_p)
             self.session.repo.save_file_settings(f["hash"], new_p, file_path=f["path"])
+            self._lock_roll_card_for(f, f["hash"], new_p, "baseline", p)
             changed.append(f["hash"])
         if changed:
             self.session.frames_edited_offscreen.emit(changed)
@@ -6326,6 +6354,17 @@ class AppController(QObject):
             self.session.update_config(replace(self.state.config, process=new_process), persist=True)
         return locked_skipped
 
+    def _roll_rides_its_average(self, roll_id: str, targets: List[dict], outliers: set, cast: bool) -> None:
+        """Roll Analysis makes Use Average the roll's own value, so a frame added later follows it.
+        An outlier or a Lock Bounds frame keeps its own measurement: its Roll Analysis card locks."""
+        repo = self.session.repo
+        rolls.set_roll_defaults(repo, roll_id, use_luma_average=True, use_color_average=True, use_cast_average=cast)
+        for f in targets:
+            config = self.state.config if f["hash"] == self.state.current_file_hash else repo.load_file_settings(f["hash"])
+            own = f["hash"] in outliers or bool(config and config.process.lock_bounds)
+            rolls.set_frame_override(repo, roll_id, rolls.unforked_hash(f["hash"]), "baseline", own)
+        self.config_updated.emit()
+
     def _on_normalization_finished(
         self, locked_floors: tuple, locked_ceils: tuple, outlier_hashes: list, axis: Optional[tuple] = None
     ) -> None:
@@ -6339,20 +6378,22 @@ class AppController(QObject):
         roll_id = self.state.active_roll_id
         source = f"scene:{scene_id}" if scene_id else (f"roll:{roll_id}" if roll_id else "")
         outliers = tuple(outlier_hashes)
-        targets = self._normalization_targets(scene_id)
+        measured = self._normalization_measured
+        targets = [f for f in self._normalization_targets(scene_id) if measured is None or f["hash"] in measured]
         locked_skipped = self._push_bounds(targets, locked_floors, locked_ceils, None, source, outliers, axis)
 
+        known = tuple(f["hash"] for f in targets)
+        inputs = self._meter_inputs(targets)
         if scene_id is None:
             if roll_id is not None:
-                known = tuple(f["hash"] for f in targets)
                 rolls.set_roll_normalization(
-                    self.session.repo, roll_id, locked_floors, locked_ceils, outliers=outliers, axis=axis, frames=known
+                    self.session.repo, roll_id, locked_floors, locked_ceils, outliers=outliers, axis=axis, frames=known, inputs=inputs
                 )
+                self._roll_rides_its_average(roll_id, targets, set(outliers), axis is not None)
             message = tr("Roll analysis complete")
         else:
-            known = tuple(f["hash"] for f in targets)
             rolls.set_scene_normalization(
-                self.session.repo, roll_id, scene_id, locked_floors, locked_ceils, outliers=outliers, axis=axis, frames=known
+                self.session.repo, roll_id, scene_id, locked_floors, locked_ceils, outliers=outliers, axis=axis, frames=known, inputs=inputs
             )
             self.session.refresh_scene_marks()
             message = tr("Scene “{value}” analyzed", value=self._scene_name(scene_id))
@@ -6395,33 +6436,46 @@ class AppController(QObject):
         """Measures the roll baseline, then each scene's, one per run, without a dialog or
         progress bar and without turning any frame's Use Average on. A scope runs while one of its
         frames is missing from its saved baseline; a baseline saved before frames were recorded
-        stays until Roll or Scene Analysis runs."""
+        stays until Roll or Scene Analysis runs. A slide never prints on an average, so the run
+        leaves slide frames out."""
         roll_id = self.state.active_roll_id
         if roll_id is None or self._active_batch is not None or self._background_baseline is not None:
             return
         repo = self.session.repo
         for scene_id in [None, *(sid for sid, _entry in rolls.roll_scenes(repo, roll_id))]:
-            frames = [f for f in self._normalization_targets(scene_id) if not self._waits_for_auto_crop(f)]
+            targets = [f for f in self._normalization_targets(scene_id) if not self._waits_for_auto_crop(f)]
+            configs = {f["hash"]: self._config_for_batch_asset(f) for f in targets}
+            frames = [f for f in targets if render_path(configs[f["hash"]].process) is RenderPath.PRINT]
             hashes = tuple(f["hash"] for f in frames)
             saved = rolls.scene_normalization(repo, roll_id, scene_id) if scene_id else rolls.roll_normalization(repo, roll_id)
-            if len(frames) >= 2 and not (saved and (saved["frames"] is None or set(hashes) <= set(saved["frames"]))):
+            if len(frames) < 2 or (saved and saved["frames"] is None):
+                continue
+            inputs = {h: meter_inputs_key(configs[h]) for h in hashes}
+            if not saved or not set(hashes) <= set(saved["frames"]) or self._inputs_changed(saved, inputs):
                 break
         else:
             return
-        self._background_baseline = (roll_id, scene_id, hashes)
+        self._background_baseline = BackgroundBaseline(roll_id, scene_id, hashes, inputs, saved is not None)
         self._on_background_baseline_progress(0, len(frames))
         self.bg_norm_worker.arm()
         self.background_normalization_requested.emit(
             NormalizationTask(
-                frames=[NormalizationInput(file_info=f, config=self._config_for_batch_asset(f)) for f in frames],
+                frames=[NormalizationInput(file_info=f, config=configs[f["hash"]]) for f in frames],
                 workspace_color_space=self.state.workspace_color_space,
-                override_analysis_buffer=None,
-                override_luma_range_clip=None,
-                override_color_range_clip=None,
                 background=True,
             )
         )
         self.config_updated.emit()
+
+    def _meter_inputs(self, frames: List[dict]) -> Dict[str, str]:
+        return {f["hash"]: meter_inputs_key(self._config_for_batch_asset(f)) for f in frames}
+
+    @staticmethod
+    def _inputs_changed(saved: dict, inputs: Dict[str, str]) -> bool:
+        """A frame whose crop or Metering changed since the average measured it. A baseline saved
+        before inputs were recorded cannot tell, and stays."""
+        recorded = saved.get("inputs")
+        return recorded is not None and any(recorded.get(h) not in (None, key) for h, key in inputs.items())
 
     def measuring_baseline(self) -> bool:
         return self._background_baseline is not None
@@ -6430,14 +6484,24 @@ class AppController(QObject):
         """Saves the measured baseline on the roll or scene and moves the frames that already ride it."""
         if self._background_baseline is None:
             return
-        roll_id, scene_id, hashes = self._background_baseline
+        roll_id, scene_id, hashes, inputs, remeasured = self._background_baseline
         outliers = tuple(outlier_hashes)
+        repo = self.session.repo
         if scene_id:
-            rolls.set_scene_normalization(self.session.repo, roll_id, scene_id, floors, ceils, outliers=outliers, axis=axis, frames=hashes)
+            rolls.set_scene_normalization(
+                repo, roll_id, scene_id, floors, ceils, outliers=outliers, axis=axis, frames=hashes, inputs=inputs
+            )
         else:
-            rolls.set_roll_normalization(self.session.repo, roll_id, floors, ceils, outliers=outliers, axis=axis, frames=hashes)
+            rolls.set_roll_normalization(repo, roll_id, floors, ceils, outliers=outliers, axis=axis, frames=hashes, inputs=inputs)
         if roll_id == self.state.active_roll_id:
-            self._refresh_riding_frames(scene_id, floors, ceils, axis)
+            moved = self._refresh_riding_frames(scene_id, floors, ceils, axis)
+            if remeasured and moved:
+                message = (
+                    tr("Scene average measured again: {value} took the new average", value=count_of(moved, "frame"))
+                    if scene_id
+                    else tr("Roll average measured again: {value} took the new average", value=count_of(moved, "frame"))
+                )
+                self.set_status(message, 4000)
             # Outliers moved with the new pool.
             self.session.refresh_average_marks()
         self._on_background_baseline_ended()
@@ -6451,7 +6515,7 @@ class AppController(QObject):
     def _on_background_baseline_progress(self, done: int, total: int, *_args) -> None:
         if self._background_baseline is None:
             return
-        if self._background_baseline[1]:
+        if self._background_baseline.scene_id:
             text = tr("Scene average {index}/{total}", index=done, total=total)
         else:
             text = tr("Roll average {index}/{total}", index=done, total=total)
@@ -6466,18 +6530,23 @@ class AppController(QObject):
             self.status_progress_requested.emit(0, 0)
         self.config_updated.emit()
 
-    def _refresh_riding_frames(self, scene_id: Optional[str], floors: tuple, ceils: tuple, axis: Optional[tuple]) -> None:
+    def _refresh_riding_frames(self, scene_id: Optional[str], floors: tuple, ceils: tuple, axis: Optional[tuple]) -> int:
         """A frame that rides Use Average on this scene's or the roll's baseline, or on none yet
-        while it belongs here, takes the new numbers; its Use Average choices stay."""
+        while it belongs here, takes the new numbers; its Use Average choices stay. Returns how
+        many frames moved."""
         source = f"scene:{scene_id}" if scene_id else f"roll:{self.state.active_roll_id}"
         own = {f["hash"] for f in self._normalization_targets(scene_id)}
 
+        values = {"locked_floors": floors, "locked_ceils": ceils, "locked_neutral_axis": axis, "baseline_source": source}
+
         def rides(p, file_hash: str) -> bool:
+            """A riding frame that already holds these numbers does not move, so its thumbnail stays."""
             if p.lock_bounds or not (p.use_luma_average or p.use_color_average or p.use_cast_average):
+                return False
+            if replace(p, **values) == p:
                 return False
             return p.baseline_source == source or (file_hash in own and not (p.baseline_source or p.is_locked_initialized))
 
-        values = {"locked_floors": floors, "locked_ceils": ceils, "locked_neutral_axis": axis, "baseline_source": source}
         current = self.state.current_file_hash
         changed: List[str] = []
         for f in self.state.uploaded_files:
@@ -6492,9 +6561,12 @@ class AppController(QObject):
             changed.append(f["hash"])
         if changed:
             self.session.frames_edited_offscreen.emit(changed)
+        moved = len(changed)
         if current and rides(self.state.config.process, current):
             self.session.update_config(replace(self.state.config, process=replace(self.state.config.process, **values)), persist=True)
             self.request_render()
+            moved += 1
+        return moved
 
     def set_roll_average(self, scope: Optional[str] = None, **axis: bool) -> None:
         """Use Average on the active frame alone. An axis turned on takes the current scene or
@@ -6566,7 +6638,7 @@ class AppController(QObject):
             new_config = replace(config, process=process)
             self.session.push_external_history(f["hash"], config, new_config)
             self.session.repo.save_file_settings(f["hash"], new_config, file_path=f["path"])
-            self._lock_roll_card_for(f, f["hash"], new_config, "baseline")
+            self._lock_roll_card_for(f, f["hash"], new_config, "baseline", config)
             changed.append(f["hash"])
         if changed:
             self.session.frames_edited_offscreen.emit(changed)
@@ -6596,11 +6668,27 @@ class AppController(QObject):
             self.state.average_peek_axes = axes
             self.state.average_peek_scope = rolls.average_scope(process)
         self.state.average_peek = target
+        self._average_peek_hash = self.state.current_file_hash
         self.average_peek_changed.emit(target)
         if target:
             self._render_average_peek()
         else:
             self.request_render()
+
+    def _carry_average_peek(self) -> None:
+        """The peek follows the user to the next frame with the same averages on, so a roll
+        can be checked frame by frame. A frame with no average yet ends it."""
+        process = self.state.config.process
+        self._average_peek_hash = self.state.current_file_hash
+        if not self._saved_baseline_fields(process):
+            self.state.average_peek = False
+            self.average_peek_changed.emit(False)
+            self.set_status(tr("No average for this frame yet"), 3000)
+            self.request_render()
+            return
+        self.state.average_peek_scope = rolls.average_scope(process)
+        self.average_peek_changed.emit(True)
+        self._render_average_peek()
 
     def _cast_average_applies(self) -> bool:
         process = self.state.config.process
@@ -6647,14 +6735,14 @@ class AppController(QObject):
         self.request_render()
 
     def set_roll_baseline_from_frame(self, roll_id: str) -> None:
-        """Save the active frame's rendered bounds as the roll's baseline, then push them
-        out the way a Roll Analysis result is pushed. A standing rule, not a one-shot
-        copy: a frame loaded later reads the same baseline."""
-        bounds = _source_effective_bounds(self.state.config.process)
-        if bounds is None:
-            self.set_status(tr("Render this frame before taking its bounds"), 3000)
+        """Save the active frame's own measurement as the roll's baseline, then push it out the
+        way a Roll Analysis result is pushed. Its own, not what it renders: a frame on the
+        average renders the average. A frame loaded later reads the same baseline."""
+        process = self.state.config.process
+        if not process.is_local_initialized:
+            self.set_status(tr("Measure this frame on its own first: click Measure Alone."), 4000)
             return
-        floors, ceils = bounds
+        floors, ceils = process.local_floors, process.local_ceils
         rolls.set_roll_normalization(self.session.repo, roll_id, floors, ceils)
         self.apply_normalization_roll(roll_id)
 
@@ -6752,34 +6840,8 @@ class AppController(QObject):
         "metadata_scanning",
         "metadata_exposure",
     )
-    _ROLL_CARD_LABELS = {
-        "film": tr("Film Mode"),
-        "sensor": tr("Calibration"),
-        "fade": tr("Fade Restoration"),
-        "demosaic": tr("Raw Decode"),
-        "baseline": tr("Roll Analysis"),
-        "process": tr("Metering"),
-        "lens": tr("Optics"),
-        "flatfield": tr("Optics"),
-        "metadata_gear": tr("Analog Gear"),
-        "metadata_capture": tr("Capture"),
-        "metadata_process": tr("Process"),
-        "metadata_scanning": tr("Scanning"),
-        "metadata_exposure": tr("Exposure"),
-    }
+    _ROLL_CARD_LABELS = ROLL_CARD_LABELS
     METADATA_CARDS = ("metadata_gear", "metadata_capture", "metadata_process", "metadata_scanning", "metadata_exposure")
-    _FRAME_CARD_LABELS = {
-        "autocrop": tr("Crop"),
-        "geometry": tr("Straighten"),
-        "color": tr("Filtration"),
-        "tone": tr("Tone"),
-        "paper": tr("Paper Response"),
-        "lab": tr("Lab"),
-        "altproc": tr("Alternative Processes"),
-        "toning": tr("Toning"),
-        "retouch": tr("Retouch"),
-        "finish": tr("Finishing"),
-    }
 
     @staticmethod
     def _card_values(config, card_key: str) -> dict:
@@ -6799,6 +6861,19 @@ class AppController(QObject):
             config = replace(config, process=replace(config.process, **invalidate_local_bounds(config.process)))
         return config
 
+    def _set_roll_cards(self, roll_id: str, config, **values) -> None:
+        """Writes *values* into the roll as whole cards: a field of a touched card the roll lacks
+        takes *config*'s value, because a card with an unset field never matches the roll again."""
+        repo = self.session.repo
+        defaults = rolls.roll_defaults(repo, roll_id)
+        wanted = {}
+        for card_key, (_section, names) in rolls.ROLL_DEFAULT_FIELDS.items():
+            if any(name in values for name in names):
+                wanted.update(self._roll_baseline(config, card_key, defaults))
+        wanted.update(values)
+        if not all(n in defaults and rolls.same_value(v, defaults[n]) for n, v in wanted.items()):
+            rolls.set_roll_defaults(repo, roll_id, **wanted)
+
     def locked_roll_cards(self) -> set:
         """The Roll-tab cards the active frame has locked to its own value, within the
         active roll. Empty with no active roll. Keyed on the unforked hash, like the lock
@@ -6812,13 +6887,24 @@ class AppController(QObject):
     def roll_card_locked(self, card_key: str) -> bool:
         return card_key in self.locked_roll_cards()
 
+    def roll_crossover_table(self) -> Optional[tuple]:
+        """The crossover table the active frame's roll holds, None with no roll or no table."""
+        if not self.state.current_file_hash:
+            return None
+        idx = self.state.selected_file_idx
+        files = self.state.uploaded_files
+        asset = files[idx] if 0 <= idx < len(files) else {}
+        roll_id = rolls.frame_roll(self.session.repo, self.state.active_roll_id, asset)
+        table = None if roll_id is None else rolls.roll_defaults(self.session.repo, roll_id).get("fade_crossover_table")
+        return None if table is None else tuple(table)
+
     def diverged_roll_cards(self) -> List[str]:
         """Every Roll-tab card locked away from the roll on the active frame -- what
         Apply to Whole Roll / Apply to Selected Frames act on."""
         locked = self.locked_roll_cards()
         return [key for key in self._ROLL_CARDS if key in locked]
 
-    def _lock_roll_card(self, card_key: str) -> None:
+    def _lock_roll_card(self, card_key: str, before: Optional[WorkspaceConfig] = None) -> None:
         """Lock *card_key* only while the active frame's value differs from the roll's: a value
         edited back to the roll's is no divergence. Written in the roll the frame resolves
         through (rolls.frame_roll). No-op with no frame, or a frame in no roll."""
@@ -6827,24 +6913,24 @@ class AppController(QObject):
         idx = self.state.selected_file_idx
         files = self.state.uploaded_files
         asset = files[idx] if 0 <= idx < len(files) else {}
-        self._lock_roll_card_for(asset, self.state.current_file_hash, self.state.config, card_key)
+        self._lock_roll_card_for(asset, self.state.current_file_hash, self.state.config, card_key, before)
 
-    def _lock_roll_card_for(self, asset: dict, file_hash: str, config: WorkspaceConfig, card_key: str) -> None:
-        """_lock_roll_card for any frame, given its config."""
-        roll_id = rolls.frame_roll(self.session.repo, self.state.active_roll_id, asset)
+    def _lock_roll_card_for(
+        self, asset: dict, file_hash: str, config: WorkspaceConfig, card_key: str, before: Optional[WorkspaceConfig] = None
+    ) -> None:
+        """_lock_roll_card for any frame, given its config and, for an edit, the config before it."""
+        repo = self.session.repo
+        roll_id = rolls.frame_roll(repo, self.state.active_roll_id, asset)
         if roll_id is None:
             return
-        defaults = rolls.roll_defaults(self.session.repo, roll_id)
-        # A field the roll has never set at all cannot "match" -- there is nothing yet
-        # to differ from, and treating that as a match would hide a card's first-ever
-        # edit from Apply until every one of its fields happened to get a roll default.
-        current = self._card_values(config, card_key)
-        matches_roll = all(name in defaults and rolls.same_value(value, defaults[name]) for name, value in current.items())
-        diverged = not matches_roll
-        file_hash = rolls.unforked_hash(file_hash)
-        if diverged == (card_key in rolls.frame_override_cards(self.session.repo, roll_id, file_hash)):
-            return
-        rolls.set_frame_override(self.session.repo, roll_id, file_hash, card_key, diverged)
+        old = None if before is None else self._card_values(before, card_key)
+        rolls.settle_card_lock(
+            repo, roll_id, rolls.unforked_hash(file_hash), card_key, self._card_values(config, card_key), old, process=config.process
+        )
+
+    def _roll_baseline(self, config: WorkspaceConfig, card_key: str, defaults: dict) -> dict:
+        """*card_key*'s values on *config* for the fields the roll has no value for."""
+        return {name: value for name, value in self._card_values(config, card_key).items() if name not in defaults}
 
     def set_process_mode(self, mode: str) -> None:
         """Switches Film Mode for the active frame, locking the "film" card away from
@@ -6854,8 +6940,9 @@ class AppController(QObject):
         config = with_process_mode(self.state.config, mode)
         if config.process.process_mode != self.state.config.process.process_mode:
             config = with_scanner_positive_default(config, self.state.current_file_path or "")
+        before = self.state.config
         self.apply_config(config, persist=True)
-        self._lock_roll_card("film")
+        self._lock_roll_card("film", before)
 
     def set_positive_source(self, checked: bool) -> None:
         """Toggles Positive for the active frame, locking the "film" card away from
@@ -6864,16 +6951,27 @@ class AppController(QObject):
         if self.state.config.process.process_mode != ProcessMode.E6:
             # The shortcut still reaches the hidden button.
             return
-        self.apply_config(with_positive_source(self.state.config, checked), persist=True)
-        self._lock_roll_card("film")
+        before = self.state.config
+        self.apply_config(with_positive_source(before, checked), persist=True)
+        self._lock_roll_card("film", before)
+
+    def set_slide_bw(self, checked: bool) -> None:
+        """Toggles B&W for the active Slide, locking the "film" card away from the roll like Positive."""
+        if self.state.config.process.process_mode != ProcessMode.E6:
+            # The shortcut still reaches the hidden button.
+            return
+        before = self.state.config
+        self.apply_config(with_slide_bw(before, checked), persist=True)
+        self._lock_roll_card("film", before)
 
     def set_source_encoding(self, encoding: str) -> None:
         """Sets the active frame's Source Encoding, locking the "film" card away from the roll
         like Positive: one scanner and one workflow usually make a whole roll."""
         if str(self.state.config.process.source_encoding) == encoding:
             return
-        self.apply_config(with_source_encoding(self.state.config, encoding), persist=True)
-        self._lock_roll_card("film")
+        before = self.state.config
+        self.apply_config(with_source_encoding(before, encoding), persist=True)
+        self._lock_roll_card("film", before)
 
     def set_roll_default(self, card_key: str, persist: bool = True, readback_metrics: bool = True, **changes) -> None:
         """Edits *card_key* for the active frame alone, same as any other control --
@@ -6886,9 +6984,15 @@ class AppController(QObject):
         any other live preview -- the lock only follows the settled value, not every
         intermediate tick.
         """
+        before = self.state.config
         self._edit_card(card_key, rolls.ROLL_DEFAULT_FIELDS[card_key][0], persist, readback_metrics, changes)
         if persist:
-            self._lock_roll_card(card_key)
+            self._lock_roll_card(card_key, before)
+
+    def set_fade_white(self, **white) -> None:
+        """Store a camera RAW's fade white on the active frame. It is a reading of this frame's
+        decode, which no roll holds, so it locks no card."""
+        self._edit_card("fade", "process", True, True, white)
 
     def set_crop_settings(self, persist: bool = True, readback_metrics: bool = True, **changes) -> None:
         """Auto Crop's detection settings on the active frame. A change re-detects the crop
@@ -6926,35 +7030,53 @@ class AppController(QObject):
         frame_hash = rolls.unforked_hash(self.state.current_file_hash)
         # Only the fields this push writes, so an undo leaves every later roll default alone.
         names = {name for card in pushed for name in rolls.card_fields(card)}
-        self._roll_push_undo = (roll_id, frame_hash, tuple(pushed), rolls.roll_fields_snapshot(repo, roll_id, names))
-        for card_key in pushed:
-            rolls.set_roll_defaults(repo, roll_id, **self._card_values(self.state.config, card_key))
-            rolls.set_frame_override(repo, roll_id, frame_hash, card_key, False)
+        snapshot = rolls.roll_fields_snapshot(repo, roll_id, names)
+        baselines = {card: rolls.frame_baseline(repo, roll_id, frame_hash, card) for card in pushed}
+        with self.session.recording_batch(tr("Apply to Roll")) as batch:
+            for card_key in pushed:
+                rolls.set_roll_defaults(repo, roll_id, **self._card_values(self.state.config, card_key))
+                rolls.set_frame_override(repo, roll_id, frame_hash, card_key, False)
+            batch.roll_undo = lambda: self._restore_roll_push(roll_id, frame_hash, baselines, snapshot)
         self._roll_defaults_changed(roll_id, set(pushed))
-        self.set_status(tr("Applied to the roll: {value}", value=self._roll_card_names(pushed)), 3000)
+        message = tr("Applied to the roll: {value}", value=self._roll_card_names(pushed))
+        own = self._frames_keeping_own(roll_id, set(pushed))
+        if own:
+            message = tr("{message}. Frames that keep their own value: {count}", message=message, count=own)
+        self.set_status(message, 5000 if own else 3000)
         return len(set(pushed))
 
-    def can_undo_roll_push(self, cards=None) -> bool:
-        """Only on the frame that pushed, while the roll is open: elsewhere the live config
-        holds the pushed values, and the undo would leave it stale. With *cards*, only when
-        the last push included one of them."""
-        undo = self._roll_push_undo
-        if not undo or undo[0] != self.state.active_roll_id or undo[1] != rolls.unforked_hash(self.state.current_file_hash or ""):
-            return False
-        return cards is None or bool(set(cards) & set(undo[2]))
+    def _frames_keeping_own(self, roll_id: str, cards: set) -> int:
+        """Loaded frames locked on any of *cards*: a push to the roll does not reach them."""
+        entry = rolls.roll_for_id(self.session.repo, roll_id) or {}
+        overrides = entry.get("frame_overrides", {})
+        return sum(1 for f in self.state.uploaded_files if cards & set(overrides.get(rolls.unforked_hash(f["hash"]), ())))
 
-    def undo_roll_push(self) -> None:
-        if not self.can_undo_roll_push():
-            self.set_status(tr("Nothing to undo: this frame has no Apply to Roll."), 2500)
-            return
-        roll_id, frame_hash, pushed, snapshot = self._roll_push_undo
-        self._roll_push_undo = None
-        rolls.restore_roll_fields(self.session.repo, roll_id, snapshot)
-        # A push only ever moves cards this frame had locked.
-        for card_key in pushed:
-            rolls.set_frame_override(self.session.repo, roll_id, frame_hash, card_key, True)
+    def _restore_roll_push(self, roll_id: str, frame_hash: str, baselines: dict, snapshot: dict) -> None:
+        """Gives the roll back the values a push replaced; the frame that pushed keeps its own again.
+        *baselines* maps each pushed card to the pre-lock values its lock held."""
+        repo = self.session.repo
+        pushed = tuple(baselines)
+        rolls.restore_roll_fields(repo, roll_id, snapshot)
+        for card_key, baseline in baselines.items():
+            rolls.set_frame_override(repo, roll_id, frame_hash, card_key, True, baseline=baseline)
         self._roll_defaults_changed(roll_id, set(pushed))
-        self.set_status(tr("Undid Apply to Roll: {value}", value=self._roll_card_names(pushed)), 3000)
+        # The open frame follows the roll on these cards unless it is the one that pushed.
+        idx = self.state.selected_file_idx
+        if roll_id == self.state.active_roll_id and 0 <= idx < len(self.state.uploaded_files):
+            if rolls.unforked_hash(self.state.current_file_hash) != frame_hash:
+                self.apply_config(self.session.config_for_asset(self.state.uploaded_files[idx]), persist=False)
+
+    def can_undo_batch(self) -> bool:
+        return self.session.last_batch is not None
+
+    def undo_last_batch(self) -> None:
+        batch = self.session.last_batch
+        if batch is None:
+            self.set_status(tr("Nothing to undo: no change to several frames since your last edit."), 2500)
+            return
+        moved = self.session.undo_last_batch()
+        self.request_render()
+        self.set_status(tr("Undid {label}: {value}", label=batch.label, value=count_of(moved, "frame")), 3000)
 
     def _roll_card_names(self, cards) -> str:
         return ", ".join(dict.fromkeys(self._ROLL_CARD_LABELS[k] for k in self._ROLL_CARDS if k in cards))
@@ -6990,79 +7112,37 @@ class AppController(QObject):
             for key in keys:
                 self.set_roll_card_locked(key, True)
 
-    def sync_metadata_card_locks(self) -> None:
+    def sync_metadata_card_locks(self, before: Optional[WorkspaceConfig] = None) -> None:
         """Re-reads every Metadata card's lock after a write that touched several at once.
         The Metadata panel commits its fields in one go rather than control by control, so
-        no single edit knows which cards it moved; _lock_roll_card settles each either way."""
-        for card_key in self.METADATA_CARDS:
-            self._lock_roll_card(card_key)
+        no single edit knows which cards it moved."""
+        self.sync_roll_card_locks(self.METADATA_CARDS, before)
 
-    def frame_section_scope(self, section_key: str) -> str:
-        """Where a frame-level card's values live: "roll" once a whole-roll apply put them
-        there and this frame still matches every field it pushed, "frame" otherwise. Edit
-        one of those fields and it reads Frame again on its own, with nothing to clear."""
-        return self.frame_section_scopes((section_key,))[section_key]
-
-    def frame_section_scopes(self, section_keys: tuple) -> Dict[str, str]:
-        """frame_section_scope for many cards, off one read of the roll."""
-        pushes = self._section_pushes()
-        return {key: "roll" if pushes.get(key) and self._matches_push(pushes[key]) else "frame" for key in section_keys}
-
-    def _section_pushes(self) -> Dict[str, dict]:
-        roll_id = self.state.active_roll_id
-        entry = rolls.roll_for_id(self.session.repo, roll_id) if roll_id is not None else None
-        return entry.get("section_pushes", {}) if entry else {}
-
-    def _matches_push(self, pushed: dict) -> bool:
-        sections = section_of_field()
-        return all(rolls.same_value(getattr(getattr(self.state.config, sections[f]), f), v) for f, v in pushed.items() if f in sections)
-
-    def record_roll_apply(self, rows) -> None:
-        """Files a whole-roll apply of *rows*, split per frame card, so each card's scope
-        pair reads Roll and Reset to Roll has a value to return to."""
-        roll_id = self.state.active_roll_id
-        rows = list(rows)
-        if roll_id is None or not rows:
-            return
-        for key in FRAME_CARD_FIELDS:
-            own = [r for r in frame_card_rows(key) if r in rows]
-            if own:
-                rolls.set_section_push(self.session.repo, roll_id, key, selected_flat_dict(self.state.config, own))
-        self.config_updated.emit()
+    def sync_roll_card_locks(self, card_keys: Collection[str], before: Optional[WorkspaceConfig] = None) -> None:
+        """Locks each of *card_keys* where the active frame now differs from the roll, and
+        unlocks it where it matches again. *before* is the config ahead of the write."""
+        for card_key in card_keys:
+            self._lock_roll_card(card_key, before)
 
     def roll_revert_cards(self, card_keys: Collection[str]) -> Set[str]:
-        """Which of *card_keys* the active frame can reset to the roll: a Roll-tab card it
-        has locked while the roll holds a value for it, or a frame card that no longer
-        matches its recorded whole-roll apply. Empty with no active roll."""
+        """Which of *card_keys* the active frame can reset to the roll: a Roll-tab card it has
+        locked while the roll holds a value for it. Empty with no active roll."""
         roll_id = self.state.active_roll_id
         if roll_id is None or not self.state.current_file_hash:
             return set()
         defaults = rolls.roll_defaults(self.session.repo, roll_id)
-        pushes = self._section_pushes()
         locked = self.locked_roll_cards()
-        available = set()
-        for key in card_keys:
-            if key in rolls.ROLL_DEFAULT_FIELDS:
-                if key in locked and any(f in defaults for f in rolls.card_fields(key)):
-                    available.add(key)
-            elif pushes.get(key) and not self._matches_push(pushes[key]):
-                available.add(key)
-        return available
+        return {
+            key
+            for key in card_keys
+            if key in rolls.ROLL_DEFAULT_FIELDS and key in locked and any(f in defaults for f in rolls.card_fields(key))
+        }
 
     def revert_to_roll(self, card_keys: Collection[str]) -> int:
         """Resets *card_keys* on the active frame to the roll, as one edit and one undo
-        step. A Roll-tab card rejoins the roll and takes its values; a frame card takes
-        back what its whole-roll apply recorded, and a field that apply never carried keeps
-        the frame's own value. Returns how many cards moved."""
+        step: each card rejoins the roll and takes its values. Returns how many cards moved."""
         available = self.roll_revert_cards(card_keys)
         cards = [k for k in dict.fromkeys(card_keys) if k in available]
-        pushes = self._section_pushes()
-        crop_held = self.crop_edits_blocked() and "autocrop" in cards
-        if crop_held:
-            cards = [k for k in cards if k != "autocrop"]
-            if not cards:
-                self.refuse_crop_edit()
-                return 0
         if not cards:
             return 0
         roll_id = self.state.active_roll_id
@@ -7070,37 +7150,28 @@ class AppController(QObject):
         defaults = rolls.roll_defaults(self.session.repo, roll_id)
         config = self.state.config
         for key in cards:
-            if key in rolls.ROLL_DEFAULT_FIELDS:
-                config = self._with_roll_card(config, key, defaults)
-                rolls.set_frame_override(self.session.repo, roll_id, file_hash, key, False)
-            else:
-                config = self._with_frame_card_push(config, pushes[key])
+            config = self._with_roll_card(config, key, defaults)
+            rolls.set_frame_override(self.session.repo, roll_id, file_hash, key, False)
         if all(key in self.METADATA_CARDS for key in cards):
             # Metadata never reaches the pixels.
             self.session.update_config(config, persist=True, render=False)
         else:
             self.apply_config(config, persist=True)
         self.config_updated.emit()
-        labels = {**self._ROLL_CARD_LABELS, **self._FRAME_CARD_LABELS}
-        names = ", ".join(dict.fromkeys(labels[k] for k in cards))
-        self.set_status(
-            tr("Reset to the roll: {value}; Crop waits for Auto Crop", value=names)
-            if crop_held
-            else tr("Reset to the roll: {value}", value=names),
-            3000,
-        )
+        self.set_status(tr("Reset to the roll: {value}", value=self._roll_card_names(cards)), 3000)
         return len(cards)
 
     def can_revert_frame_to_roll(self) -> bool:
-        return bool(self.roll_revert_cards(self._ROLL_CARDS + tuple(FRAME_CARD_FIELDS)))
+        return bool(self.roll_revert_cards(self._ROLL_CARDS))
 
     def revert_frame_to_roll(self) -> int:
         """Reset to Roll Settings: every card on the active frame that differs from the roll."""
-        return self.revert_to_roll(self._ROLL_CARDS + tuple(FRAME_CARD_FIELDS))
+        return self.revert_to_roll(self._ROLL_CARDS)
 
     def _with_roll_card(self, config: WorkspaceConfig, card_key: str, defaults: dict) -> WorkspaceConfig:
         """*config* with *card_key* holding the roll's value for every field the roll has
         set, through the side effects a hand edit of that card carries."""
+        defaults = rolls.frame_roll_defaults(defaults, config.process)
         values = {f: rolls.config_value(defaults[f]) for f in rolls.card_fields(card_key) if f in defaults}
         if card_key == "film":
             return with_film_fields(config, values)
@@ -7109,30 +7180,6 @@ class AppController(QObject):
             file_hash = rolls.unforked_hash(self.state.current_file_hash)
             config = rolls.resolve_roll_baseline(self.session.repo, self.state.active_roll_id, file_hash, config)
         return config
-
-    @staticmethod
-    def _with_frame_card_push(config: WorkspaceConfig, pushed: dict) -> WorkspaceConfig:
-        """*config* carrying a frame card's recorded whole-roll apply. The cached per-frame
-        bounds drop when a field that feeds the meter moves."""
-        sections = section_of_field()
-        by_section: Dict[str, dict] = {}
-        for name, value in pushed.items():
-            if name in sections:
-                by_section.setdefault(sections[name], {})[name] = rolls.config_value(value)
-        new = config
-        geometry = by_section.get("geometry", {})
-        if "crop_from_auto" in geometry and "crop_rect" not in geometry:
-            new = with_auto_crop_field(new, geometry)
-        for section, values in by_section.items():
-            new = replace(new, **{section: replace(getattr(new, section), **values)})
-        remeter = any(
-            name in BOUNDS_INPUT_FIELDS and getattr(getattr(new, section), name) != getattr(getattr(config, section), name)
-            for section, values in by_section.items()
-            for name in values
-        )
-        if remeter:
-            new = replace(new, process=replace(new.process, **invalidate_local_bounds(new.process)))
-        return new
 
     def set_roll_card_locked(self, card_key: str, locked: bool) -> None:
         """Lock or unlock one Roll-tab card for the active frame, within the active
@@ -7143,10 +7190,13 @@ class AppController(QObject):
         roll_id = self.state.active_roll_id
         if roll_id is None or not self.state.current_file_hash:
             return
+        baseline = {}
         if locked:
             frozen = self._card_values(self.state.config, card_key)
             self.session.update_config(self._with_card_values(self.state.config, card_key, frozen), persist=True, render=False)
-        rolls.set_frame_override(self.session.repo, roll_id, rolls.unforked_hash(self.state.current_file_hash), card_key, locked)
+            baseline = self._roll_baseline(self.state.config, card_key, rolls.roll_defaults(self.session.repo, roll_id))
+        file_hash = rolls.unforked_hash(self.state.current_file_hash)
+        rolls.set_frame_override(self.session.repo, roll_id, file_hash, card_key, locked, baseline=baseline)
         if not locked:
             asset = self.state.uploaded_files[self.state.selected_file_idx]
             self.apply_config(self.session.config_for_asset(asset), persist=False)
@@ -7162,19 +7212,21 @@ class AppController(QObject):
         self.session.update_config(replace(self.state.config, process=new_process), record_history=False)
         self.request_render()
 
-    def set_active_flatfield_profile(self, profile_id: str) -> None:
+    def set_active_flatfield_profile(self, profile_id: str, remember: bool = False) -> None:
         """
         Sets the Flat Field card's profile on the current frame like any other roll card (an
-        empty ``profile_id`` clears it), and makes it the profile a frame that names none takes.
+        empty ``profile_id`` clears it), and makes it the profile a camera frame that names none
+        takes. A film scanner frame leaves that one as it is, unless *remember* is set.
         """
         from negpy.services.assets.flatfield import FlatFieldProfiles
 
-        self.session.repo.save_global_setting("flatfield_active_profile", profile_id or "")
+        if remember or not self.session.film_scanner_file(self.state.current_file_path or ""):
+            self.session.repo.save_global_setting("flatfield_active_profile", profile_id or "")
         prof = FlatFieldProfiles.get(profile_id) if profile_id else None
         pid = prof.id if prof else ""
         self.set_roll_default("flatfield", profile_id=pid, apply=bool(pid))
 
-    def save_flatfield_profile(self, name: str, path: str) -> None:
+    def save_flatfield_profile(self, name: str, path: str, remember: bool = False) -> None:
         """
         Bakes a reference image into a named flat-field profile and makes it active.
         """
@@ -7187,7 +7239,7 @@ class AppController(QObject):
             self.set_status(tr("Flat Field: could not read that reference image"), 3000, kind="error")
             return
         profile_id, check = baked
-        self.set_active_flatfield_profile(profile_id)
+        self.set_active_flatfield_profile(profile_id, remember=remember)
         if check.clipped:
             self.set_status(
                 tr("Flat Field profile '{name}' saved, but the reference is clipped: shoot it darker to correct the falloff", name=name),
@@ -7221,7 +7273,7 @@ class AppController(QObject):
         invalidate_gain(profile_id)
         active = self.session.repo.get_global_setting("flatfield_active_profile") or ""
         if active == profile_id:
-            self.set_active_flatfield_profile("")
+            self.set_active_flatfield_profile("", remember=True)
         elif self.state.config.flatfield.profile_id == profile_id:
             self.set_roll_default("flatfield", profile_id=active if active and FlatFieldProfiles.get(active) else "")
 
@@ -8112,20 +8164,17 @@ class AppController(QObject):
     def _set_roll_sensor_profile(self, roll_id: str, name: str, matrix: tuple) -> None:
         """Make a single-capture preset's sensor profile the roll's own. The unmix needs
         Linear RAW, so that goes with it."""
-        wanted = {"linear_raw": True, "sensor_profile": name, "sensor_matrix": matrix}
-        defaults = rolls.roll_defaults(self.session.repo, roll_id)
-        if not all(key in defaults and rolls.same_value(value, defaults[key]) for key, value in wanted.items()):
-            rolls.set_roll_defaults(self.session.repo, roll_id, **wanted)
+        self._set_roll_cards(roll_id, self.state.config, linear_raw=True, sensor_profile=name, sensor_matrix=matrix)
 
     def _on_capture_flat(self, path: str) -> None:
         """A strip's bare-light reference: save it as the roll's Flat Field profile, which its frames take."""
         req = getattr(self, "_last_capture_req", None)
         roll = req.roll_name if req is not None else os.path.splitext(os.path.basename(path))[0]
-        self.save_flatfield_profile(f"{roll} (Lento Dock)", path)
+        self.save_flatfield_profile(f"{roll} (Lento Dock)", path, remember=True)
 
     def _on_capture_finished(self, paths: list) -> None:
         """Feed the captured frame(s) into NegPy. An RGB triplet → RGB-Scan, C-41; a single-capture
-        RGB frame → a single RAW, C-41; a white-light slide → E-6/positive; a normal camera scan →
+        or Blend RGB frame → a single RAW, C-41; a white-light slide → E-6/positive; a normal camera scan →
         a single RAW, process left to NegPy."""
         self.capture_finished.emit(paths)
         if not paths:
@@ -8135,8 +8184,11 @@ class AppController(QObject):
         main = [p for p in paths if not os.path.splitext(os.path.basename(p))[0].lower().endswith("_ir")] or list(paths)
         white = bool(req is not None and req.white_mode)
         rgb = bool(req is not None and getattr(req, "rgb_mode", True))
-        single = bool(req is not None and getattr(req, "single_capture", False))
+        # A Blend frame is one RAW lit by all three LEDs, so it enters as a single capture does.
+        single = bool(req is not None and (getattr(req, "single_capture", False) or getattr(req, "blend_capture", False)))
         channels = tuple(getattr(req, "channels", ("R", "G", "B")) or ()) if req is not None else ("R", "G", "B")
+        if rgb and not white and single:
+            record_capture_mode(self.session.repo, main[0], BLEND if getattr(req, "blend_capture", False) else SINGLE)
         if rgb and not white and not single and channels != ("R", "G", "B"):
             # A subset of the frame's exposures. Once the frame's three visible files exist it
             # re-enters discovery as one triplet, with its saved record dropped first: a re-shot
@@ -8430,6 +8482,9 @@ class AppController(QObject):
             self.state.flat_peek = False
             self.flat_peek_changed.emit(False)
         if config_override is None and self.state.average_peek:
+            if self._average_peek_hash != self.state.current_file_hash:
+                self._carry_average_peek()
+                return
             self.state.average_peek = False
             self.average_peek_changed.emit(False)
         if config_override is None and (self.state.negative_peek or self.state.embedded_peek) and not self._peek_shows(self.state.config):
@@ -10279,6 +10334,34 @@ class AppController(QObject):
         self._dispatch_pending_render()
         AppController._continue_background_work(self)
 
+    def _measured_fade_white(self, metrics: Dict[str, Any]) -> Dict[str, Any]:
+        """The fade white fields a render measured for a stale one (`resolve_fade_white`), to store
+        with its bounds. A reading of this frame's decode, so it locks no card."""
+        from negpy.features.process.fade import fade_white_stale, render_white_space
+
+        measured = metrics.get("fade_white")
+        process = self.state.config.process
+        cam_xyz, camera_wb = self._effective_cam_xyz()
+        if measured is None or measured[3] != render_white_space(process, process.process_mode, cam_xyz, camera_wb):
+            return {}
+        if not fade_white_stale(process, measured[3]):
+            return {}
+        return dict(zip(("fade_white_r", "fade_white_g", "fade_white_b", "fade_white_space"), measured))
+
+    def _measured_fade_crossover(self, metrics: Dict[str, Any], process: ProcessConfig) -> Dict[str, Any]:
+        """The crossover table a render measured for a missing one (`resolve_crossover`), when it was
+        measured in this config's space. It fills a frame the roll gave no table, so it locks no card."""
+        from negpy.features.process.fade import crossover_space, fade_density, render_white_space
+
+        measured = metrics.get("fade_crossover")
+        if measured is None or process.fade_crossover == 0.0 or measured[1] == process.fade_crossover_space:
+            return {}
+        cam_xyz, camera_wb = self._effective_cam_xyz()
+        white_space = render_white_space(process, process.process_mode, cam_xyz, camera_wb)
+        if measured[1] != crossover_space(fade_density(process, process.process_mode, white_space), white_space, process):
+            return {}
+        return {"fade_crossover_table": measured[0], "fade_crossover_space": measured[1]}
+
     def _freeze_resolved_auto_crop(self, metrics: Dict[str, Any]) -> None:
         """Store the crop this render detected, so nothing detects it a second time.
 
@@ -10398,35 +10481,34 @@ class AppController(QObject):
         # stacks edits. Skip only when both axes ride the roll baseline.
         proc = self.state.config.process
         bounds = metrics.get("log_bounds_base") or metrics.get("log_bounds")
+        changes = self._measured_fade_white(metrics)
+        changes.update(self._measured_fade_crossover(metrics, replace(proc, **changes)))
         if bounds and not (proc.use_luma_average and proc.use_color_average):
-            changes = {}
             if not proc.lock_bounds and (bounds.floors != proc.local_floors or bounds.ceils != proc.local_ceils):
                 changes["local_floors"] = bounds.floors
                 changes["local_ceils"] = bounds.ceils
 
-            if changes:
-                before = self.state.config
-                new_process = replace(self.state.config.process, **changes)
-                self.session.update_config(
-                    replace(self.state.config, process=new_process),
-                    persist=self._may_persist_measured_bounds(),
-                    render=False,
-                    record_history=False,
+        if changes:
+            before = self.state.config
+            new_process = replace(self.state.config.process, **changes)
+            self.session.update_config(
+                replace(self.state.config, process=new_process),
+                persist=self._may_persist_measured_bounds(),
+                render=False,
+                record_history=False,
+            )
+            self._carry_render_identity(before)
+            # render=False: the displayed pixels already reflect these measured bounds and white.
+            # Move the frame's memo entry to the updated config's key so the first
+            # navigate-back after an initial render still hits. A GPU render is not filed
+            # until navigate-away, so its identity follows too.
+            self._render_memo.rekey(src or self.state.current_file_hash or "", self._render_memo_key(), old_key=metrics.get("memo_key", ""))
+            if self._last_render_identity is not None:
+                self._last_render_identity = (
+                    self._last_render_identity[0],
+                    self._render_memo_key(),
+                    self._last_render_identity[2],
                 )
-                self._carry_render_identity(before)
-                # render=False: the displayed pixels already reflect these measured bounds.
-                # Move the frame's memo entry to the updated config's key so the first
-                # navigate-back after an initial render still hits. A GPU render is not filed
-                # until navigate-away, so its identity follows too.
-                self._render_memo.rekey(
-                    src or self.state.current_file_hash or "", self._render_memo_key(), old_key=metrics.get("memo_key", "")
-                )
-                if self._last_render_identity is not None:
-                    self._last_render_identity = (
-                        self._last_render_identity[0],
-                        self._render_memo_key(),
-                        self._last_render_identity[2],
-                    )
 
     def _may_persist_measured_bounds(self) -> bool:
         """Whether an auto-measured bounds write may reach the database.
