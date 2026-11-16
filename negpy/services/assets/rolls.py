@@ -116,7 +116,7 @@ def next_roll_name(name: str, taken: Callable[[str], bool]) -> str:
 def recognize_folder(repo: Any, path: str, name: str = "") -> str:
     """Mark *path* as a recognized folder roll. Idempotent: returns the existing id
     when the folder is already recognized, without touching its stored name."""
-    _undismiss(repo, path)
+    undismiss_folder(repo, path)
     existing = folder_roll_id_for_path(repo, path)
     if existing:
         return existing
@@ -133,7 +133,8 @@ def recognize_folder(repo: Any, path: str, name: str = "") -> str:
     return roll_id
 
 
-def _undismiss(repo: Any, path: str) -> None:
+def undismiss_folder(repo: Any, path: str) -> None:
+    """Forget that *path* was a deleted folder roll, so a refresh recognizes it again."""
     dismissed = _dismissed_folders(repo)
     kept = [p for p in dismissed if _folder_key(p) != _folder_key(path)]
     if kept != dismissed:
@@ -173,7 +174,7 @@ def convert_to_folder_roll(repo: Any, roll_id: str, folder: str, excluded: Seque
     entry = store.get(roll_id)
     if entry is None or entry.get("kind") != "virtual":
         return ""
-    _undismiss(repo, folder)
+    undismiss_folder(repo, folder)
     name = folder_roll_name(repo, folder)
     entry.pop("member_paths", None)
     entry.update(kind="folder", name=name, folder_path=folder, extra_paths=[], excluded_paths=list(excluded))
@@ -618,53 +619,13 @@ def rename_folder_roll_disk(repo: Any, roll_id: str, new_name: str) -> Optional[
     return new_path
 
 
-def relocate_folder_roll(repo: Any, roll_id: str, new_path: str) -> Optional[str]:
-    """Point a folder roll at *new_path* after its folder was moved on disk.
-
-    Nothing on disk is touched: the caller moves or copies the files first, then
-    hands over the new location. Returns the old path, or None (and nothing is
-    touched) when the roll is not a folder roll, *new_path* is not a directory,
-    or another roll already points there. The same folder is a no-op success.
-    Edits need no migration: they are keyed by content hash, which a move keeps.
-    """
-    store = _read(repo)
-    entry = store.get(roll_id)
-    if entry is None or entry.get("kind") != "folder":
-        return None
-    new_path = os.path.normpath(new_path)
-    if not new_path or not os.path.isdir(new_path):
-        return None
-    old_path = entry.get("folder_path", "")
-    if _folder_key(new_path) == _folder_key(old_path):
-        return old_path
-    if folder_roll_id_for_path(repo, new_path) is not None:
-        return None
-    dismissed = _dismissed_folders(repo)
-    kept = [p for p in dismissed if _folder_key(p) != _folder_key(new_path)]
-    if kept != dismissed:
-        repo.save_global_setting(DISMISSED_FOLDERS_KEY, kept)
-    entry["folder_path"] = new_path
-    old_prefix, new_prefix = old_path.rstrip("/\\"), new_path
-    if old_prefix:
-        entry["extra_paths"] = [_rehome_path(p, old_prefix, new_prefix) for p in entry.get("extra_paths", [])]
-    _write(repo, store)
-    return old_path
-
-
-def _rehome_path(path: str, old_prefix: str, new_prefix: str) -> str:
-    """*path* rewritten from *old_prefix* to *new_prefix*, else unchanged."""
-    if path == old_prefix or path.startswith(old_prefix + os.sep):
-        return new_prefix + path[len(old_prefix) :]
-    return path
-
-
 def rehome_paths(repo: Any, move: Callable[[str], str]) -> None:
     """Pass every folder and member path of every roll through *move*."""
     store = _read(repo)
     for entry in store.values():
         if entry.get("folder_path"):
             entry["folder_path"] = move(entry["folder_path"])
-        for key in ("member_paths", "excluded_paths"):
+        for key in ("member_paths", "excluded_paths", "extra_paths"):
             if key in entry:
                 entry[key] = [move(p) for p in entry[key]]
     _write(repo, store)
@@ -944,6 +905,53 @@ def set_frame_override(
         baselines[file_hash] = frame
     else:
         baselines.pop(file_hash, None)
+    entry["frame_baselines"] = baselines
+    _write(repo, store)
+
+
+def _card_keys(card_keys: Any) -> tuple:
+    if card_keys is None:
+        return tuple(ROLL_DEFAULT_FIELDS)
+    return (card_keys,) if isinstance(card_keys, str) else tuple(card_keys)
+
+
+def card_locks_snapshot(repo: Any, roll_id: str, card_keys: Any, hashes) -> Dict[str, Any]:
+    """For each of *hashes* (unforked) and each of *card_keys* (one key, several, or None for every card),
+    the baseline its lock holds, or None where the card follows the roll."""
+    keys = _card_keys(card_keys)
+    entry = roll_for_id(repo, roll_id) or {}
+    overrides, baselines = entry.get("frame_overrides", {}), entry.get("frame_baselines", {})
+    return {h: {c: dict(baselines.get(h, {}).get(c, {})) if c in overrides.get(h, ()) else None for c in keys} for h in hashes}
+
+
+def restore_card_locks(repo: Any, roll_id: str, card_keys: Any, snapshot: Dict[str, Any]) -> None:
+    """Puts back the locks and baselines a card_locks_snapshot holds for *card_keys*. No-op for an unknown roll id."""
+    keys = set(_card_keys(card_keys))
+    store = _read(repo)
+    entry = store.get(roll_id)
+    if entry is None:
+        return
+    overrides = dict(entry.get("frame_overrides", {}))
+    baselines = dict(entry.get("frame_baselines", {}))
+    for file_hash, saved in snapshot.items():
+        cards = set(overrides.get(file_hash, ()))
+        frame = dict(baselines.get(file_hash, {}))
+        for card_key, baseline in saved.items():
+            if card_key not in keys:
+                continue
+            frame.pop(card_key, None)
+            if baseline is None:
+                cards.discard(card_key)
+            else:
+                cards.add(card_key)
+                if baseline:
+                    frame[card_key] = dict(baseline)
+        for table, value in ((overrides, sorted(cards)), (baselines, frame)):
+            if value:
+                table[file_hash] = value
+            else:
+                table.pop(file_hash, None)
+    entry["frame_overrides"] = overrides
     entry["frame_baselines"] = baselines
     _write(repo, store)
 

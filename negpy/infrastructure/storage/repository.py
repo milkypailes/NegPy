@@ -323,34 +323,6 @@ class StorageRepository(IRepository):
             conn.execute("UPDATE OR REPLACE work_prints SET file_hash = ? WHERE file_hash = ?", (new_hash, old_hash))
             conn.execute("UPDATE OR REPLACE file_marks SET file_hash = ? WHERE file_hash = ?", (new_hash, old_hash))
 
-    def rehome_file_paths(self, old_prefix: str, new_prefix: str) -> None:
-        """Repoint stored file paths after a roll folder moved.
-
-        Edits stay keyed by content hash, which a move keeps; only the file_path
-        fallback columns (path-based recovery, library search) name the old
-        location and would otherwise miss. No-op when the prefixes match.
-        """
-        old_prefix = old_prefix.rstrip("/\\")
-        if not old_prefix or old_prefix == new_prefix:
-            return
-        prefix = old_prefix + os.sep
-
-        def swapped(path: Any) -> Any:
-            if isinstance(path, str) and (path == old_prefix or path.startswith(prefix)):
-                return new_prefix + path[len(old_prefix) :]
-            return path
-
-        with self._connect(self.edits_db_path) as conn:
-            for table in ("file_settings", "file_marks", "image_embeddings"):
-                try:
-                    rows = conn.execute(f"SELECT file_hash, file_path FROM {table}").fetchall()
-                except sqlite3.OperationalError:
-                    continue  # table absent — nothing to repoint
-                for file_hash, path in rows:
-                    new_path = swapped(path)
-                    if new_path != path:
-                        conn.execute(f"UPDATE {table} SET file_path = ? WHERE file_hash = ?", (new_path, file_hash))
-
     def copy_file_edits(
         self,
         old_hash: str,
@@ -472,6 +444,22 @@ class StorageRepository(IRepository):
                 config = self._history_parse[js] = WorkspaceConfig.from_flat_dict(json.loads(js))
             out.append((int(idx), config))
         return out
+
+    def edited_file_names_under(self, folder: str) -> set[str]:
+        """Base names of the edited files saved directly under *folder*. Paths compare in the
+        platform's case rule (`os.path.normcase`)."""
+        under = folder.rstrip("/\\") + os.sep
+        with self._connect(self.edits_db_path) as conn:
+            rows = conn.execute(
+                "SELECT file_path FROM file_settings WHERE lower(substr(file_path, 1, ?)) = lower(?)", (len(under), under)
+            ).fetchall()
+        key = os.path.normcase(under)
+        names = set()
+        for (file_path,) in rows:
+            path = str(file_path)
+            if os.path.normcase(path[: len(under)]) == key and os.sep not in path[len(under) :]:
+                names.add(os.path.basename(path))
+        return names
 
     def rehome_path_prefix(self, old_prefix: str, new_prefix: str) -> None:
         """Repoint every path-keyed row under the folder *old_prefix* to *new_prefix*."""

@@ -1,5 +1,5 @@
 import math
-from typing import Callable, Optional
+from typing import Optional
 
 import negpy_core
 import numpy as np
@@ -9,14 +9,9 @@ from negpy.features.lab.models import LabConfig, SharpenMethod
 from negpy.kernel.image.logic import (
     WORKING_INV_GAMMA,
     WORKING_LAB,
-    gamut_aware_chroma_scale,
-    lab_to_rgb_working,
-    rgb_to_lab_working,
-    skin_chroma_rein,
     working_oetf_decode,
     working_oetf_encode,
 )
-from negpy.kernel.image.validation import ensure_image
 
 
 def apply_clahe(img: ImageBuffer, strength: float) -> ImageBuffer:
@@ -73,27 +68,6 @@ def rl_iterations(radius: float) -> int:
     return int(np.clip(int(round(10.0 * radius)), 5, 20))
 
 
-def _map_row_blocks(img: ImageBuffer, fn: Callable[[ImageBuffer], ImageBuffer], halo: int = 0) -> ImageBuffer:
-    rows = max(1, 1048576 // img.shape[1])
-    if img.shape[0] <= rows:
-        return fn(img)
-    output = np.empty(img.shape, dtype=np.float32)
-    for start in range(0, img.shape[0], rows):
-        end = min(start + rows, img.shape[0])
-        low, high = max(0, start - halo), min(img.shape[0], end + halo)
-        block = fn(img[low:high])
-        output[start:end] = block[start - low : end - low]
-    return output
-
-
-def apply_usm_sharpening(img: ImageBuffer, amount: float, radius: float = 1.0, masking: float = 0.0) -> ImageBuffer:
-    if amount <= 0:
-        return img
-    # Gaussian support, local range, and Sobel-plus-box support must cross block edges.
-    halo = max(len(gaussian_kernel_1d(radius)) // 2, 2)
-    return _map_row_blocks(img, lambda block: _usm_sharpening_block(block, amount, radius, masking), halo)
-
-
 # Auto Masking: the masking that holds back the grain is this gain times the measured grain
 # gradient. sharpen_grain_pick.wgsl mirrors both.
 AUTO_MASKING_GAIN = 0.27
@@ -137,12 +111,7 @@ def apply_resize_sharpening(encoded: np.ndarray, config: LabConfig) -> np.ndarra
     return np.concatenate([sharpened, encoded[..., 3:]], axis=2)
 
 
-def _usm_sharpening_block(
-    img: ImageBuffer,
-    amount: float,
-    radius: float = 1.0,
-    masking: float = 0.0,
-) -> ImageBuffer:
+def apply_usm_sharpening(img: ImageBuffer, amount: float, radius: float = 1.0, masking: float = 0.0) -> ImageBuffer:
     """L-channel soft-gated USM, its overshoot clamped to the local 3x3 range, with an optional edge mask for flat
     areas. Radius is in pixels of this buffer, before any export resize; judge sharpening at 1:1.
     lab_sharpen_h/v.wgsl and lab.wgsl mirror this."""
@@ -171,40 +140,15 @@ def apply_rl_sharpening(
 
 
 def apply_saturation(img: ImageBuffer, saturation: float, skin_protection: float = 0.0) -> ImageBuffer:
+    """Scales chroma in Oklab, which holds hue where CIELAB turns blue toward purple, and keeps the
+    pixel's CIELAB L*, which the tone tools and the sharpen state read. Above 1.0 a pixel whose full
+    push leaves the gamut takes a soft knee toward its own headroom, because an RGB clamp shifts hue.
+    Skin Protection then reins skin chroma in CIELAB, at 1.0 too."""
     if saturation == 1.0 and skin_protection <= 0.0:
         return img
-    return _map_row_blocks(img, lambda block: _saturation_block(block, saturation, skin_protection))
-
-
-def _saturation_block(img: ImageBuffer, saturation: float, skin_protection: float = 0.0) -> ImageBuffer:
-    """
-    Adjusts saturation by scaling chroma (a*, b*) in CIELAB.
-    Preserves perceived lightness, unlike HSV S-scaling which darkens
-    already-saturated colors when S clips to 1.0.
-
-    Gamut-aware above 1.0 (see gamut_aware_chroma_scale): a flat a*/b* scale
-    preserves hue mathematically, but pixels that overshoot the display gamut
-    get hard-clamped per channel afterward, which shifts the *actual* hue
-    since clamping only the overshooting channel(s) changes the R:G:B ratio.
-    A soft per-pixel knee toward each pixel's real in-gamut headroom avoids
-    that instead of clamping after the fact.
-
-    Skin protection (see skin_chroma_rein) then reins skin-hued chroma in
-    against a ceiling. It shares this one Lab round trip but is independent of
-    the scale: it runs at saturation 1.0 too, since skin can arrive
-    over-chromatic from the print curve without Chroma pushing it there.
-    """
-    if saturation == 1.0 and skin_protection <= 0.0:
-        return img
-
-    lab = rgb_to_lab_working(np.ascontiguousarray(img, dtype=np.float32))
-    if saturation != 1.0:
-        lab = gamut_aware_chroma_scale(lab, saturation)
-    if skin_protection > 0.0:
-        lab = skin_chroma_rein(lab, skin_protection)
-    res_rgb = np.ascontiguousarray(lab_to_rgb_working(lab), dtype=np.float32)
-    negpy_core.clip_unit(res_rgb)
-    return ensure_image(res_rgb)
+    return negpy_core.saturation(
+        np.ascontiguousarray(img, dtype=np.float32), np.float32(saturation), np.float32(skin_protection), *WORKING_LAB
+    )
 
 
 # Below this blur sigma (px) both engines skip the stage.

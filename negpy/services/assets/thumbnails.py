@@ -8,7 +8,7 @@ import numpy as np
 from negpy.kernel.image.logic import apply_exif_orientation, ensure_rgb, prepare_thumbnail, srgb_to_linear, uint8_to_float32
 from negpy.infrastructure.capture.raw_demosaic import _user_sat
 from negpy.infrastructure.loaders.factory import loader_factory
-from negpy.infrastructure.loaders.helpers import NonStandardFileWrapper, embedded_preview
+from negpy.infrastructure.loaders.helpers import NonStandardFileWrapper, decodes_camera_wb, embedded_preview
 from negpy.infrastructure.display.color_spaces import WORKING_COLOR_SPACE
 from negpy.kernel.system.logging import get_logger
 from negpy.services.assets.thumbnail_fingerprint import QUICK
@@ -42,14 +42,15 @@ def thumbnail_cache_key(file_hash: str, is_triplet: bool) -> str:
     return f"{base}-v3"
 
 
-def _fast_demosaic(raw: Any) -> np.ndarray:
+def _fast_demosaic(raw: Any, file_path: str = "") -> np.ndarray:
     """Fast half-size linear demosaic used for preview thumbnails."""
     # NonStandardFileWrapper has no camera calibration to read; its postprocess ignores user_sat anyway.
     user_sat = None if isinstance(raw, NonStandardFileWrapper) else _user_sat(raw)
+    camera_wb = decodes_camera_wb(raw, True, file_path)
     return ensure_rgb(
         raw.postprocess(
-            use_camera_wb=True,
-            user_wb=None,
+            use_camera_wb=camera_wb,
+            user_wb=None if camera_wb else [1, 1, 1, 1],
             adjust_maximum_thr=0.0,
             user_sat=user_sat,  # calibrated linearity limit, not the format's generic max
             half_size=True,
@@ -72,7 +73,7 @@ def _decode_triplet_preview(red_path: str, green_path: str, blue_path: str) -> O
     def _decode(path: str) -> Tuple[np.ndarray, Dict[str, Any]]:
         ctx_mgr, metadata = loader_factory.get_loader(path)
         with ctx_mgr as raw:
-            return _fast_demosaic(raw), metadata
+            return _fast_demosaic(raw, path), metadata
 
     r, red_meta = _decode(red_path)
     g, _ = _decode(green_path)
@@ -103,7 +104,7 @@ def decode_source_image(
         img: Optional[Image.Image] = embedded_preview(raw, file_path)
 
         if img is None:
-            img = Image.fromarray(_fast_demosaic(raw))
+            img = Image.fromarray(_fast_demosaic(raw, file_path))
 
         orientation = metadata.get("orientation", 1)
         if orientation and orientation != 1:

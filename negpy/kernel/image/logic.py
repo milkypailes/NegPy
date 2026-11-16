@@ -35,8 +35,8 @@ def uint8_to_float32(img: np.ndarray) -> np.ndarray:
 
 
 def rgb_to_rgba_into(src: np.ndarray, dst: np.ndarray) -> None:
-    """Copies the three color planes of float32 ``src`` into the RGBA ``dst``; alpha is left
-    as is. numpy cannot vectorize a 3-of-4 strided copy."""
+    """Writes the three color planes of float32 ``src`` and an alpha of 1 into the RGBA ``dst``.
+    ``src`` is contiguous or a row and column slice of a contiguous frame."""
     negpy_core.rgb_to_rgba_into(np.asarray(src, dtype=np.float32), dst)
 
 
@@ -47,8 +47,10 @@ def rgba_to_rgb_into(src: np.ndarray, dst: np.ndarray, oy: int, ox: int) -> None
 
 def uint16_to_float32(img: np.ndarray) -> np.ndarray:
     """
-    uint16 to float32 [0.0, 1.0].
+    uint16 to float32 [0.0, 1.0]. A float32 array passes through as it is.
     """
+    if img.dtype == np.float32:
+        return np.ascontiguousarray(img)
     return negpy_core.uint16_to_float32(np.ascontiguousarray(img, dtype=np.uint16))
 
 
@@ -156,56 +158,15 @@ def _skin_chroma_rein_kernel(lab: np.ndarray, strength: float) -> np.ndarray:
 
 def skin_chroma_rein(lab: np.ndarray, strength: float) -> np.ndarray:
     """
-    Pull skin-hued pixels down toward a chroma ceiling, leaving hue and L*
-    untouched (a* and b* scale together). Independent of the Chroma scale, so
-    it also reins in skin that arrived over-chromatic from the print curve.
-
-    One-directional: chroma is only ever reduced, never added. That is what
-    keeps saturation=0.0 reaching true grey without a special case, and what
-    makes it safe to run after the gamut knee -- a smaller chroma cannot
-    overshoot a gamut the full-strength push already fitted inside.
-
-    `strength` drives the ceiling itself rather than a blend amount, so the
-    control has one meaning: how tightly skin chroma is reined. The knee is the
-    same softplus shape as gamut_aware_chroma_scale's and the print curve's
-    toe/shoulder bounds. Accepts any array whose last axis is (L, a, b).
+    Pulls skin-hued pixels down toward a chroma ceiling; hue and L* stay (a* and b* scale together).
+    Chroma is only reduced, so saturation 0.0 still reaches gray and the result fits the gamut the
+    Saturation knee fitted. `strength` sets the ceiling, not a blend amount. The knee is the softplus
+    of the Saturation knee. Accepts any array whose last axis is (L, a, b).
     """
     arr = np.ascontiguousarray(lab, dtype=np.float32)
     if strength <= 0.0:
         return arr
     out = _skin_chroma_rein_kernel(arr.reshape(-1, 3), np.float32(strength))
-    return out.reshape(arr.shape)
-
-
-def _gamut_aware_chroma_scale_kernel(
-    lab: np.ndarray, saturation: float, m: np.ndarray, white: np.ndarray, eps: float, kappa: float, iters: int
-) -> np.ndarray:
-    """
-    Per-pixel gamut-aware chroma scale: pixels comfortably inside the display
-    gamut get the full flat `saturation` scale, unchanged from a plain a*/b*
-    multiply. Pixels whose full-strength push would clip get a smooth
-    softplus-style knee toward their own actual in-gamut headroom instead of
-    an abrupt per-channel RGB clamp -- same knee shape as the print curve's
-    toe/shoulder bounds. Bisection converges to <0.1% error in 10 iterations
-    (measured against a 24-iteration reference); going lower starts costing
-    real precision, going higher buys nothing visible.
-
-    An independent per-channel hard clamp shifts hue even though the a*/b*
-    scale itself preserves hue exactly (uniform scaling of both components
-    leaves atan2(b,a) unchanged) -- clamping only the channel(s) that overshot
-    changes the R:G:B ratio the eye actually sees. This sidesteps that by
-    never overshooting in the first place.
-    """
-    return negpy_core.gamut_aware_chroma_scale(np.ascontiguousarray(lab, dtype=np.float32), saturation, m, white, eps, kappa, iters)
-
-
-def gamut_aware_chroma_scale(lab: np.ndarray, saturation: float, iters: int = 10) -> np.ndarray:
-    """Public entry point for _gamut_aware_chroma_scale_kernel -- see its docstring.
-    Accepts any array whose last axis is (L, a, b); returns the same shape."""
-    arr = np.ascontiguousarray(lab, dtype=np.float32)
-    out = _gamut_aware_chroma_scale_kernel(
-        arr.reshape(-1, 3), np.float32(saturation), _XYZ_TO_WORKING, _WORKING_WHITE, np.float32(_LAB_EPS), np.float32(_LAB_KAPPA), iters
-    )
     return out.reshape(arr.shape)
 
 
@@ -271,6 +232,19 @@ def apply_exif_orientation(arr: np.ndarray, orientation: Optional[int]) -> np.nd
     h, w = src.shape[:2]
     out = negpy_core.orient(src.view(np.uint8).reshape(h, w, -1), int(orientation))
     return out.view(src.dtype).reshape(out.shape[:2] + src.shape[2:])
+
+
+# EXIF code of rot90(k) -> fliplr -> flipud, indexed by k * 4 + flip_h * 2 + flip_v.
+_GEOMETRY_EXIF = (1, 4, 2, 3, 8, 5, 7, 6, 3, 2, 4, 1, 6, 7, 5, 8)
+
+
+def apply_geometry_orientation(arr: np.ndarray, rotation: int, flip_h: bool, flip_v: bool) -> np.ndarray:
+    """`np.rot90(arr, rotation)`, then `fliplr` and `flipud` when asked, as one contiguous copy."""
+    k = rotation % 4
+    if not (k or flip_h or flip_v):
+        return arr
+    code = _GEOMETRY_EXIF[k * 4 + bool(flip_h) * 2 + bool(flip_v)]
+    return apply_exif_orientation(arr, code) if code != 1 else arr.copy()
 
 
 def get_luminance(img: np.ndarray) -> np.ndarray:

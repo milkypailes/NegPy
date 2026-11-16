@@ -69,7 +69,7 @@ Each card on the **Roll** and **Metadata** tabs has **Frame** (amber) and **Roll
 *   **Reset to Roll** puts the roll's values back on the card.
 *   A card on a **Frame** tab holds this frame's own values. Its copy button, **Apply to Frames**, copies them once to the selection or the whole roll.
 
-Right-click a card header for **Copy Card Settings** and **Undo Change to Several Frames**. After an Apply, Paste, Reset or Roll push to several frames, the message strip above the picture also offers **Undo**, which puts every frame back at once. It works until your next edit. Frames that are not one roll show only **Frame** until you save them as a roll.
+Right-click a card header for **Copy Card Settings** and **Undo Change to Several Frames**. After an Apply, Paste, Reset or Roll push to several frames, the message strip above the picture also offers **Undo**, which puts every frame back at once. It works until your next edit. A setting that changed again after the push keeps its new value. Frames that are not one roll show only **Frame** until you save them as a roll.
 
 ### What carries to the next frame
 
@@ -105,6 +105,39 @@ A new frame gets the roll's film type, and the crop, print stock and Lab setting
 
 If Windows blocks the default data folder, NegPy suggests `%LOCALAPPDATA%\NegPy\data`. Click the path to pick another, then **Use This Folder**. Nothing is copied. `NEGPY_USER_DIR` overrides the choice.
 
+### Command line and automation
+
+Scripts and other tools can start NegPy from the command line, for example to open a scan for editing or to make previews.
+
+`NegPy <file> [<file>…]` opens the files and shows the first one. A folder opens all of its images. If NegPy is already open, the files open in that window and the window comes to the front. On Linux, **Open With NegPy** in a file manager also opens the files.
+
+The command can also set how NegPy exports these files, so the next step of the workflow finds the result. The settings apply until you close NegPy, and only to these files:
+
+| Flag | Value |
+|------|-------|
+| `--preset <name>` | A saved export preset. The other flags change its values. |
+| `--intent` | `print`, `flat` or `linear` |
+| `--format` | `jpeg`, `tiff`, `png`, `jxl` or `webp` |
+| `--bit-depth` | `8` or `16` |
+| `--quality` | 1 to 100, for JPEG and WebP |
+| `--color-space` or `--profile` | A color space such as `srgb` or `adobe-rgb`, or the path of an ICC file |
+| `--original-size`, `--long-edge <px>` or `--print-size <cm>` with `--dpi` | The size |
+| `--ratio` | The paper ratio, such as `3:2` |
+| `--output-dir <folder>` and `--filename <pattern>` | Where the file goes and its name |
+| `--no-overwrite` | Ask before an export replaces a file. Without it, an export replaces the earlier one. |
+| `--quit-after-export` | After a good export, NegPy closes. If NegPy was already open, its window goes to the taskbar. |
+
+For such a frame, the Export tab hides the settings that the command set and lists them at the top. Presets are off for the frame. If a flag has a bad value, NegPy does not start and writes the error to `negpy.log`.
+
+#### Make previews without a window
+
+`NegPy --render <file or folder>… --format jpeg --long-edge 1600 --output-dir <folder>` writes a positive of each scan and exits. A folder gives all of its scans, without its subfolders. Use the export flags above, except `--intent linear` and `--quit-after-export`.
+
+*   A scan you edited in NegPy uses its edit. Another scan uses the standard settings.
+*   `--auto-crop` crops to the picture a scan that has no crop. Use it for scans that show the holder or the light source.
+*   The exit code is 0 when all files are written, 1 when a file fails and 2 for a bad flag.
+*   This command does not change your NegPy library or edits. It works while NegPy is open.
+
 ---
 
 ## 2. Library and film strip
@@ -114,16 +147,16 @@ If Windows blocks the default data folder, NegPy suggests `%LOCALAPPDATA%\NegPy\
 
 The **Library** tab (`Ctrl+L`) lists your **rolls**. A roll is a named group of frames, usually one film: a **folder roll** or a **virtual roll**. Importing records the folder; NegPy never moves, renames or deletes your files.
 
-*   **+**: **Import Folder as a Roll…** makes one roll of a folder and opens it. **Import Subfolders as Rolls…** makes a roll of each subfolder that holds images.
-*   **Double-click** a roll (or press Enter) to open it in the Film Strip.
-*   **⋮** or right-click a roll: **Open**, **Unload All…** (the open roll), **Roll Analysis**, **Rename…**, **Relocate…** (folder rolls), **Restore Removed Frames…** (folder rolls), **Save to Folder Roll** (virtual rolls) and **Delete…**. Relocate… points a folder roll at its folder's new location after you move the folder on disk; edits, marks and roll settings stay. Restore Removed Frames brings back the frames that Remove from Roll took out of a folder roll. Delete forgets the roll only; the files and edits stay.
+*   **+**: **Import Folder as a Roll…** makes one roll of a folder and opens it. **Import Subfolders as Rolls…** makes a roll of each subfolder that holds images. Dropping folders on the Library imports them too.
+*   **Double-click** a roll (or press Enter) to open it.
+*   **⋮** or right-click a roll: **Open**, **Unload All…** (the open roll), **Roll Analysis**, **Rename…**, **Locate Folder…** (folder gone), **Relocate…** (folder rolls), **Save to Folder Roll** (virtual rolls), **Restore Removed Frames…** (folder rolls) and **Delete…**. Locate Folder and Relocate point a folder roll at its folder's new location; edits, marks and roll settings stay. Restore Removed Frames brings back the frames that Remove from Roll took out. Delete keeps the files and their shared edits, and loses the roll's settings, baseline, film base, scenes, card locks and its own edits; Refresh does not add it again.
 *   **Filter rolls…** and **Sort** help you find a roll. **⋮ → Refresh** finds new subfolders and recounts the frames. **⋮ → Discovery Filters…** lists folder names to skip (`export` at first).
 
-A roll whose folder is gone shows **folder missing**. A folder name that matches your gear ("penf" for "Pen F") opens Roll Settings filled in.
+A roll whose folder was renamed or moved outside NegPy shows **folder missing**. **Locate Folder…** points it at the new folder. A folder name that matches your gear ("penf" for "Pen F") opens Roll Settings filled in.
 
 A folder roll holds only the files in its folder. A file you add from another folder stays for this session only.
 
-To save the frames in the Film Strip as a roll, use the Film Strip. **Save to Folder Roll** makes frames that all come from one folder that folder's roll; its other files show as removed. **Save as Virtual Roll…** keeps exactly these frames, from any folders. Save to Folder Roll also turns a virtual roll of one folder into that folder's roll. The new roll starts with the open roll's settings, card locks and the edits made only in that roll. A frame has one edit in every roll that holds it; right-click → **Edit Independently in This Roll** gives it its own edit in one roll.
+To save the frames in the Film Strip as a roll, use the Film Strip. **Save to Folder Roll** makes frames that all come from one folder that folder's roll; its other files show as removed. **Save as Virtual Roll…** keeps exactly these frames, from any folders. A frame has one edit in every roll that holds it; right-click → **Edit Independently in This Roll** gives it its own edit in one roll.
 
 <!-- panel:frames -->
 ### Film Strip
@@ -185,14 +218,14 @@ This readout describes the current frame while you edit.
 
 #### Chart
 
-Pick a chart view:
-
 *   **Curve**: the paper's curve, from the negative (across) to the print (up). Steeper means more contrast. The gray histogram is the negative, the colored one the print.
 *   **Waveform**: print brightness across the frame.
 *   **Parade**: red, green and blue side by side; a gray subject sits at one height in all three. **Parade Overlay** puts the three on one plot.
 *   **Vectorscope**: the print's colors around a center point. A cluster off center is a color cast.
 
 **Log** shows small areas, like clipping.
+
+**Analysis Overlay**: the chart on the picture while the card is closed.
 
 #### Clipping
 
@@ -210,7 +243,7 @@ The **Readouts** fold holds numbers about the scan. An amber value is a warning;
 
 **Film Base** (the crosshair): click the clear film between frames to set the base the readouts measure from.
 
-*   **Negative**: the negative's density range (Δ). Hover for flat, normal or contrasty.
+*   **Negative**: the negative's density range (Δ).
 *   **Exposure**: bright (positive) or dark (negative) frame, in stops.
 *   **Clipping**: share of the print that is pure black, then pure white.
 *   **Scan clip**: share of each channel at the scanner's maximum. No edit fixes it; expose the scan lower.
@@ -473,7 +506,7 @@ These cards hold what the frames of a roll share: the film, how it was scanned a
 What the film is and how you scanned it. These choices decide which cards and controls show.
 
 *   **Color / B&W / Slide**: color negative (C-41), a black-and-white print, or slide (E-6 and similar). B&W prints any negative in black and white. On a color negative, the Filtration card then gives a contrast Filter.
-*   **Positive** (Slide only): for a file that is already a positive, such as a scanned print or another app's export. NegPy then skips inversion and metering. A Slide that is not a camera RAW, such as a TIFF, JPEG, JXL or a Pakon, Noritsu, Coolscan or Flextight scan, starts Positive. Turn it off to give a faded scan the slide tone curve.
+*   **Positive** (Slide only): for a file that is already a positive, such as a scanned print or another app's export. NegPy then skips inversion and metering. A Slide that is not a camera RAW, such as a TIFF, JPEG, JXL, scanner DNG or Pakon, Noritsu, Coolscan or Flextight scan, starts Positive. Turn it off to give a faded scan the slide tone curve.
 *   **B&W** (Slide only): renders the slide in black and white, for B&W reversal film such as Scala. A color slide then gets the Filter.
 *   **Encoding** (Positive TIFF): how the samples encode light. **Auto** reads the file's ICC profile, else takes linear above 8 bits and sRGB at 8 bits. **Linear** is a scanner's linear output, such as Nikon Scan with color management off. **2.2** is a 2.2 gamma in Adobe RGB primaries. Pick Linear or 2.2 to match the scanner software.
 *   **Camera / Film Scanner**: what you scanned with. NegPy reads it from each file (a camera RAW is a camera) until you pick one. Your pick holds for every frame and sets the Scan tab's scanner.
@@ -490,7 +523,7 @@ How a camera RAW file is turned into pixels. Shown for a camera.
 
 *   **Camera WB / Linear RAW**: Camera WB uses the camera's white balance. Linear RAW decodes neutral, for narrowband light. Setup sets it for you.
 *   **Preview** / **Export**: the demosaic method, which fills in the colors each sensor pixel cannot see. **Auto** is fast on screen and uses **AHD** for export. **VNG** is smooth and **PPG** fast. **DCB** and **DHT** keep more fine detail but can turn grain into patterns. **AAHD** softens edges. Only the methods in your LibRaw build are listed.
-*   **Recovery** (slides): rebuilds blown highlights in a camera RAW. **Blend** suits sun and sky. **Reconstruct** is stronger but can get the color wrong. A new film scanner frame starts with Recovery off.
+*   **Recovery** (slides): rebuilds blown highlights in a camera RAW. **Blend** suits sun and sky. **Reconstruct** is stronger but can get the color wrong. A new film scanner frame starts with Recovery off. A warning shows under Recovery when the frame has clipped highlights, which can turn pink.
 
 <!-- panel:optics -->
 ### 10.3 Optics
@@ -785,6 +818,7 @@ NegPy keeps macOS and Windows awake while it scans. On Linux, turn off automatic
 *   **Infrared**: **IR** scans an infrared channel, for dust removal on the Retouch card. **ICE** (Coolscan) removes the dust in the scanner instead. A scanner without ICE shows one **IR** toggle. Not for B&W or Kodachrome.
 *   **Superfine** (Coolscan): scans one line per pass. Slower.
 *   **Autofocus**, **Auto-exposure** and **Exposure**: focus and exposure on the scanner, before the scan.
+*   **Analog Gain** (Coolscan): more or less scanner exposure than the metered one, in stops. The chevron opens **Red**, **Green** and **Blue**, one per channel.
 
 <!-- panel:scan_framing -->
 ### Framing
@@ -856,7 +890,7 @@ Shows the whole strip, to place and pick the frames before the scan. **Apply Fra
 
 ### Interface
 
-*   **Language**: English, Simplified Chinese, Japanese, Korean, German, Vietnamese or Norwegian Bokmål, after a restart.
+*   **Language**: English, Simplified Chinese, Japanese, Korean, German, Vietnamese, Norwegian Bokmål or Italian, after a restart.
 *   **UI scale**: 80% to 120%, after a restart.
 *   **Canvas background**: from black to white. Mid gray is best for judging a print.
 *   **Sticky Zoom**: keeps the zoom when you change frames. **Reverse Scroll Zoom**: scroll up zooms out.

@@ -2,21 +2,21 @@
 
 NegPy ist eine virtuelle Dunkelkammer, die Filmscans zu fertigen Bildern macht. Deine Originaldateien bleiben unverändert. NegPy speichert deine Bearbeitungen in einer lokalen Datenbank. Wähle die Sprache unter Einstellungen → Oberfläche → Sprache und starte NegPy neu. Die Option „Systemstandard“ folgt der Systemsprache und nutzt Englisch, wenn NegPy diese Sprache nicht kennt. Fehlt eine Übersetzung für einen Bereich, zeigt NegPy den englischen Text.
 
-<!-- panel:library src:89d70d2c -->
+<!-- panel:library src:3492e003 -->
 ### Bibliothek
 
 Der Tab **Bibliothek** (`Ctrl+L`) listet deine **Rollen**. Eine Rolle ist eine benannte Gruppe von Bildern, meist ein Film: eine **Ordnerrolle** oder eine **virtuelle Rolle**. Beim Import merkt sich NegPy den Ordner. NegPy verschiebt, benennt oder löscht deine Dateien nie.
 
-*   **+**: **Ordner als Rolle importieren…** macht aus einem Ordner eine Rolle und öffnet sie. **Unterordner als Rollen importieren…** macht aus jedem Unterordner mit Bildern eine Rolle.
-*   **Doppelklicke** auf eine Rolle (oder drücke Enter), um sie im Filmstreifen zu öffnen.
-*   **⋮** oder Rechtsklick auf eine Rolle: **Öffnen**, **Alle entladen…** (die geöffnete Rolle), **Rollenanalyse**, **Umbenennen…**, **In Ordnerrolle speichern**, **Entfernte Bilder wiederherstellen…** und **Löschen…**. Entfernte Bilder wiederherstellen holt die Bilder zurück, die Aus Rolle entfernen aus einer Ordnerrolle genommen hat. Die Zeile unter dem Namen der Rolle zählt sie. Löschen behält die Dateien und ihre gemeinsamen Bearbeitungen. Es verliert die Einstellungen, die Basislinie, die Filmbasis, die Szenen, die Kartensperren und die nur in dieser Rolle gemachten Bearbeitungen der Rolle. Aktualisieren fügt eine gelöschte Ordnerrolle nicht wieder hinzu.
+*   **+**: **Ordner als Rolle importieren…** macht aus einem Ordner eine Rolle und öffnet sie. **Unterordner als Rollen importieren…** macht aus jedem Unterordner mit Bildern eine Rolle. Auf die Bibliothek gezogene Ordner werden ebenfalls importiert.
+*   **Doppelklicke** auf eine Rolle (oder drücke Enter), um sie zu öffnen.
+*   **⋮** oder Rechtsklick auf eine Rolle: **Öffnen**, **Alle entladen…** (die geöffnete Rolle), **Rollenanalyse**, **Umbenennen…**, **Ordner suchen…** (eine Rolle ohne Ordner), **Neu verorten…** (Ordnerrollen), **In Ordnerrolle speichern** (virtuelle Rollen), **Entfernte Bilder wiederherstellen…** (Ordnerrollen) und **Löschen…**. Ordner suchen… und Neu verorten… richten eine Ordnerrolle nach dem Umbenennen oder Verschieben ihres Ordners auf den neuen Speicherort; Bearbeitungen, Markierungen und Rolleneinstellungen bleiben erhalten. Entfernte Bilder wiederherstellen holt die Bilder zurück, die Aus Rolle entfernen aus einer Ordnerrolle genommen hat. Löschen behält die Dateien und ihre gemeinsamen Bearbeitungen. Es verliert die Einstellungen, die Basislinie, die Filmbasis, die Szenen, die Kartensperren und die nur in dieser Rolle gemachten Bearbeitungen der Rolle. Aktualisieren fügt eine gelöschte Ordnerrolle nicht wieder hinzu.
 *   **Rollen filtern…** und **Sortieren** helfen dir beim Finden einer Rolle. **⋮ → Aktualisieren** findet neue Unterordner und zählt die Bilder neu. **⋮ → Suchfilter…** listet Ordnernamen, die übersprungen werden (zuerst `export`).
 
-Eine Rolle, deren Ordner fehlt, zeigt **Ordner fehlt**. Passt ein Ordnername zu deiner Ausrüstung ("penf" für "Pen F"), öffnen sich die Rolleneinstellungen schon ausgefüllt.
+Eine Rolle, deren Ordner fehlt, zeigt **Ordner fehlt**. **Ordner suchen…** verknüpft sie mit dem neuen Ordner. Passt ein Ordnername zu deiner Ausrüstung ("penf" für "Pen F"), öffnen sich die Rolleneinstellungen schon ausgefüllt.
 
 Eine Ordnerrolle enthält nur die Dateien ihres Ordners. Eine Datei, die du aus einem anderen Ordner hinzufügst, bleibt nur für diese Sitzung.
 
-Um die Bilder im Filmstreifen als Rolle zu speichern, nutze den Filmstreifen. **In Ordnerrolle speichern** macht aus Bildern, die alle aus einem Ordner stammen, die Rolle dieses Ordners. Seine anderen Dateien erscheinen als entfernt. **Als virtuelle Rolle speichern…** behält genau diese Bilder, aus beliebigen Ordnern. In Ordnerrolle speichern macht auch aus einer virtuellen Rolle eines Ordners die Rolle dieses Ordners. Die neue Rolle startet mit den Einstellungen, den Kartensperren und den nur in dieser Rolle gemachten Bearbeitungen der geöffneten Rolle. Ein Bild hat in jeder Rolle, die es enthält, dieselbe Bearbeitung. Rechtsklick → **In dieser Rolle unabhängig bearbeiten** gibt ihm in einer Rolle eine eigene Bearbeitung.
+Um die Bilder im Filmstreifen als Rolle zu speichern, nutze den Filmstreifen. **In Ordnerrolle speichern** macht aus Bildern, die alle aus einem Ordner stammen, die Rolle dieses Ordners. Seine anderen Dateien erscheinen als entfernt. **Als virtuelle Rolle speichern…** behält genau diese Bilder, aus beliebigen Ordnern. Ein Bild hat in jeder Rolle, die es enthält, dieselbe Bearbeitung. Rechtsklick → **In dieser Rolle unabhängig bearbeiten** gibt ihm in einer Rolle eine eigene Bearbeitung.
 
 <!-- panel:frames src:c1f54a29 -->
 ### Filmstreifen
@@ -51,14 +51,12 @@ Ein einfaches Wort passt auf den Dateinamen. Begriffe der Form `field:value` pas
 
 Begriffe lassen sich kombinieren: `film:portra iso:>=400 -rejected:`. Metadaten-Begriffe passen nur auf Bilder, deren Metadaten du ausgefüllt hast. **Suche nach Bedeutung** (aktiviere sie unter Einstellungen → Leistung) findet Bilder über eine Beschreibung, zum Beispiel "ein Hund am Strand".
 
-<!-- panel:analysis src:cf165609 -->
+<!-- panel:analysis src:7afa1351 -->
 ## 3. Analyse-Anzeige
 
 Diese Anzeige beschreibt das aktuelle Bild, während du bearbeitest.
 
 #### Diagramm
-
-Wähle eine Diagrammansicht:
 
 *   **Kurve**: die Kurve des Papiers, vom Negativ (quer) zum Abzug (nach oben). Steiler bedeutet mehr Kontrast. Das graue Histogramm zeigt das Negativ, das farbige den Abzug.
 *   **Waveform**: Helligkeit des Abzugs über die Bildbreite.
@@ -66,6 +64,8 @@ Wähle eine Diagrammansicht:
 *   **Vektorskop**: die Farben des Abzugs rund um einen Mittelpunkt. Eine Gruppe neben der Mitte ist ein Farbstich.
 
 **Log** zeigt kleine Bereiche, wie Beschneidung.
+
+**Analyse-Überlagerung**: das Diagramm auf dem Bild, solange die Karte geschlossen ist.
 
 #### Beschneidung
 
@@ -83,7 +83,7 @@ Die Falte **Messwerte** enthält Zahlen zum Scan. Ein bernsteinfarbener Wert ist
 
 **Filmbasis** (das Fadenkreuz): Klicke auf den klaren Film zwischen den Bildern, um die Basis festzulegen, von der die Messwerte messen.
 
-*   **Negativ**: der Dichteumfang des Negativs (Δ). Der Mauszeiger zeigt flach, normal oder kontrastreich.
+*   **Negativ**: der Dichteumfang des Negativs (Δ).
 *   **Belichtung**: helles (positiv) oder dunkles (negativ) Bild, in Blenden.
 *   **Beschneidung**: Anteil des Abzugs in reinem Schwarz, dann in reinem Weiß.
 *   **Scan-Beschneidung**: Anteil jedes Kanals am Maximum des Scanners. Keine Bearbeitung behebt das. Belichte den Scan niedriger.
@@ -298,13 +298,13 @@ Ein **Arbeitsabzug** ist eine Version dieses Bildes, die du unter einem Namen be
 
 Jede Änderung, die du gemacht hast, die neueste oben (die letzten 100). **Jetzt** markiert den aktuellen Stand. Nach einem Rückgängig erscheinen spätere Schritte als **Rückgängig gemacht**, bis zu deiner nächsten Bearbeitung. Klicke auf einen Schritt, um dorthin zurückzugehen. **⋮** oder Rechtsklick → **Diese Version exportieren…** exportiert einen früheren Stand. **Mit diesem Schritt vergleichen** öffnet **Vorher / Nachher** mit diesem Schritt links, auf deinem aktuellen Zuschnitt. Drücke `\`, um den Vergleich zu schließen.
 
-<!-- panel:film src:5487c3ab -->
+<!-- panel:film src:0094e9db -->
 ### 10.1 Einrichtung
 
 Was der Film ist und wie du ihn gescannt hast. Diese Angaben bestimmen, welche Karten und Regler erscheinen.
 
 *   **Farbe / S/W / Dia**: Farbnegativ (C-41), ein Schwarzweißabzug oder Dia (E-6 und ähnlich). S/W druckt jedes Negativ in Schwarzweiß. Bei einem Farbnegativ bietet die Karte Filterung dann einen Kontrast-Filter.
-*   **Positiv** (nur Dia): für eine Datei, die schon ein Positiv ist, etwa ein gescannter Abzug oder der Export einer anderen App. NegPy überspringt dann Inversion und Messung. Ein Dia, das keine Kamera-RAW ist, etwa ein TIFF, JPEG, JXL oder ein Pakon-, Noritsu-, Coolscan- oder Flextight-Scan, startet als Positiv. Schalte es aus, um einem verblassten Scan die Dia-Tonkurve zu geben.
+*   **Positiv** (nur Dia): für eine Datei, die schon ein Positiv ist, etwa ein gescannter Abzug oder der Export einer anderen App. NegPy überspringt dann Inversion und Messung. Ein Dia, das keine Kamera-RAW ist, etwa ein TIFF, JPEG, JXL, ein Scanner-DNG oder ein Pakon-, Noritsu-, Coolscan- oder Flextight-Scan, startet als Positiv. Schalte es aus, um einem verblassten Scan die Dia-Tonkurve zu geben.
 *   **S/W** (nur Dia): zeigt das Dia in Schwarzweiß, für S/W-Umkehrfilm wie Scala. Ein Farbdia bekommt dann den Filter.
 *   **Kodierung** (Positiv, TIFF): wie die Werte das Licht kodieren. **Auto** liest das ICC-Profil der Datei, sonst gilt linear über 8 Bit und sRGB bei 8 Bit. **Linear** ist die lineare Ausgabe eines Scanners, etwa Nikon Scan mit ausgeschaltetem Farbmanagement. **2.2** ist ein Gamma von 2,2 in Adobe-RGB-Primärfarben. Wähle Linear oder 2.2 passend zur Scansoftware.
 *   **Kamera / Filmscanner**: womit du gescannt hast. NegPy liest das aus jeder Datei (eine Kamera-RAW-Datei ist eine Kamera), bis du eine Wahl triffst. Deine Wahl gilt für jedes Bild und legt den Scanner im Scan-Reiter fest.
@@ -314,14 +314,14 @@ Die Scan-Angaben sind eine Einstellung für die ganze App. Die Liste darunter ze
 
 Eine Kamera zeigt die Karten Raw-Dekodierung und Optik. Eine Kamera mit Schmalbandlicht zeigt auch Trichrom und Kalibrierung. Eine Änderung aktualisiert jedes geöffnete Bild (Ctrl+Z macht sie pro Bild rückgängig), aber ein Papier, das du selbst gewählt hast, bleibt. Ein Kamera-Scan legt Dekodierung und Papier für jedes Bild aus seinem eigenen Licht fest.
 
-<!-- panel:demosaic src:577713a8 -->
+<!-- panel:demosaic src:5627a0ef -->
 ### 10.2 Raw-Dekodierung
 
 Wie eine Kamera-RAW-Datei in Pixel umgewandelt wird. Wird bei einer Kamera angezeigt.
 
 *   **Kamera-WB / Lineares RAW**: Kamera-WB nutzt den Weißabgleich der Kamera. Lineares RAW dekodiert neutral, für schmalbandiges Licht. Die Einrichtung stellt es für dich ein.
 *   **Vorschau** / **Export**: die Demosaicing-Methode, die die Farben ergänzt, die ein Sensorpixel nicht sieht. **Auto** ist am Bildschirm schnell und nutzt für den Export **AHD**. **VNG** ist glatt und **PPG** schnell. **DCB** und **DHT** erhalten mehr feine Details, können aber Korn in Muster verwandeln. **AAHD** macht Kanten weicher. Es werden nur die Methoden deines LibRaw-Builds aufgeführt.
-*   **Wiederherstellung** (Dias): rekonstruiert ausgebrannte Lichter in einer Kamera-RAW-Datei. **Mischen** passt zu Sonne und Himmel. **Rekonstruieren** ist stärker, kann aber die Farbe falsch treffen. Ein neues Bild vom Filmscanner beginnt mit ausgeschalteter Wiederherstellung.
+*   **Wiederherstellung** (Dias): rekonstruiert ausgebrannte Lichter in einer Kamera-RAW-Datei. **Mischen** passt zu Sonne und Himmel. **Rekonstruieren** ist stärker, kann aber die Farbe falsch treffen. Ein neues Bild vom Filmscanner beginnt mit ausgeschalteter Wiederherstellung. Unter Wiederherstellung erscheint eine Warnung, wenn das Bild ausgefressene Lichter hat, die rosa werden können.
 
 <!-- panel:optics src:33b2d330 -->
 ### 10.3 Optik
@@ -559,7 +559,7 @@ NegPy hält macOS und Windows während des Scans wach. Schalte unter Linux vor e
 
 **Plustek**: Der OpticFilm 8200i SE, 8100 V2, 8300i SE, 7600i v1 und 7600i v2 funktionieren. Probiere bei anderen Modellen SANE. Richte unter Windows zuerst den USB-Treiber ein ([PLUSTEK_WINDOWS.md](PLUSTEK_WINDOWS.md)). **Coolscan**: braucht kein SANE. Unter Linux braucht USB eine udev-Regel für den Hersteller `04b0`.
 
-<!-- panel:scan_quality src:0e35bd9a -->
+<!-- panel:scan_quality src:1f841943 -->
 ### Film & Qualität
 
 *   **Film**: Farbnegativ, S/W-Negativ, Dia oder Kodachrome. Er bestimmt die Bilderkennung, die Messung und ob Infrarot angeboten wird.
@@ -570,6 +570,7 @@ NegPy hält macOS und Windows während des Scans wach. Schalte unter Linux vor e
 *   **Infrarot**: **IR** scannt einen Infrarotkanal für die Staubentfernung auf der Karte Retusche. **ICE** (Coolscan) entfernt den Staub stattdessen im Scanner. Ein Scanner ohne ICE zeigt nur einen **IR**-Schalter. Nicht für S/W oder Kodachrome.
 *   **Superfine** (Coolscan): scannt eine Zeile pro Durchgang. Langsamer.
 *   **Autofokus**, **Auto-Belichtung** und **Belichtung**: Fokus und Belichtung am Scanner, vor dem Scan.
+*   **Analoge Verstärkung** (Coolscan): mehr oder weniger Scanner-Belichtung als die gemessene, in Blenden. Der Pfeil öffnet **Rot**, **Grün** und **Blau**, einen Regler pro Kanal.
 
 <!-- panel:scan_framing src:945dad86 -->
 ### Bildausschnitt

@@ -3,8 +3,7 @@
 Each record holds the three content hashes: a file changed on disk since the grouping does not re-attach.
 """
 
-import os
-from typing import Any, Dict
+from typing import Any, Callable, Dict
 
 from negpy.services.assets.half_frame import base_hash
 
@@ -65,18 +64,12 @@ def remember_triplets(repo: Any, assets: Any) -> None:
         repo.save_global_setting(TRIPLETS_KEY, updated)
 
 
-def rehome_triplets(repo: Any, old_prefix: str, new_prefix: str) -> None:
-    """Repoint triplet keys and member paths after a roll folder moved."""
-    old_prefix = old_prefix.rstrip("/\\")
-    if not old_prefix or old_prefix == new_prefix:
-        return
-
-    def swapped(path: str) -> str:
-        if path == old_prefix or path.startswith(old_prefix + os.sep):
-            return new_prefix + path[len(old_prefix) :]
-        return path
-
+def rehome_paths(repo: Any, move: Callable[[str], str]) -> None:
+    """Pass every triplet primary and member path through *move*."""
     store = saved_triplets(repo)
-    rebuilt = {swapped(red): [swapped(record[0]), swapped(record[1]), *record[2:]] for red, record in store.items()}
+    rebuilt = {
+        move(red): [move(record[0]) if record[0] else record[0], move(record[1]) if record[1] else record[1], *record[2:]]
+        for red, record in store.items()
+    }
     if rebuilt != store:
         repo.save_global_setting(TRIPLETS_KEY, rebuilt)

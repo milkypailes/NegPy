@@ -1,11 +1,11 @@
 from unittest.mock import MagicMock
 
 import pytest
-from PyQt6.QtCore import QPoint
-from PyQt6.QtGui import QIcon
-from PyQt6.QtWidgets import QFileDialog, QInputDialog, QMessageBox
+from PyQt6.QtCore import QMimeData, QPoint, QPointF, Qt, QThreadPool, QUrl
+from PyQt6.QtGui import QDragEnterEvent, QDragMoveEvent, QDropEvent, QIcon
+from PyQt6.QtWidgets import QApplication, QFileDialog, QHBoxLayout, QInputDialog, QMainWindow, QMessageBox, QWidget
 
-from negpy.desktop.view.sidebar.library_tree import _DETAIL_ROLE, _FOLDER_ROLE, _MISSING_ROLE, LibraryTree
+from negpy.desktop.view.sidebar.library_tree import _DETAIL_ROLE, _FOLDER_ROLE, _MISSING_ROLE, _PATH_ROLE, LibraryTree
 from negpy.desktop.view.styles.theme import THEME
 from negpy.infrastructure.storage.repository import StorageRepository
 from negpy.services.assets.rolls import create_virtual_roll, delete_roll, recognize_folder, roll_for_id, saved_rolls
@@ -816,6 +816,122 @@ def test_a_roll_whose_folder_is_gone_is_marked_missing(widget, tmp_path):
     assert item.data(0, _DETAIL_ROLE) == "folder missing" and item.data(0, _MISSING_ROLE)
 
 
+def _check_folders(widget) -> None:
+    widget.check_folders()
+    QThreadPool.globalInstance().waitForDone()
+    QApplication.processEvents()
+
+
+def test_a_folder_renamed_while_running_is_marked_missing_in_place(widget, tree_dirs):
+    recognize_folder(widget.repo, str(tree_dirs / "roll_a"))
+    widget.reload()
+    item = widget.tree.topLevelItem(0)
+    assert not item.data(0, _MISSING_ROLE)
+
+    (tree_dirs / "roll_a").rename(tree_dirs / "roll_a_renamed")
+    _check_folders(widget)
+
+    assert widget.tree.topLevelItem(0) is item
+    assert item.data(0, _MISSING_ROLE) and item.data(0, _DETAIL_ROLE) == "folder missing"
+    assert "Folder not found" in item.toolTip(0)
+
+    (tree_dirs / "roll_a_renamed").rename(tree_dirs / "roll_a")
+    _check_folders(widget)
+
+    assert not item.data(0, _MISSING_ROLE) and _count(item) == "2 photos"
+    assert "Folder roll" in item.toolTip(0) and not item.toolTip(1)
+
+
+class _StubCheck:
+    """Stands in for _DiskCheck: the test delivers the result by hand."""
+
+    def __init__(self, paths):
+        self.paths = paths
+        self.signals = MagicMock()
+
+
+def _start_stub_check(widget, monkeypatch) -> _StubCheck:
+    stubs = []
+    monkeypatch.setattr("negpy.desktop.view.sidebar.library_tree._DiskCheck", lambda paths: stubs.append(_StubCheck(paths)) or stubs[-1])
+    monkeypatch.setattr("negpy.desktop.view.sidebar.library_tree.QThreadPool.globalInstance", lambda: MagicMock())
+    widget.check_folders()
+    return stubs[-1]
+
+
+def test_a_late_result_for_an_old_path_is_ignored(widget, tree_dirs, monkeypatch):
+    recognize_folder(widget.repo, str(tree_dirs / "roll_a"))
+    widget.reload()
+    stub = _start_stub_check(widget, monkeypatch)
+    roll_id, old_path = next(iter(stub.paths.items()))
+    item = widget.tree.topLevelItem(0)
+    item.setData(0, _PATH_ROLE, str(tree_dirs / "roll_b"))
+
+    widget._apply_folder_check({roll_id: (old_path, True)})
+
+    assert not item.data(0, _MISSING_ROLE)
+
+
+def test_a_result_resets_the_check_flag_and_keeps_the_runnable(widget, tree_dirs, monkeypatch):
+    recognize_folder(widget.repo, str(tree_dirs / "roll_a"))
+    widget.reload()
+    stub = _start_stub_check(widget, monkeypatch)
+    assert widget._checking
+
+    widget._apply_folder_check({})
+
+    assert not widget._checking and widget._disk_check is stub
+
+
+def test_reload_during_a_check_is_harmless(widget, tree_dirs, monkeypatch):
+    recognize_folder(widget.repo, str(tree_dirs / "roll_a"))
+    widget.reload()
+    stub = _start_stub_check(widget, monkeypatch)
+    roll_id, path = next(iter(stub.paths.items()))
+    (tree_dirs / "roll_a").rename(tree_dirs / "moved")
+    widget.reload()
+
+    widget._apply_folder_check({roll_id: (path, True)})
+
+    assert widget.tree.topLevelItem(0).data(0, _MISSING_ROLE)
+
+
+def test_a_result_for_a_deleted_roll_is_ignored(widget, tree_dirs, monkeypatch):
+    recognize_folder(widget.repo, str(tree_dirs / "roll_a"))
+    widget.reload()
+    stub = _start_stub_check(widget, monkeypatch)
+    roll_id, path = next(iter(stub.paths.items()))
+    delete_roll(widget.repo, roll_id)
+    widget.reload()
+
+    widget._apply_folder_check({roll_id: (path, True)})
+
+    assert widget.tree.topLevelItemCount() == 0
+
+
+def test_a_changed_row_follows_the_filter(widget, tree_dirs):
+    recognize_folder(widget.repo, str(tree_dirs / "roll_a"))
+    widget.reload()
+    widget.filter_input.setText("folder missing")
+    item = widget.tree.topLevelItem(0)
+    assert item.isHidden()
+
+    (tree_dirs / "roll_a").rename(tree_dirs / "moved")
+    _check_folders(widget)
+
+    assert not item.isHidden()
+
+
+def test_activating_the_app_checks_folders(widget, tree_dirs, monkeypatch):
+    calls = []
+    monkeypatch.setattr(widget, "check_folders", lambda: calls.append(1))
+    widget.show()
+    assert len(calls) == 1
+    widget._on_app_state_changed(Qt.ApplicationState.ApplicationActive)
+    widget._on_app_state_changed(Qt.ApplicationState.ApplicationInactive)
+
+    assert len(calls) == 2
+
+
 def test_importing_a_folder_without_images_imports_its_subfolders(widget, tree_dirs, monkeypatch):
     monkeypatch.setattr(QFileDialog, "getExistingDirectory", staticmethod(lambda *a, **k: str(tree_dirs)))
     widget.controller.import_subfolders_as_rolls.return_value = ["id1", "id2"]
@@ -1018,13 +1134,13 @@ def test_relocate_roll_repoints_and_reloads(widget, tree_dirs, monkeypatch):
     target = _relocate_target(tree_dirs)
     monkeypatch.setattr(QFileDialog, "getExistingDirectory", staticmethod(lambda *a, **k: target))
     monkeypatch.setattr("negpy.desktop.view.sidebar.library_tree.confirm_relocate_roll", lambda *a, **k: True)
-    widget.controller.request_relocate_roll.return_value = True
+    widget.controller.relink_roll.return_value = ""
     changed = []
     widget.rolls_changed.connect(lambda: changed.append(True))
 
     widget._relocate_roll(roll_id, "roll_a")
 
-    widget.controller.request_relocate_roll.assert_called_once_with(roll_id, target)
+    widget.controller.relink_roll.assert_called_once_with(roll_id, target)
     assert changed == [True]
 
 
@@ -1034,7 +1150,7 @@ def test_cancelling_the_relocate_picker_repoints_nothing(widget, tree_dirs, monk
 
     widget._relocate_roll(roll_id, "roll_a")
 
-    widget.controller.request_relocate_roll.assert_not_called()
+    widget.controller.relink_roll.assert_not_called()
     assert roll_for_id(widget.repo, roll_id)["folder_path"] == str(tree_dirs / "roll_a")
 
 
@@ -1045,7 +1161,7 @@ def test_relocate_roll_to_its_own_folder_only_reports_status(widget, tree_dirs, 
     widget._relocate_roll(roll_id, "roll_a")
 
     widget.controller.set_status.assert_called_once()
-    widget.controller.request_relocate_roll.assert_not_called()
+    widget.controller.relink_roll.assert_not_called()
 
 
 def test_relocate_roll_to_an_empty_folder_warns(widget, tree_dirs, monkeypatch):
@@ -1059,7 +1175,7 @@ def test_relocate_roll_to_an_empty_folder_warns(widget, tree_dirs, monkeypatch):
     widget._relocate_roll(roll_id, "roll_a")
 
     assert len(warned) == 1
-    widget.controller.request_relocate_roll.assert_not_called()
+    widget.controller.relink_roll.assert_not_called()
 
 
 def test_relocate_roll_to_another_rolls_folder_warns(widget, tree_dirs, monkeypatch):
@@ -1072,7 +1188,7 @@ def test_relocate_roll_to_another_rolls_folder_warns(widget, tree_dirs, monkeypa
     widget._relocate_roll(roll_id, "roll_a")
 
     assert len(warned) == 1
-    widget.controller.request_relocate_roll.assert_not_called()
+    widget.controller.relink_roll.assert_not_called()
 
 
 def test_relocate_roll_declined_at_the_confirm_repoints_nothing(widget, tree_dirs, monkeypatch):
@@ -1082,14 +1198,14 @@ def test_relocate_roll_declined_at_the_confirm_repoints_nothing(widget, tree_dir
 
     widget._relocate_roll(roll_id, "roll_a")
 
-    widget.controller.request_relocate_roll.assert_not_called()
+    widget.controller.relink_roll.assert_not_called()
 
 
 def test_relocate_roll_failure_warns_and_does_not_reload(widget, tree_dirs, monkeypatch):
     roll_id = recognize_folder(widget.repo, str(tree_dirs / "roll_a"))
     monkeypatch.setattr(QFileDialog, "getExistingDirectory", staticmethod(lambda *a, **k: _relocate_target(tree_dirs)))
     monkeypatch.setattr("negpy.desktop.view.sidebar.library_tree.confirm_relocate_roll", lambda *a, **k: True)
-    widget.controller.request_relocate_roll.return_value = False
+    widget.controller.relink_roll.return_value = "folder_taken"
     warned = []
     monkeypatch.setattr(QMessageBox, "warning", staticmethod(lambda *a, **k: warned.append(a)))
     reloaded = []
@@ -1174,3 +1290,201 @@ def test_delete_says_what_the_roll_loses_by_kind(widget, tmp_path, monkeypatch):
     assert "Refresh will not add these rolls again." in said[2]
     assert "The folder roll's settings" in said[0] and "The virtual roll's list of frames" in said[1]
     assert "virtual roll loses" not in said[3] and said[4].endswith("A virtual roll loses its list of frames too.")
+
+
+def test_import_folder_declined_at_the_confirm_opens_nothing(widget, tree_dirs, monkeypatch):
+    monkeypatch.setattr("negpy.desktop.view.sidebar.library_tree.confirm_load_roll", lambda *a, **k: False)
+
+    assert widget.import_folder(str(tree_dirs / "roll_a")) is False
+    widget.controller.open_library_folder.assert_not_called()
+
+
+# --- dropping folders on the Library ------------------------------------------
+
+
+def test_one_dropped_folder_imports_like_the_menu(widget, tree_dirs, monkeypatch):
+    calls = []
+    monkeypatch.setattr(widget, "import_folder", lambda path: calls.append(path) or True)
+
+    assert widget.import_dropped([str(tree_dirs / "roll_a")]) is True
+    assert calls == [str(tree_dirs / "roll_a")]
+
+
+def test_several_dropped_roll_folders_become_rolls_and_none_opens(widget, tree_dirs):
+    widget.controller.recognize_library_folders.side_effect = lambda folders: folders
+    changed = []
+    widget.rolls_changed.connect(lambda: changed.append(True))
+    folders = [str(tree_dirs / "roll_b"), str(tree_dirs / "roll_a")]
+
+    assert widget.import_dropped(folders) is True
+    assert [c.args[0] for c in widget.controller.recognize_library_folders.call_args_list] == [[f] for f in sorted(folders)]
+    widget.controller.import_subfolders_as_rolls.assert_not_called()
+    widget.controller.open_library_folder.assert_not_called()
+    assert changed == [True]
+
+
+def test_several_dropped_folders_without_images_report_status(widget, tmp_path):
+    (tmp_path / "empty_a").mkdir()
+    (tmp_path / "empty_b").mkdir()
+    widget.controller.import_subfolders_as_rolls.return_value = []
+
+    assert widget.import_dropped([str(tmp_path / "empty_a"), str(tmp_path / "empty_b")]) is False
+    widget.controller.set_status.assert_called_once()
+
+
+def _real_imports(widget):
+    from negpy.services.assets import rolls
+
+    widget.controller.import_subfolders_as_rolls.side_effect = lambda parent: rolls.import_subfolders_as_rolls(widget.repo, parent)
+    widget.controller.recognize_library_folders.side_effect = lambda folders: [recognize_folder(widget.repo, f) for f in folders]
+
+
+@pytest.mark.parametrize("child_first", [False, True])
+def test_a_parent_dropped_with_its_subfolder_counts_each_roll_once(widget, tree_dirs, child_first):
+    _real_imports(widget)
+    folders = [str(tree_dirs), str(tree_dirs / "roll_a")]
+
+    assert widget.import_dropped(folders[::-1] if child_first else folders) is True
+    assert sorted(entry["name"] for entry in saved_rolls(widget.repo).values()) == ["scans/roll_a", "scans/roll_b"]
+    assert "2 rolls" in widget.controller.set_status.call_args.args[0]
+
+
+def test_roll_folders_dropped_together_keep_their_import_source_names(widget, tree_dirs):
+    from negpy.services.assets import rolls
+
+    _real_imports(widget)
+    rolls.import_subfolders_as_rolls(widget.repo, str(tree_dirs))
+    for roll_id in list(saved_rolls(widget.repo)):
+        rolls.delete_roll(widget.repo, roll_id)
+
+    widget.import_dropped([str(tree_dirs / "roll_a"), str(tree_dirs / "roll_b")])
+
+    assert sorted(entry["name"] for entry in saved_rolls(widget.repo).values()) == ["scans/roll_a", "scans/roll_b"]
+    assert rolls.import_sources(widget.repo) == [str(tree_dirs)]
+
+
+def test_a_dropped_folder_url_loses_its_trailing_slash(tree_dirs):
+    mime = QMimeData()
+    mime.setUrls([QUrl(QUrl.fromLocalFile(str(tree_dirs / "roll_a")).toString() + "/")])
+
+    assert LibraryTree._dropped_folders(mime) == [str(tree_dirs / "roll_a")]
+
+
+class _DropHost(QMainWindow):
+    """Accepts every drag, like MainWindow, and records the drops that reach it."""
+
+    def __init__(self, library):
+        super().__init__()
+        self.setAcceptDrops(True)
+        self.drops = []
+        central = QWidget()
+        row = QHBoxLayout(central)
+        self.filler = QWidget()
+        self.filler.setMinimumSize(150, 300)
+        row.addWidget(self.filler)
+        row.addWidget(library)
+        self.setCentralWidget(central)
+        self.resize(600, 400)
+
+    def dragEnterEvent(self, event):  # noqa: N802
+        event.acceptProposedAction()
+
+    def dragMoveEvent(self, event):  # noqa: N802
+        event.acceptProposedAction()
+
+    def dropEvent(self, event):  # noqa: N802
+        self.drops.append([url.toLocalFile() for url in event.mimeData().urls()])
+        event.acceptProposedAction()
+
+
+def _drop(host, target, urls) -> None:
+    """Drag *urls* onto *target* through the window, so Qt picks the widget as a real drag does."""
+    mime = QMimeData()
+    mime.setUrls(urls)
+    pos = target.mapTo(host, target.rect().center())
+    args = (Qt.DropAction.CopyAction, mime, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
+    handle = host.windowHandle()
+    QApplication.sendEvent(handle, QDragEnterEvent(pos, *args))
+    QApplication.sendEvent(handle, QDragMoveEvent(pos, *args))
+    QApplication.sendEvent(handle, QDropEvent(QPointF(pos), *args))
+    QApplication.processEvents()
+
+
+@pytest.fixture
+def drop_host(widget, monkeypatch):
+    dropped = []
+    monkeypatch.setattr(widget, "import_dropped", lambda folders: dropped.append(folders) or True)
+    host = _DropHost(widget)
+    host.show()
+    QApplication.processEvents()
+    yield host, dropped
+    host.close()
+
+
+def test_a_folder_dropped_on_the_empty_library_is_imported(widget, tree_dirs, drop_host):
+    host, dropped = drop_host
+    assert widget.empty_label.isVisible()
+
+    _drop(host, widget.empty_label, [QUrl.fromLocalFile(str(tree_dirs / "roll_a"))])
+
+    assert dropped == [[str(tree_dirs / "roll_a")]]
+    assert host.drops == []
+
+
+def test_a_folder_dropped_on_the_roll_list_is_imported(widget, tree_dirs, drop_host):
+    host, dropped = drop_host
+    recognize_folder(widget.repo, str(tree_dirs / "roll_b"))
+    widget.reload()
+    QApplication.processEvents()
+    assert widget.tree.isVisible()
+
+    _drop(host, widget.tree.viewport(), [QUrl.fromLocalFile(str(tree_dirs / "roll_a"))])
+
+    assert dropped == [[str(tree_dirs / "roll_a")]]
+    assert host.drops == []
+
+
+@pytest.mark.parametrize("kind", ["file", "folder_and_file", "remote"])
+def test_anything_but_local_folders_goes_on_to_the_window(widget, tree_dirs, drop_host, kind):
+    host, dropped = drop_host
+    scan = QUrl.fromLocalFile(str(tree_dirs / "roll_a" / "a1.NEF"))
+    urls = {
+        "file": [scan],
+        "folder_and_file": [QUrl.fromLocalFile(str(tree_dirs / "roll_b")), scan],
+        "remote": [QUrl("https://example.com/roll_a")],
+    }[kind]
+
+    _drop(host, widget.empty_label, urls)
+
+    assert dropped == []
+    assert len(host.drops) == 1
+
+
+def test_a_drop_outside_the_library_stays_with_the_window(widget, tree_dirs, drop_host):
+    host, dropped = drop_host
+
+    _drop(host, host.filler, [QUrl.fromLocalFile(str(tree_dirs / "roll_a"))])
+
+    assert dropped == []
+    assert host.drops == [[str(tree_dirs / "roll_a")]]
+
+
+def test_a_dropped_parent_folder_makes_each_roll_folder_a_roll(widget, tree_dirs):
+    """End to end: the drop, the deferred import, the subfolder walk and the roll list."""
+    from negpy.services.assets import rolls
+
+    widget.controller.import_subfolders_as_rolls.side_effect = lambda parent: rolls.import_subfolders_as_rolls(widget.repo, parent)
+    host = _DropHost(widget)
+    host.show()
+    QApplication.processEvents()
+    try:
+        _drop(host, widget.empty_label, [QUrl.fromLocalFile(str(tree_dirs))])
+    finally:
+        host.close()
+
+    assert sorted(entry["name"] for entry in saved_rolls(widget.repo).values()) == ["scans/roll_a", "scans/roll_b"]
+    assert sorted(item.text(0) for item in widget._roll_items()) == ["roll_a", "roll_b"]
+    assert widget.empty_label.isHidden()
+    widget.controller.open_library_folder.assert_not_called()
+    widget.controller.set_status.assert_called_once()
+    assert host.drops == []

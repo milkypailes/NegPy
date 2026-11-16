@@ -15,7 +15,7 @@ from PyQt6.QtWidgets import QApplication, QDialog, QMessageBox
 
 from negpy.kernel.system.memory import available_system_memory_bytes
 from negpy.kernel.system.text import count_of, plural
-from negpy.kernel.image.logic import apply_exif_orientation, working_oetf_encode
+from negpy.kernel.image.logic import apply_exif_orientation, apply_geometry_orientation, working_oetf_encode
 from negpy.desktop.auto_sliders import record_meters, shown_values
 from negpy.desktop.converters import ImageConverter
 from negpy.desktop.file_manager import move_to_trash
@@ -44,6 +44,7 @@ from negpy.desktop.workers.export import (
     find_export_conflicts,
     resolve_output_dir,
 )
+from negpy.services.export.launch_recipe import LaunchRecipe, apply_recipe, recipe_intent, recipe_key
 from negpy.desktop.workers.render import (
     _THUMBNAIL_WORKERS,
     AssetDiscoveryTask,
@@ -99,6 +100,7 @@ from negpy.desktop.workers.capture_worker import (
 from negpy.domain.models import (
     PROOF_INTENT_LABELS,
     ColorSpace,
+    ExportConfig,
     ExportFormat,
     ExportPreset,
     ExportPresetOutputMode,
@@ -118,19 +120,17 @@ from negpy.services.assets.composites import (
     forget_composite,
     frame_count,
     part_paths,
-    rehome_composites,
     restore_maps,
     saved_composites,
     source_files,
 )
-from negpy.services.assets.library import folder_label
 from negpy.services.assets.triplets import (
     applied_triplets,
     forget_triplets,
-    rehome_triplets,
     saved_triplets,
 )
 from negpy.services.assets import rolls
+from negpy.services.assets.rehome import folder_roll_missing, relink_folder_roll
 from negpy.services.assets.sensor import SensorProfiles
 from negpy.services.export.contact_sheet_layout import ContactSheetSettings
 from negpy.services.export.contact_sheet_roll import (
@@ -184,7 +184,9 @@ from negpy.features.exposure.papers import DEFAULT_PROFILE_KEY, profiles_for_mod
 from negpy.features.exposure.logic import (
     calculate_wb_shifts,
     calculate_wb_shifts_from_log,
+    channel_density_ranges,
 )
+from negpy.features.transparency.logic import slide_pick_wb, transfer_total_contrast
 from negpy.features.altprocess.models import AltProcess, AltProcessConfig
 from negpy.features.finish.models import FinishConfig
 from negpy.features.geometry.logic import (
@@ -403,6 +405,7 @@ class _DiscoveryRequest:
     hot_folder: bool = False
     skip_paths: frozenset = frozenset()
     user_add: bool = False
+    select_path: Optional[str] = None
 
 
 # Sections a scan peek shows itself or that never reach the pixels; an edit to any other section ends the peek.
@@ -575,6 +578,7 @@ class AppController(QObject):
     """
 
     image_updated = pyqtSignal()
+    roll_folder_missing = pyqtSignal(str)  # a folder roll was opened but its folder is gone
     preview_loaded = pyqtSignal()
     metrics_available = pyqtSignal(dict)
     loading_started = pyqtSignal()
@@ -643,6 +647,8 @@ class AppController(QObject):
     compare_frame_ready = pyqtSignal()
     compare_hold_changed = pyqtSignal(bool)
     flat_output_changed = pyqtSignal(bool)
+    launch_recipe_changed = pyqtSignal()  # the open frame's command-line export recipe came or went
+    launch_export_done = pyqtSignal(bool)  # --quit-after-export finished; True when that launch started NegPy
     linear_output_changed = pyqtSignal(bool)
     bake_on_export_changed = pyqtSignal(bool)
     flat_peek_changed = pyqtSignal(bool)
@@ -756,6 +762,10 @@ class AppController(QObject):
         self._frame_merge_trash = True
         self._discovery_running = False
         self._auto_open_after_discovery = False
+        self._select_after_discovery: Optional[str] = None
+        self._launch_recipes: dict[str, tuple[LaunchRecipe, Optional[ExportPreset]]] = {}
+        self._intent_before_recipe: Optional[tuple[bool, bool]] = None
+        self._launch_quit_pending: Optional[bool] = None
         self._replace_after_discovery = False
         self._reselect_after_discovery: Optional[str] = None
         self._announce_rgb = False
@@ -1824,28 +1834,19 @@ class AppController(QObject):
         hot_folder: bool = False,
         user_add: bool = False,
         rgb_scan: Optional[bool] = None,
+        select_path: Optional[str] = None,
     ) -> None:
         """
-        Starts asynchronous discovery of supported assets.
-        Requests arriving while hashing is in progress are queued in order.
+        Starts asynchronous discovery of supported assets. Requests during hashing queue in order.
 
-        `replace_existing` rebuilds the asset list from the results (instead of
-        appending) and reselects `reselect_path` — used when re-running discovery
-        over already-loaded files (e.g. an RGB-scan mode toggle).
-
-        `announce_rgb` allows the modal report when RGB Scan assembles nothing. Set it
-        where the user just asked for this folder or just turned the mode on; leaving it
-        off is what keeps a restored session from opening a dialog nobody asked for.
-
-        `hot_folder` marks this request as coming from the Hot Folder poll, not from a
-        user action — it drives `hot_folder_sequence_active`, which is what the batch
-        popup checks, rather than whether the toggle happens to be on.
-
-        `user_add` marks Add Files, Add Folder and a drop: the files the open folder roll cannot
-        hold are reported.
-
-        `rgb_scan` False loads the files without Trichrome Mode grouping, for files the user just
-        took out of a triplet; None follows the roll's mode.
+        `replace_existing` rebuilds the asset list from the results and reselects `reselect_path`.
+        `announce_rgb` allows the modal report when RGB Scan assembles nothing: set it only where the
+        user just asked for this folder or turned the mode on, never on a restored session.
+        `hot_folder` marks a Hot Folder poll and drives `hot_folder_sequence_active`.
+        `user_add` marks Add Files, Add Folder and a drop: the files the open folder roll cannot hold
+        are reported.
+        `rgb_scan` False loads the files without Trichrome Mode grouping; None follows the roll's mode.
+        `select_path` opens that file when the request finishes, even when another frame is open.
         """
         self.thumb_worker.cancel_pending()
         self.thumbnail_cancel_requested.emit()
@@ -1865,6 +1866,7 @@ class AppController(QObject):
             hot_folder=hot_folder,
             skip_paths=rolls.excluded_paths(self.session.repo, [p for p in paths if os.path.isdir(p)]),
             user_add=user_add,
+            select_path=select_path,
         )
         if self._discovery_running:
             self._pending_asset_discoveries.append(request)
@@ -1897,6 +1899,7 @@ class AppController(QObject):
         self._replace_after_discovery = request.replace_existing
         self._reselect_after_discovery = request.reselect_path
         self._user_add_after_discovery = request.user_add
+        self._select_after_discovery = request.select_path
         self._active_discovery_keys = frozenset(_capture_import_key(path) for path in request.paths)
         self.set_status(tr("Scanning for assets…"))
         stitches, merges = restore_maps(self.session.repo)
@@ -2007,6 +2010,12 @@ class AppController(QObject):
             self._register_library_roots([parent_path])
         return roll_ids
 
+    def recognize_library_folders(self, folders: List[str]) -> List[str]:
+        """Recognize each folder as a roll without opening it; it is not an import source."""
+        roll_ids = [rolls.recognize_folder(self.session.repo, folder) for folder in folders]
+        self._register_library_roots(folders)
+        return roll_ids
+
     def rediscover_rolls(self) -> tuple[int, int]:
         """Walk every Import Subfolders source again under the current discovery filters;
         returns (new rolls, rolls dropped by a filter)."""
@@ -2049,6 +2058,9 @@ class AppController(QObject):
             self.set_status(tr("That roll no longer exists"), 3000)
             return
         if entry["kind"] == "folder":
+            if folder_roll_missing(self.session.repo, roll_id):
+                self.roll_folder_missing.emit(roll_id)
+                return
             paths = [entry["folder_path"]]
             self._extras_notice = roll_id if self._unnoticed_extras(roll_id, entry) else None
         else:
@@ -2082,6 +2094,7 @@ class AppController(QObject):
         if moved[1]:
             self._reselect_active_frame()
         self._announce_roll_modes(roll_id)
+        self.config_updated.emit()
         self.set_status(tr("Saved as virtual roll “{name}”", name=name), 3000)
         return roll_id
 
@@ -2160,6 +2173,7 @@ class AppController(QObject):
         self.invalidate_library_walk()
         self.session.persist_session()
         self._announce_roll_modes(roll_id)
+        self.config_updated.emit()
         name = (rolls.roll_for_id(self.session.repo, roll_id) or {}).get("name") or folder
         self.set_status(tr("Saved as folder roll “{name}”", name=name), 3000)
         return roll_id
@@ -2222,45 +2236,18 @@ class AppController(QObject):
         rolls.rename_roll(self.session.repo, roll_id, new_name)
         return True
 
-    def request_relocate_roll(self, roll_id: str, new_path: str) -> bool:
-        """Point a folder roll at its folder's new location after the user moved it
-        on disk. Nothing is copied or moved here; only the stored locations change,
-        so edits, marks and roll settings (all keyed by content hash) stay in place.
-        """
-        repo = self.session.repo
-        entry = rolls.roll_for_id(repo, roll_id)
-        if entry is None or entry.get("kind") != "folder":
-            return False
-        old_path = entry.get("folder_path", "")
-        new_path = os.path.normpath(new_path)
-        if not new_path or not os.path.isdir(new_path):
-            return False
-        if rolls.relocate_folder_roll(repo, roll_id, new_path) is None:
-            return False
-        relocated = rolls.roll_for_id(repo, roll_id)
-        if relocated is None:
-            return False
-        new_path = relocated["folder_path"]
-        repo.rehome_file_paths(old_path, new_path)
-        self._rehome_path_setting("library_roots", old_path, new_path)
-        self._rehome_path_setting(rolls.IMPORT_SOURCES_KEY, old_path, new_path)
-        rehome_composites(repo, old_path, new_path)
-        rehome_triplets(repo, old_path, new_path)
-        self.session.rehome_folder_paths(old_path, new_path)
+    def relink_roll(self, roll_id: str, new_path: str) -> str:
+        """Point a folder roll at its renamed or moved folder. Returns "" or the reason it failed.
+        The open roll keeps its frames, as a rename does; any other roll opens."""
+        old_path, reason = relink_folder_roll(self.session.repo, roll_id, new_path)
+        if old_path is None:
+            return reason
         self.invalidate_library_walk()
-        self.set_status(tr("Roll “{name}” now points at “{path}”", name=entry.get("name", ""), path=folder_label(new_path)), 3000)
-        return True
-
-    def _rehome_path_setting(self, key: str, old_prefix: str, new_prefix: str) -> None:
-        """Rewrite stored paths under *old_prefix* to *new_prefix* in one list setting."""
-        old_prefix = old_prefix.rstrip("/\\")
-        if not old_prefix or old_prefix == new_prefix:
-            return
-        saved = self.session.repo.get_global_setting(key, []) or []
-        paths = [p for p in saved if isinstance(p, str)]
-        swapped = [new_prefix + p[len(old_prefix) :] if p == old_prefix or p.startswith(old_prefix + os.sep) else p for p in paths]
-        if swapped != paths:
-            self.session.repo.save_global_setting(key, swapped)
+        if roll_id == self.state.active_roll_id and self.state.uploaded_files:
+            self.session.rehome_folder_paths(old_path, new_path)
+        else:
+            self.open_roll(roll_id)
+        return ""
 
     def invalidate_library_walk(self) -> None:
         """Drop the cached traversal so the next search re-reads the folders."""
@@ -2856,6 +2843,8 @@ class AppController(QObject):
 
         user_add = self._user_add_after_discovery
         self._user_add_after_discovery = False
+        select_path = self._select_after_discovery
+        self._select_after_discovery = None
 
         # Files appended (not replaced) to an open virtual roll join it. A folder roll holds only
         # its folder's files: an appended one of them leaves excluded_paths, any other stays for this session.
@@ -2925,6 +2914,8 @@ class AppController(QObject):
                 self.generate_missing_embeddings()
             if pending_scan and self._select_file_by_path(pending_scan):
                 selected_pending_scan = True
+            elif select_path and self._select_file_by_source(select_path):
+                pass
             elif auto_open and not self.state.current_file_path and len(self.session.state.uploaded_files) > first_new_idx:
                 # Select the first newly-loaded frame in filmstrip order, not discovery
                 # order, or the initial frame lands mid-strip.
@@ -3153,6 +3144,7 @@ class AppController(QObject):
         self._preview_load_t0 = time.perf_counter()
         keep_preview = preserve_zoom and self._requested_file_path == file_path
         self._requested_file_path = file_path
+        self._sync_launch_recipe(file_path)
         # The memo fast path below repaints without request_render, so the state tied to the frame
         # the user leaves goes here: test strip, zone pins, compare split, flat peek, Keystone Lines.
         self._clear_test_strip()
@@ -5313,13 +5305,7 @@ class AppController(QObject):
             return
 
         geom = self.state.config.geometry
-        transformed = img
-        if geom.rotation != 0:
-            transformed = np.rot90(transformed, k=geom.rotation)
-        if geom.flip_horizontal:
-            transformed = np.ascontiguousarray(np.fliplr(transformed))
-        if geom.flip_vertical:
-            transformed = np.ascontiguousarray(np.flipud(transformed))
+        transformed = apply_geometry_orientation(img, geom.rotation, geom.flip_horizontal, geom.flip_vertical)
         if geom.fine_rotation != 0.0:
             transformed = apply_fine_rotation(transformed, geom.fine_rotation)
 
@@ -5758,7 +5744,10 @@ class AppController(QObject):
 
         exp = self.state.config.exposure
         bounds = metrics.get("final_bounds") or metrics.get("log_bounds")  # CPU/GPU key names
-        if is_log:
+        slide_pick = is_log and render_path(self.state.config.process) is not RenderPath.PRINT
+        if slide_pick:
+            new_c, new_m, new_y = slide_pick_wb(sampled[:3], channel_density_ranges(bounds), transfer_total_contrast(exp, metrics))
+        elif is_log:
             new_m, new_y = calculate_wb_shifts_from_log(sampled[:3], bounds)
         else:
             delta_m, delta_y = calculate_wb_shifts(sampled[:3])
@@ -5770,7 +5759,7 @@ class AppController(QObject):
         if region == 0:
             new_exp = replace(
                 exp,
-                wb_cyan=0.0,
+                wb_cyan=float(np.clip(new_c, -1.0, 1.0)) if slide_pick else 0.0,
                 wb_magenta=float(np.clip(new_m, -1.0, 1.0)),
                 wb_yellow=float(np.clip(new_y, -1.0, 1.0)),
             )
@@ -5783,15 +5772,16 @@ class AppController(QObject):
                 ("highlight_cyan", "highlight_magenta", "highlight_yellow"),
             )[region - 1]
             rng_m = rng_y = 1.0
-            if is_log and bounds is not None:
+            if is_log and bounds is not None and not slide_pick:
                 rng_m = max(abs(bounds.ceils[1] - bounds.floors[1]), 1e-6)
                 rng_y = max(abs(bounds.ceils[2] - bounds.floors[2]), 1e-6)
             dm = (new_m - exp.wb_magenta) / rng_m
             dy = (new_y - exp.wb_yellow) / rng_y
+            dc = (new_c - exp.wb_cyan) if slide_pick else 0.0
             new_exp = replace(
                 exp,
                 **{
-                    c_field: 0.0,
+                    c_field: float(np.clip(dc, -1.0, 1.0)),
                     m_field: float(np.clip(dm, -1.0, 1.0)),
                     y_field: float(np.clip(dy, -1.0, 1.0)),
                 },
@@ -6334,6 +6324,7 @@ class AppController(QObject):
             new_p = replace(p, process=replace(p.process, **values))
             self.session.push_external_history(f["hash"], p, new_p)
             self.session.repo.save_file_settings(f["hash"], new_p, file_path=f["path"])
+            self.session.follow_last_batch(f["hash"], new_p, values)
             changed.append(f["hash"])
         if changed:
             self.session.frames_edited_offscreen.emit(changed)
@@ -6850,9 +6841,18 @@ class AppController(QObject):
         if batch is None:
             self.set_status(tr("Nothing to undo: no change to several frames since your last edit."), 2500)
             return
-        moved = self.session.undo_last_batch()
+        moved, kept = self.session.undo_last_batch()
         self.request_render()
-        self.set_status(tr("Undid {label}: {value}", label=batch.label, value=count_of(moved, "frame")), 3000)
+        if kept:
+            message = tr(
+                "Undid {label}: {value}. Frames that keep a later change: {count}",
+                label=batch.label,
+                value=count_of(moved, "frame"),
+                count=kept,
+            )
+            self.set_status(message, 5000)
+        else:
+            self.set_status(tr("Undid {label}: {value}", label=batch.label, value=count_of(moved, "frame")), 3000)
 
     def _roll_card_names(self, cards) -> str:
         return ", ".join(dict.fromkeys(self._ROLL_CARD_LABELS[k] for k in self._ROLL_CARDS if k in cards))
@@ -7846,6 +7846,102 @@ class AppController(QObject):
         self.state.is_dirty = False
         self.session.select_file(self.state.selected_file_idx, selection_override=list(self.state.selected_indices))
 
+    def _select_file_by_source(self, path: str) -> bool:
+        """Select the frame whose source file is ``path``, compared as the file system compares names."""
+        key = os.path.normcase(os.path.abspath(path))
+        for i, f_info in enumerate(self.session.state.uploaded_files):
+            sources = (f_info.get("path"), f_info.get("green_path"), f_info.get("blue_path"))
+            if any(p and os.path.normcase(os.path.abspath(p)) == key for p in sources):
+                if i != self.state.selected_file_idx:
+                    self.session.select_file(i)
+                return True
+        return False
+
+    def open_launch_request(self, paths: List[str], recipe: Optional[LaunchRecipe] = None) -> None:
+        """Open files named on the command line or handed over by a second launch, and open the first.
+        Their exports follow ``recipe`` for this session; a folder's recipe covers every file under it."""
+        found = [p for p in paths if p and os.path.exists(p)]
+        for path in (p for p in paths if p not in found):
+            logger.warning("Command-line path not found: %s", path)
+        if not found:
+            if paths:
+                self.set_status(tr("File not found: {path}", path=paths[0]), 6000, kind="warning")
+            return
+        if recipe is not None:
+            preset = None
+            if recipe.preset:
+                wanted = recipe.preset.strip().lower()
+                preset = next((p for p in self.state.export_presets if p.name.strip().lower() == wanted), None)
+                if preset is None:
+                    logger.error("Command-line export preset not found: %s", recipe.preset)
+            for path in found:
+                self._launch_recipes[recipe_key(path)] = (recipe, preset)
+            self._sync_launch_recipe()
+        first_file = next((p for p in found if os.path.isfile(p)), None)
+        self.request_asset_discovery(found, auto_open=True, select_path=first_file)
+
+    def launch_recipe_for(self, path: Optional[str]) -> Optional[tuple[LaunchRecipe, Optional[ExportPreset]]]:
+        """The command-line export recipe and its preset for one source file, if a launch opened it."""
+        if not path or not self._launch_recipes:
+            return None
+        key = recipe_key(path)
+        while True:
+            if key in self._launch_recipes:
+                return self._launch_recipes[key]
+            parent = os.path.dirname(key)
+            if parent == key:
+                return None
+            key = parent
+
+    def current_launch_recipe(self) -> Optional[tuple[LaunchRecipe, Optional[ExportPreset]]]:
+        return self.launch_recipe_for(self.state.current_file_path)
+
+    def recipe_export_config(self) -> ExportConfig:
+        """The open frame's export settings as its export will use them, recipe included."""
+        conf = replace(self.state.config.export, icc_output_path=self.state.icc_output_path)
+        return self._recipe_export(self.state.current_file_path, conf)
+
+    def _recipe_export(self, path: Optional[str], conf: ExportConfig) -> ExportConfig:
+        """``conf`` with the launch recipe of ``path`` on top, or unchanged."""
+        found = self.launch_recipe_for(path)
+        return apply_recipe(conf, *found) if found else conf
+
+    def _recipe_flat(self, path: Optional[str]) -> bool:
+        """Whether a print-or-flat export of ``path`` is flat: its recipe's intent, else the panel's."""
+        found = self.launch_recipe_for(path)
+        intent = recipe_intent(*found) if found else None
+        return intent == "flat" if intent in ("print", "flat") else self.state.flat_output
+
+    def _sync_launch_recipe(self, path: Optional[str] = None) -> None:
+        """While a frame whose recipe sets the intent is open, the intent follows it unsaved, and
+        the user's own intent comes back on a frame without one."""
+        found = self.launch_recipe_for(path or self.state.current_file_path)
+        intent = recipe_intent(*found) if found else None
+        if intent is not None:
+            if self._intent_before_recipe is None:
+                self._intent_before_recipe = (self.state.flat_output, self.state.linear_output)
+            self._set_intent_unsaved(intent == "flat", intent == "linear")
+        elif self._intent_before_recipe is not None:
+            flat, linear = self._intent_before_recipe
+            self._intent_before_recipe = None
+            self._set_intent_unsaved(flat, linear)
+        self.launch_recipe_changed.emit()
+
+    def _set_intent_unsaved(self, flat: bool, linear: bool) -> None:
+        if (self.state.flat_output, self.state.linear_output) == (flat, linear):
+            return
+        self.state.flat_output, self.state.linear_output = flat, linear
+        if not flat and self.state.flat_peek:
+            self.toggle_flat_peek(force=False)
+        self.flat_output_changed.emit(flat)
+        self.linear_output_changed.emit(linear)
+
+    def _arm_launch_quit(self, paths: List[str]) -> None:
+        """Remember whether this export finishes a ``--quit-after-export`` launch."""
+        recipes = [found[0] for found in map(self.launch_recipe_for, paths) if found]
+        quitting = [r for r in recipes if r.quit_after_export]
+        self._launch_quit_pending = any(r.started_app for r in quitting) if quitting else None
+
     def _select_file_by_path(self, path: str) -> bool:
         """Find a file by path in uploaded_files and select it."""
         for i, f_info in enumerate(self.session.state.uploaded_files):
@@ -8034,6 +8130,10 @@ class AppController(QObject):
     def effective_output_icc(self) -> Optional[str]:
         """Profile the *export* converts to and tags with: a custom override, else the
         profile for the selected export color space."""
+        found = self.current_launch_recipe()
+        if found and (found[0].color_space or found[0].profile or found[1] is not None):
+            export = self._recipe_export(self.state.current_file_path, self.state.config.export)
+            return export.icc_output_path or ColorSpaceRegistry.get_icc_path(export.export_color_space)
         return self.state.icc_output_path or ColorSpaceRegistry.get_icc_path(self.state.config.export.export_color_space)
 
     def effective_proof_icc(self) -> Optional[str]:
@@ -8505,7 +8605,7 @@ class AppController(QObject):
 
     def set_flat_output(self, enabled: bool) -> None:
         """Toggle the flat digital-intermediate output intent (export + peek)."""
-        if self.state.flat_output == enabled:
+        if self.state.flat_output == enabled or self._intent_before_recipe is not None:
             return
         self.state.flat_output = enabled
         if enabled:
@@ -8533,7 +8633,7 @@ class AppController(QObject):
 
     def set_linear_output(self, enabled: bool) -> None:
         """Toggle the linear output intent (raw loader dump, no pipeline)."""
-        if self.state.linear_output == enabled:
+        if self.state.linear_output == enabled or self._intent_before_recipe is not None:
             return
         self.state.linear_output = enabled
         if enabled:
@@ -8780,6 +8880,7 @@ class AppController(QObject):
         st = self.state
         params = flat_master_config(st.config) if st.flat_output else st.config
         export_conf = replace(st.config.export, icc_input_path=self.effective_input_icc(), icc_output_path=st.icc_output_path)
+        export_conf = self._recipe_export(st.current_file_path, export_conf)
         if st.flat_output:
             export_conf = flat_export_config(export_conf)
         file_info = next(
@@ -8923,12 +9024,7 @@ class AppController(QObject):
             view = apply_exif_orientation(view, self.state.preview_orientation)
         # GeometryProcessor's order.
         geometry = self.state.config.geometry
-        view = np.rot90(view, k=geometry.rotation)
-        if geometry.flip_horizontal:
-            view = np.fliplr(view)
-        if geometry.flip_vertical:
-            view = np.flipud(view)
-        view = np.ascontiguousarray(view)
+        view = np.ascontiguousarray(apply_geometry_orientation(view, geometry.rotation, geometry.flip_horizontal, geometry.flip_vertical))
         h, w = view.shape[:2]
         scale = APP_CONFIG.preview_render_size / max(h, w)
         view = negpy_core.resize_linear(np.ascontiguousarray(view, dtype=np.float32), (round(w * scale), round(h * scale)))
@@ -9179,6 +9275,7 @@ class AppController(QObject):
         self._export_errors = []
         if self._begin_batch("export", tr("Exporting Linear Output"), abortable=True) is None:
             return
+        self._arm_launch_quit([t.file_info.get("path") for t in tasks])
         QMetaObject.invokeMethod(
             self.export_worker,
             "run_linear_output",
@@ -9204,6 +9301,10 @@ class AppController(QObject):
             params = self._batch_params_for(f)
             stitch = params.stitch if params.stitch.stitch_enabled else None
             frames = hdr_frame_paths(f)
+            delivery = replace(
+                preset_from_export_config(self._recipe_export(f["path"], replace(self.state.config.export, export_path=export_path))),
+                export_fmt=ExportFormat.JXL if linear_fmt == "jxl" else ExportFormat.TIFF,
+            )
             out_dir = resolve_output_dir(f["path"], delivery)
             # Same naming rule as a normal export: the bracket's first frame, suffixed so
             # the merge does not write over that frame's own linear output. No border and no
@@ -9270,6 +9371,7 @@ class AppController(QObject):
             icc_input_path=self.effective_input_icc(),
             icc_output_path=self.state.icc_output_path,
         )
+        export_conf = self._recipe_export(self.state.current_file_path, export_conf)
         if self.state.flat_output:
             export_conf = flat_export_config(export_conf)
         source_exif = self.state.source_exif.get(self.state.current_file_hash or "")
@@ -9353,10 +9455,9 @@ class AppController(QObject):
         if self.state.config.export.export_sidecars_enabled:
             self._write_edit_sidecars(files)
 
-        flat = self.state.flat_output
-
         tasks = []
         for f in files:
+            flat = self._recipe_flat(f["path"])
             # Delivery settings are session-level. A per-file config from the DB bypasses
             # _apply_sticky_settings and carries the export block current when that frame was
             # last saved, so honouring it exports at a size the panel never shows (#750).
@@ -9365,10 +9466,9 @@ class AppController(QObject):
             if flat:
                 params = flat_master_config(params)
 
-            final_export = replace(
-                params.export,
-                icc_input_path=self.effective_input_icc(),
-                icc_output_path=icc_output,
+            final_export = self._recipe_export(
+                f["path"],
+                replace(params.export, icc_input_path=self.effective_input_icc(), icc_output_path=icc_output),
             )
 
             if flat:
@@ -9480,6 +9580,8 @@ class AppController(QObject):
         self._flush_export_ui()
         if self._batch_busy("export"):
             return
+        # A frame opened with a command-line recipe exports only where its command expects the file.
+        files = [f for f in files if self.launch_recipe_for(f.get("path")) is None]
         if not files:
             return
 
@@ -9870,6 +9972,7 @@ class AppController(QObject):
         self._export_errors = []
         if self._begin_batch("export", tr("Exporting"), abortable=True) is None:
             return
+        self._arm_launch_quit([t.file_info.get("path") for t in tasks])
         QMetaObject.invokeMethod(
             self.export_worker,
             "run_batch",
@@ -9888,10 +9991,14 @@ class AppController(QObject):
         if not tasks:
             return tasks
 
-        if self.state.config.export.overwrite:
-            return [replace(t, export_settings=replace(t.export_settings, overwrite=True)) for t in tasks]
+        # A frame a command-line launch opened follows its recipe's overwrite flag, not the panel's.
+        own = [self.launch_recipe_for(t.file_info.get("path")) is not None for t in tasks]
+        panel_overwrite = self.state.config.export.overwrite
+        if panel_overwrite:
+            tasks = [t if mine else replace(t, export_settings=replace(t.export_settings, overwrite=True)) for t, mine in zip(tasks, own)]
+        ask = [(not t.export_settings.overwrite) if mine else not panel_overwrite for t, mine in zip(tasks, own)]
 
-        conflicts = find_export_conflicts(tasks)
+        conflicts = find_export_conflicts([t for t, a in zip(tasks, ask) if a])
         if not conflicts:
             return tasks
 
@@ -9900,7 +10007,7 @@ class AppController(QObject):
             return None
         if remember and choice:
             self._set_overwrite_preference(True)
-        return [replace(t, export_settings=replace(t.export_settings, overwrite=choice)) for t in tasks]
+        return [replace(t, export_settings=replace(t.export_settings, overwrite=choice)) if a else t for t, a in zip(tasks, ask)]
 
     def _set_overwrite_preference(self, value: bool) -> None:
         """Persist the global 'Overwrite existing files' preference (syncs the Export tab
@@ -10322,6 +10429,9 @@ class AppController(QObject):
         owner = self._active_batch if self._active_batch in ("export", "contact_sheet") else "export"
         self._end_batch(owner)
         self.export_finished.emit(elapsed, list(self._export_errors))
+        quit_pending, self._launch_quit_pending = self._launch_quit_pending, None
+        if quit_pending is not None and owner == "export" and not self._export_errors:
+            self.launch_export_done.emit(quit_pending)
         if owner == "contact_sheet" and self._contact_sheet_folder:
             folder, errors = self._contact_sheet_folder, len(self._export_errors)
             self.set_status(

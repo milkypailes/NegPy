@@ -1,5 +1,6 @@
 from negpy.kernel.system.i18n import tr
 import os
+from dataclasses import replace
 from typing import Optional
 
 import numpy as np
@@ -161,7 +162,9 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.controller = controller
         self.state = controller.state
-        self._export_size_zoom_pending = False
+        self._export_size_shape: Optional[tuple[int, ...]] = None
+        self._launch_request = None
+        controller.launch_export_done.connect(self._on_launch_export_done)
 
         self._restore_window_geometry()
         self.setAcceptDrops(True)
@@ -236,9 +239,34 @@ class MainWindow(QMainWindow):
             self._session_restore_checked = True
             QTimer.singleShot(0, self._maybe_restore_session)
 
+    def open_launch_request(self, request) -> None:
+        """Open the files of a command-line launch. Before the first show they replace the restore
+        question; later, from a second launch, the window comes to the front."""
+        if not getattr(self, "_session_restore_checked", False):
+            self._launch_request = replace(request, recipe=replace(request.recipe, started_app=True))
+            return
+        if self.isMinimized():
+            self.showNormal()
+        self.raise_()
+        self.activateWindow()
+        self.controller.open_launch_request(list(request.paths), request.recipe)
+
+    def _on_launch_export_done(self, started_app: bool) -> None:
+        """``--quit-after-export``: NegPy closes when that launch started it, else steps back."""
+        if started_app:
+            self.close()
+        else:
+            self.showMinimized()
+
     def _maybe_restore_session(self) -> None:
         """Offers to reopen the previous session's files on first show, and otherwise
         opens the library — with nothing loaded, a list of rolls beats a blank panel."""
+        if self._launch_request is not None:
+            request, self._launch_request = self._launch_request, None
+            self.file_browser.restore_hot_folder(False)
+            self.controller.open_launch_request(list(request.paths), request.recipe)
+            self._schedule_onboarding()
+            return
         paths = self.controller.saved_session_paths()
         if paths:
             reply = QMessageBox.question(
@@ -625,6 +653,18 @@ class MainWindow(QMainWindow):
         self.controller.session.repo.save_global_setting("panel_right_visible", True)
         self.canvas.hud.showMessage(tr("Panel layout reset"), timeout=1500)
 
+    def _sync_analysis_plate(self) -> None:
+        """One chart stack serves the Analysis card and the canvas plate: it moves to the one in view."""
+        plate = self.canvas.analysis_plate
+        wanted = self.right_panel.analysis_overlay_wanted()
+        if wanted == plate.holds_charts():
+            return
+        if wanted:
+            plate.hold(self.right_panel.chart_stack)
+        else:
+            plate.release()
+            self.right_panel.chart_well.take_back()
+
     def _connect_signals(self) -> None:
         """Wire controller and view."""
         browser = self.file_browser
@@ -717,6 +757,9 @@ class MainWindow(QMainWindow):
         self.canvas.overlay.zone_shares_changed.connect(self.toolbar.set_zone_shares)
         self.canvas.overlay.zone_pointer_changed.connect(self.toolbar.set_zone_pointer)
         self.controller.clipping_overlay_changed.connect(lambda _on: self.canvas.overlay.update())
+        self.right_panel.analysis_overlay_changed.connect(self._sync_analysis_plate)
+        self.canvas.analysis_plate.cycle_requested.connect(self.right_panel.cycle_analysis_view)
+        self._sync_analysis_plate()
         self.controller.zone_highlight_changed.connect(self.canvas.overlay.update)
         self.controller.grain_focuser_changed.connect(lambda _on: self.canvas.overlay.update())
         self.controller.export_view_ready.connect(self.canvas.overlay.update)
@@ -863,7 +906,7 @@ class MainWindow(QMainWindow):
         self._refresh_image_info()
 
     def _on_export_size_view_changed(self, on: bool) -> None:
-        self._export_size_zoom_pending = on
+        self._export_size_shape = None
 
     def _on_image_updated(self) -> None:
         """Refreshes canvas when a new render pass completes."""
@@ -916,9 +959,10 @@ class MainWindow(QMainWindow):
             splash=bool(shown("splash")), proofed=bool(shown("proof", True))
         )
         self.canvas.update_buffer(buffer, display_cs, content_rect=content_rect, monitor_icc_bytes=monitor_bytes, proof=proof)
-        # The first export frame opens at 100%: Export Size is for judging pixels.
-        if self._export_size_zoom_pending and shown("export_view"):
-            self._export_size_zoom_pending = False
+        # An export frame of a new size opens at 100%: Export Size is for judging pixels. An edit
+        # that keeps the size keeps the zoom and pan.
+        if shown("export_view") and buffer.shape[:2] != self._export_size_shape:
+            self._export_size_shape = buffer.shape[:2]
             self.canvas.zoom_to_percent(100.0)
 
     def _refresh_image_info(self) -> None:
