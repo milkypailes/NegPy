@@ -1,3 +1,4 @@
+import functools
 import os
 import io
 from concurrent.futures import ThreadPoolExecutor
@@ -439,7 +440,7 @@ def dng_bounded_preview(
             white = _dng_rgb_values(_dng_tag_floats(tag("WhiteLevel")), dtype_max)
             neutral = _dng_tag_floats(pages[0].tags.get("AsShotNeutral"))
             wb = np.ones((1, 1, 3), dtype=np.float32)
-            if neutral.size >= 3 and np.all(neutral[:3] > 0):
+            if neutral.size >= 3 and np.all(neutral[:3] > 0) and not is_scanned_dng(file_path):
                 wb[0, 0] = (neutral[1] / neutral[0], 1.0, neutral[1] / neutral[2])
             linearization_tag = tag("LinearizationTable")
             linearization = np.asarray(linearization_tag.value, dtype=np.float32) if linearization_tag is not None else None
@@ -663,12 +664,33 @@ class NonStandardFileWrapper:
         # If set, `sizes` reports this (h, w) for full image; else derived from `data` shape.
         self._full_output_hw: Optional[Tuple[int, int]] = full_output_hw
         # As-shot (R, G, B) white balance gains, applied by postprocess() when the caller asks
-        # for camera WB. None means the source has no WB to offer, as with NegPy's own scanner
-        # DNGs, which are always neutral. postprocess() then leaves the data untouched.
+        # for camera WB and read through camera_whitebalance like a camera's. None means the source
+        # has no WB to offer, as with NegPy's own scanner DNGs, which are always neutral.
         self.wb_gains: Optional[Tuple[float, float, float]] = wb_gains
-        # A Positive source decoded in its own primaries carries them here (source_cam_xyz), read
-        # by camera_xyz_matrix like a camera's. None for every other source.
+        # XYZ->camera, read by camera_xyz_matrix like a camera's: a Positive source's own primaries
+        # (source_cam_xyz), or the ColorMatrix of a LinearRaw camera DNG libraw cannot unpack.
         self.rgb_xyz_matrix: Optional[Sequence] = None
+
+    @property
+    def camera_whitebalance(self) -> list:
+        """`wb_gains` in libraw's [R, G, B, G2] form, libraw's [0, 1, 0, 0] when there are none."""
+        if self.wb_gains is None:
+            return [0.0, 1.0, 0.0, 0.0]
+        r, g, b = self.wb_gains
+        return [r, g, b, 0.0]
+
+    def _decode_gains(self, kwargs: dict) -> Optional[Tuple[float, float, float]]:
+        """The gains a postprocess call asks for, as libraw resolves them: `user_wb` wins over
+        `use_camera_wb`. None when the decode stays neutral."""
+        user_wb = kwargs.get("user_wb")
+        if user_wb is not None:
+            r, g, b = (float(v) for v in user_wb[:3])
+            gains = (r / g, 1.0, b / g) if g > 0 else (1.0, 1.0, 1.0)
+        elif kwargs.get("use_camera_wb") and self.wb_gains is not None:
+            gains = self.wb_gains
+        else:
+            return None
+        return None if gains == (1.0, 1.0, 1.0) else gains
 
     @property
     def data(self) -> np.ndarray:
@@ -697,27 +719,22 @@ class NonStandardFileWrapper:
         bps = kwargs.get("output_bps", 8)
         half_size = kwargs.get("half_size", False)
         gamma = kwargs.get("gamma")
-        camera_wb = kwargs.get("use_camera_wb") and self.wb_gains is not None
-        if self._source_u16 is not None and bps == 16 and gamma is not None and tuple(gamma) == (1, 1) and not camera_wb:
+        gains = self._decode_gains(kwargs)
+        linear16 = bps == 16 and gamma is not None and tuple(gamma) == (1, 1)
+        if self._source_u16 is not None and linear16 and gains is None:
             return np.ascontiguousarray(self._source_u16[::2, ::2] if half_size else self._source_u16)
         data = self.data
         if half_size:
             data = data[::2, ::2]
+        if linear16:
+            # Float32 in [0, 1], LibRaw's u16 ceiling, so float sources keep their precision. Always a new array.
+            # A clamp keeps NaN, and NaN in the source poisons the bounds percentiles.
+            data = negpy_core.nan_to_num(np.ascontiguousarray(data), 0.0, 1.0, 0.0)
+            return negpy_core.scale_clip_unit(data, [gains[0], 1.0, gains[2]]) if gains is not None else negpy_core.clip01(data)
 
-        if kwargs.get("use_camera_wb") and self.wb_gains is not None:
-            r, g, b = self.wb_gains
-            data = data.astype(np.float32, copy=True)
-            data[..., 0] *= r
-            data[..., 2] *= b
-            data = np.clip(data, 0.0, 1.0)
-
-        if gamma is None or tuple(gamma) != (1, 1):
-            # LibRaw's default BT.709 display gamma, or linear thumbnails go near-black.
-            data = np.where(data < 0.018, data * 4.5, 1.099 * np.power(np.maximum(data, 0.0), 1.0 / 2.222) - 0.099)
-
-        if bps == 16:
-            return (data * 65535.0).astype(np.uint16)
-        return (data * 255.0).astype(np.uint8)
+        # LibRaw's default BT.709 display gamma, or linear thumbnails go near-black.
+        display_gamma = gamma is None or tuple(gamma) != (1, 1)
+        return negpy_core.display_decode(np.ascontiguousarray(data, dtype=np.float32), gains, display_gamma, 16 if bps == 16 else 8)
 
 
 _DEMOSAIC_ALGORITHMS: dict[str, Any] = {
@@ -802,15 +819,50 @@ def camera_xyz_matrix(raw: Any) -> Optional[Sequence]:
     return [[float(v) for v in row] for row in m[:3]]
 
 
-def camera_wb_multipliers(raw: Any) -> Optional[list]:
-    """The as-shot white balance as [R, G, B] multipliers, or None if absent.
+_CAMERA_EXPOSURE_TAGS = ("ExposureTime", "FNumber")
 
-    Needed only when a buffer is decoded WITHOUT white balance (Linear RAW): the camera
-    matrix is row-normalized, so it assumes a neutral camera signal, and an unbalanced
-    one renders with a heavy cast. Folding these back in reconstructs the balanced
-    signal the matrix expects. Serialized out of the rawpy object for the same
-    lifetime reason as camera_xyz_matrix.
-    """
+
+@functools.lru_cache(maxsize=4096)
+def _scanned_dng(file_path: str, mtime_ns: int, size: int) -> bool:
+    import tifffile
+
+    try:
+        with tifffile.TiffFile(file_path) as tif:
+            page0 = tif.pages[0]
+            main = next((p for p in (page0, *(page0.pages or [])) if int(getattr(p, "subfiletype", 0)) == 0), None)
+            if main is None or int(main.photometric) != _DNG_LINEAR_RAW:
+                return False
+            for page in (page0, main):
+                # TIFF/EP lets a camera write the exposure tags in the IFD itself, beside the EXIF IFD.
+                exif = page.tags.get("ExifTag")
+                exif_tags = exif.value if exif is not None and isinstance(exif.value, dict) else {}
+                if any(t in exif_tags or page.tags.get(t) is not None for t in _CAMERA_EXPOSURE_TAGS):
+                    return False
+            return True
+    except Exception:
+        return False
+
+
+def is_scanned_dng(file_path: str) -> bool:
+    """A DNG whose main image is LinearRaw and whose EXIF holds no exposure: a film scanner's
+    file, or an editor's rebuild of one. A camera's DNG keeps ExposureTime or FNumber, and so does
+    a LinearRaw one from DxO or Lightroom Enhance, because its pixels still need the as-shot decode."""
+    if not file_path or os.path.splitext(file_path)[1].lower() != ".dng":
+        return False
+    try:
+        st = os.stat(file_path)
+    except OSError:
+        return False
+    return _scanned_dng(file_path, st.st_mtime_ns, st.st_size)
+
+
+def camera_wb_multipliers(raw: Any, file_path: str = "") -> Optional[list]:
+    """The as-shot white balance as [R, G, B] multipliers, or None if absent. A scanner DNG has
+    none: the scanner balances its gains to its lamp. A decode without white balance (Linear RAW)
+    folds these back in, because the row-normalized camera matrix assumes a neutral camera signal.
+    Serialized out of the rawpy object for the same lifetime reason as camera_xyz_matrix."""
+    if is_scanned_dng(file_path):
+        return None
     try:
         wb = [float(v) for v in raw.camera_whitebalance[:3]]
     except Exception:
@@ -818,6 +870,16 @@ def camera_wb_multipliers(raw: Any) -> Optional[list]:
     if len(wb) != 3 or not all(np.isfinite(wb)) or min(wb) <= 0.0:
         return None
     return wb
+
+
+def decodes_camera_wb(raw: Any, wanted: bool, file_path: str = "") -> bool:
+    """Whether a decode that *wanted* the as-shot white balance gets it. A file with none
+    (`camera_wb_multipliers`) decodes neutral, because libraw answers the request with its auto
+    white balance, a gray world per frame. A NonStandardFileWrapper applies only gains it holds, and a
+    scanner DNG never gets any, so a wrapper of one decodes neutral too."""
+    if is_scanned_dng(file_path):
+        return False
+    return wanted and (not isinstance(raw, rawpy.RawPy) or camera_wb_multipliers(raw, file_path) is not None)
 
 
 #: Nikon's High Efficiency (HE / HE*) raw on the Z 8 and Z 9 is intoPIX TicoRAW carrying a

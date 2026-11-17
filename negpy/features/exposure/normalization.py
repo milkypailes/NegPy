@@ -7,7 +7,7 @@ from negpy.domain.types import LUMA_B, LUMA_G, LUMA_R, ImageBuffer
 from negpy.features.exposure.bw_filter import collapse_matrix
 from negpy.features.geometry.logic import AUTOCROP_DETECT_RES, _normalize_detection_input
 from negpy.features.process.models import ProcessMode
-from negpy.kernel.image.logic import percentile_from_sorted
+from negpy.kernel.image.logic import apply_geometry_orientation, percentile_from_sorted
 from negpy.kernel.image.validation import ensure_image
 
 if TYPE_CHECKING:
@@ -15,7 +15,7 @@ if TYPE_CHECKING:
 
 # Bump in any change that alters the bounds a frame measures for unchanged settings. Saved
 # per-frame bounds from an older version are dropped at startup (migrations/bounds.py).
-BOUNDS_VERSION = 3
+BOUNDS_VERSION = 7
 
 # Contrast Mask blur sigma, per-cent of the analysis grid's short side. Of the grid, not of
 # the render, so preview and export mask alike. Near the Frontier HyperTone blur's spread.
@@ -97,8 +97,7 @@ def _block_median_grid(img_log: ImageBuffer) -> ImageBuffer:
     b = int(np.ceil(max(h, w) / grid))
     if b <= 1 or h < b or w < b:
         return img_log
-    hb, wb = (h // b) * b, (w // b) * b
-    return negpy_core.block_median_grid(np.ascontiguousarray(img_log[:hb, :wb], dtype=np.float32), b)
+    return negpy_core.block_median_grid(np.asarray(img_log, dtype=np.float32), b)
 
 
 def prefilter_log_grid(
@@ -326,13 +325,9 @@ def base_scan_density(base_log: Optional[Tuple[float, float, float]], unmix: Opt
 
 
 def luminance_density_range(bounds: LogNegativeBounds) -> float:
-    """
-    Single global density range as a Rec.709 luminance weighting of the
-    per-channel ranges. Replaces the green-only range so frames with a strong
-    single-channel cast don't swing the slope as hard, while green still
-    dominates so calibrated grade behaviour barely shifts. abs() keeps it
-    sign-safe for a slide's reversed (f > c) window.
-    """
+    """One global density range: the luma-weighted per-channel ranges, so a strong single-channel
+    cast moves the slope less than it moves that channel. abs() keeps a slide's reversed (f > c)
+    window sign-safe."""
     rr = abs(bounds.ceils[0] - bounds.floors[0])
     rg = abs(bounds.ceils[1] - bounds.floors[1])
     rb = abs(bounds.ceils[2] - bounds.floors[2])
@@ -550,13 +545,7 @@ def analysis_grid(
         scale = grid / float(max(h, w))
         image = negpy_core.resize_area(np.ascontiguousarray(image, dtype=np.float32), (max(1, round(w * scale)), max(1, round(h * scale))))
 
-    if rotation:
-        image = np.rot90(image, k=rotation)
-    if flip_horizontal:
-        image = np.fliplr(image)
-    if flip_vertical:
-        image = np.flipud(image)
-    image = np.ascontiguousarray(image)
+    image = np.ascontiguousarray(apply_geometry_orientation(image, rotation, flip_horizontal, flip_vertical))
     if fine_rotation != 0.0:
         image = apply_fine_rotation(image, fine_rotation)
     if distortion_k1 != 0.0:

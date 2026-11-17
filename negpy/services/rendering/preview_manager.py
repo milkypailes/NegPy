@@ -15,6 +15,7 @@ from negpy.infrastructure.loaders.factory import loader_factory
 from negpy.infrastructure.loaders.helpers import (
     NonStandardFileWrapper,
     camera_wb_multipliers,
+    decodes_camera_wb,
     camera_xyz_matrix,
     embedded_preview,
     get_best_demosaic_algorithm,
@@ -359,12 +360,12 @@ class PreviewManager:
                 user_wb.append(user_wb[1])
             use_camera_wb_flag = False
             wb_for_gain: Optional[Sequence[float]] = user_wb
-        elif decode_camera_wb:
+        elif decodes_camera_wb(raw, decode_camera_wb, file_path):
             user_wb = None
             use_camera_wb_flag = True
             # Read before postprocess: camera_whitebalance is sensor metadata, unaffected
             # by it, and highlight_reconstruction_bright_gain needs it ahead of the call.
-            wb_for_gain = camera_wb_multipliers(raw)
+            wb_for_gain = camera_wb_multipliers(raw, file_path)
         else:
             user_wb = [1, 1, 1, 1]
             use_camera_wb_flag = False
@@ -401,7 +402,7 @@ class PreviewManager:
         # features.process.capture_color.
         metadata["cam_xyz"] = camera_xyz_matrix(raw)
         # Only needed when use_camera_wb is False; harmless otherwise.
-        metadata["camera_wb"] = camera_wb_multipliers(raw)
+        metadata["camera_wb"] = camera_wb_multipliers(raw, file_path)
         if isinstance(raw, rawpy.RawPy):
             raw.close()
         if should_cancel is not None and should_cancel():
@@ -412,7 +413,7 @@ class PreviewManager:
         full_linear = apply_exif_orientation(uint16_to_float32(np.ascontiguousarray(rgb)), orientation)
         if lens_corrections:
             full_linear = prepare_lens_source(full_linear, metadata, lens_flatfield, lens_corrections)
-        del rgb  # release the uint16 decode buffer before the resize/copy peak
+        del rgb  # release the decode buffer before the resize/copy peak
         if should_cancel is not None and should_cancel():
             raise InterruptedError("preview load cancelled")
         ir_full = metadata.get("ir")
