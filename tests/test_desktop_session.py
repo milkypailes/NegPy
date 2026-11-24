@@ -124,6 +124,14 @@ class TestDesktopSessionSync(unittest.TestCase):
         self.mock_repo.save_global_setting.assert_called_once_with("auto_thumbnail_refresh", True)
         self.assertEqual(heard, [True])
 
+    def test_automatic_roll_average_is_saved_and_announced(self):
+        heard = []
+        self.session.auto_roll_average_changed.connect(heard.append)
+        self.session.set_auto_roll_average(False)
+        self.session.set_auto_roll_average(False)
+        self.mock_repo.save_global_setting.assert_called_once_with("auto_roll_average", False)
+        self.assertEqual(heard, [False])
+
     def test_update_selection(self):
         self.session.update_selection([0, 1])
         self.assertEqual(self.session.state.selected_indices, [0, 1])
@@ -561,6 +569,31 @@ class TestDesktopSessionSync(unittest.TestCase):
         kept = persisted("Portra")
         self.assertEqual((kept["sensor_profile"], kept["sensor_matrix"]), ("Hand Made", [2.0] * 9))
         self.assertEqual(persisted("Other Hand Made")["sensor_profile"], "Other Hand Made")
+
+    def test_a_bw_frame_does_not_carry_its_hidden_chroma(self):
+        from negpy.desktop.sticky import STICKY_CONFIG_KEY
+
+        store = {STICKY_CONFIG_KEY: {"saturation": 1.2}}
+        self.mock_repo.get_global_setting.side_effect = lambda key, default=None: store.get(key, default)
+
+        def persisted(mode):
+            config = WorkspaceConfig(process=replace(WorkspaceConfig().process, process_mode=mode))
+            self.session._persist_sticky_settings(replace(config, lab=replace(config.lab, saturation=0.0)))
+            return self.mock_repo.save_global_settings.call_args.args[0][STICKY_CONFIG_KEY]["saturation"]
+
+        self.assertEqual(persisted(ProcessMode.BW), 1.2)
+        self.assertEqual(persisted(ProcessMode.C41), 0.0)
+
+    def test_a_color_roll_opened_after_a_bw_roll_is_in_color(self):
+        from negpy.desktop.sticky import STICKY_CONFIG_KEY, sticky_snapshot
+        from negpy.features.process.models import with_process_mode
+
+        bw = with_process_mode(WorkspaceConfig(), ProcessMode.BW)
+        store = {STICKY_CONFIG_KEY: sticky_snapshot(replace(bw, lab=replace(bw.lab, saturation=0.0)))}
+        self.mock_repo.get_global_setting.side_effect = lambda key, default=None: store.get(key, default)
+        fresh = self.session._apply_sticky_settings(WorkspaceConfig(), only_global=False)
+        self.assertEqual((fresh.process.process_mode, fresh.lab.saturation), (ProcessMode.BW, 0.0))
+        self.assertEqual(with_process_mode(fresh, ProcessMode.C41).lab.saturation, 1.0)
 
     def test_persist_sticky_settings_does_not_write_description_fields(self):
         """Any metadata save must not clobber last Description… confirm."""

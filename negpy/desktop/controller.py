@@ -44,6 +44,7 @@ from negpy.desktop.workers.export import (
     find_export_conflicts,
     resolve_output_dir,
 )
+from negpy.desktop.workers.fade_roll import FadeRollResult, FadeRollTask, FadeRollWorker
 from negpy.services.export.launch_recipe import LaunchRecipe, apply_recipe, recipe_intent, recipe_key
 from negpy.desktop.workers.render import (
     _THUMBNAIL_WORKERS,
@@ -130,7 +131,14 @@ from negpy.services.assets.triplets import (
     saved_triplets,
 )
 from negpy.services.assets import rolls
-from negpy.services.assets.rehome import folder_roll_missing, relink_folder_roll
+from negpy.services.assets.rehome import (
+    folder_roll_missing,
+    gone_member_paths,
+    member_folders,
+    missing_member_folders,
+    rehome_path_prefix,
+    relink_folder_roll,
+)
 from negpy.services.assets.sensor import SensorProfiles
 from negpy.services.export.contact_sheet_layout import ContactSheetSettings
 from negpy.services.export.contact_sheet_roll import (
@@ -209,11 +217,14 @@ from negpy.features.geometry.processor import CropProcessor, GeometryProcessor
 from negpy.domain.interfaces import PipelineContext
 from negpy.features.lab.models import LabConfig
 from negpy.features.local.models import LocalAdjustmentsConfig
-from negpy.features.process.path import RenderPath, positive_decode, render_path
+from negpy.features.process.fade_roll import ROLL_MIN_FRAMES
+from negpy.features.process.path import RenderPath, is_mono, positive_decode, render_path
+from negpy.infrastructure.display.icc_profile import is_gray_profile
 from negpy.features.process.models import (
     SCAN_SETUP_PAPERS,
     ProcessConfig,
     ProcessMode,
+    chroma_for_mono,
     invalidate_local_bounds,
     mode_aware_exposure_reset,
     scan_setup_values,
@@ -273,7 +284,7 @@ logger = get_logger(__name__)
 _BUSY_TOAST_MS = 30000
 # Batch owners that share norm_thread (and its CPU) with the background thumbnail
 # refresh — the only ones a running refresh actually needs to get out of the way of.
-_NORM_THREAD_BATCH_OWNERS = frozenset({"autocrop", "normalization"})
+_NORM_THREAD_BATCH_OWNERS = frozenset({"autocrop", "normalization", "fade_roll"})
 
 
 class BackgroundBaseline(NamedTuple):
@@ -578,7 +589,7 @@ class AppController(QObject):
     """
 
     image_updated = pyqtSignal()
-    roll_folder_missing = pyqtSignal(str)  # a folder roll was opened but its folder is gone
+    roll_folder_missing = pyqtSignal(str)  # a roll was opened but its folder, or every folder of its frames, is gone
     preview_loaded = pyqtSignal()
     metrics_available = pyqtSignal(dict)
     loading_started = pyqtSignal()
@@ -586,12 +597,15 @@ class AppController(QObject):
     # Emitted before the GPU engine frees its texture pool; the canvas samples a
     # pooled texture directly and must drop it first.
     gpu_textures_released = pyqtSignal()
-    export_finished = pyqtSignal(float, list)  # elapsed seconds, the failed files' messages
+    export_finished = pyqtSignal(float, list, str)  # elapsed seconds, the failed files' messages, the one folder written to
     render_requested = pyqtSignal(RenderTask)
     preview_load_requested = pyqtSignal(PreviewLoadTask)
     prefetch_load_requested = pyqtSignal(PreviewLoadTask)
     normalization_requested = pyqtSignal(NormalizationTask)
     background_normalization_requested = pyqtSignal(NormalizationTask)
+    fade_roll_requested = pyqtSignal(FadeRollTask)
+    # The Fade card's hint after Estimate Roll, and the frame names its tooltip lists.
+    fade_roll_hint = pyqtSignal(str, str, str)
     batch_autocrop_requested = pyqtSignal(BatchAutoCropTask)
     thumbnail_render_requested = pyqtSignal(ThumbnailRenderTask)
     thumbnail_refresh_state_changed = pyqtSignal(bool)  # a background refresh started/stopped running
@@ -758,6 +772,7 @@ class AppController(QObject):
         self._first_render_t0: Optional[float] = None
         self._export_start_time = 0.0
         self._export_errors: list[str] = []
+        self._export_folder = ""
         # (roll id, pushing frame, pushed cards, their roll fields before the push)
         self._frame_merge_trash = True
         self._discovery_running = False
@@ -794,6 +809,8 @@ class AppController(QObject):
         self._background_baseline_timer.setSingleShot(True)
         self._background_baseline_timer.setInterval(2000)
         self._background_baseline_timer.timeout.connect(self._run_background_baseline)
+        # Per frame hash, what the last background check read: (render path, waits for Auto Crop, meter inputs).
+        self._baseline_seen: Dict[str, tuple] = {}
         # True while a hot-folder-triggered discovery owns the batch lane. Thumbnail
         # loading is an independent background queue and never owns this state.
         self._hot_folder_sequence_active = False
@@ -802,6 +819,8 @@ class AppController(QObject):
         self._autocrop_preflight_skipped = 0
         # Per frame hash: its resolved Auto Crop when the run started.
         self._autocrop_started_auto: Dict[str, bool] = {}
+        # The roll the running Estimate Roll reads.
+        self._fade_roll_target: Optional[str] = None
         self._autocrop_cancel_requested = False
         # The analysis a run of Auto-crop all frames was started for, run when it finishes.
         self._analysis_after_crop: Optional[Callable[[], None]] = None
@@ -886,6 +905,8 @@ class AppController(QObject):
         self.batch_autocrop_worker.moveToThread(self.norm_thread)
         self.thumbnail_render_worker = ThumbnailRenderWorker(self.thumbnail_render_preview_service, self.preview_service)
         self.thumbnail_render_worker.moveToThread(self.norm_thread)
+        self.fade_roll_worker = FadeRollWorker(self.preview_service)
+        self.fade_roll_worker.moveToThread(self.norm_thread)
         self.norm_thread.start()
 
         self.discovery_thread = QThread()
@@ -995,6 +1016,8 @@ class AppController(QObject):
         self._neighbor_prefetch_queue: list[PreviewLoadTask] = []
         self._prefetch_in_flight_generation: Optional[int] = None
         self._thumbnail_queue_active = False
+        # The frame copies the thumbnail queue was last sent, with their stamped film process.
+        self._thumbnail_backlog: List[dict] = []
         self._thumbnails_paused_for_foreground = False
 
         self._connect_signals()
@@ -1127,8 +1150,7 @@ class AppController(QObject):
     def _connect_signals(self) -> None:
         # A lock moves with an edit, a push, a paste or a reset; each ends in config_updated.
         self.config_updated.connect(self.session.refresh_own_marks)
-        # A crop or Metering edit can leave the roll average out of date; the run checks each frame's inputs.
-        self.config_updated.connect(self._background_baseline_timer.start)
+        self.config_updated.connect(self._schedule_baseline_after_edit)
         self.render_requested.connect(self.render_worker.process)
         self.strip_requested.connect(self.render_worker.build_strip)
         self.pick_better_requested.connect(self.render_worker.build_pick_better)
@@ -1144,6 +1166,7 @@ class AppController(QObject):
         self.render_worker.error.connect(self._on_pick_better_error)
 
         self.export_worker.progress.connect(self._on_batch_progress)
+        self.export_worker.batch_written.connect(self._on_export_batch_written)
         self.export_worker.finished.connect(self._on_export_finished)
         self.export_worker.cancelled.connect(self._on_export_batch_cancelled)
         self.export_worker.error.connect(self._on_export_task_error)
@@ -1192,6 +1215,11 @@ class AppController(QObject):
         self.norm_worker.cancelled.connect(self._on_normalization_cancelled)
         self.norm_worker.error.connect(self._on_normalization_error)
         self.background_normalization_requested.connect(self.bg_norm_worker.process)
+        self.fade_roll_requested.connect(self.fade_roll_worker.process)
+        self.fade_roll_worker.progress.connect(self._on_fade_roll_progress)
+        self.fade_roll_worker.finished.connect(self._on_fade_roll_finished)
+        self.fade_roll_worker.cancelled.connect(lambda: self._on_batch_cancelled("fade_roll"))
+        self.fade_roll_worker.error.connect(self._on_fade_roll_error)
         self.bg_norm_worker.finished.connect(self._on_background_baseline)
         self.bg_norm_worker.progress.connect(self._on_background_baseline_progress)
         self.bg_norm_worker.cancelled.connect(self._on_background_baseline_ended)
@@ -1212,6 +1240,7 @@ class AppController(QObject):
         self.thumbnail_render_worker.error.connect(self._on_thumbnail_render_error)
         self.session.frames_edited_offscreen.connect(self._on_frames_edited_offscreen)
         self.session.auto_thumbnail_refresh_changed.connect(self._on_auto_thumbnail_refresh_changed)
+        self.session.auto_roll_average_changed.connect(self._on_auto_roll_average_changed)
 
         self.asset_discovery_requested.connect(self.discovery_worker.process)
         self.discovery_worker.progress.connect(self._on_discovery_progress)
@@ -1325,16 +1354,24 @@ class AppController(QObject):
             return
         self._render_debounce.start()
 
-    def generate_missing_thumbnails(self) -> None:
+    def generate_missing_thumbnails(self, *, reuse_stamps: bool = False) -> None:
+        """Queues every frame without a thumbnail. *reuse_stamps* resends the last request's copies
+        when they cover every missing frame: the open frame pauses the queue on each render."""
         missing = [f for f in self.state.uploaded_files if asset_thumbnail_key(f) not in self.state.thumbnails]
-        if missing:
-            self._thumbnail_queue_active = True
-            self.thumb_worker.cancel_pending()
+        if not missing:
+            return
+        self._thumbnail_queue_active = True
+        self.thumb_worker.cancel_pending()
+        keys = [asset_thumbnail_key(f) for f in missing]
+        stamped = {asset_thumbnail_key(f): f for f in self._thumbnail_backlog} if reuse_stamps else {}
+        if not all(k in stamped for k in keys):
             # Copies, carrying each frame's stored film process. The source decode cannot
             # tell a slide from a negative reliably, and inverting a positive is what put
             # negatives in the filmstrip. They are copies because these dicts cross to a
             # worker thread and uploaded_files must not grow a stale mode.
-            self.thumbnail_requested.emit([{**f, "process_mode": self.session.stored_process_mode(f)} for f in missing])
+            stamped = {k: {**f, "process_mode": self.session.stored_process_mode(f)} for k, f in zip(keys, missing)}
+        self._thumbnail_backlog = [stamped[k] for k in keys]
+        self.thumbnail_requested.emit(list(self._thumbnail_backlog))
 
     def thumbnail_turn_snapshot(self) -> dict[str, Optional[bool]]:
         """Per selected frame but the active one: whether its stored thumbnail shows its settings,
@@ -1639,7 +1676,7 @@ class AppController(QObject):
         ):
             return
         self._thumbnails_paused_for_foreground = False
-        self.generate_missing_thumbnails()
+        self.generate_missing_thumbnails(reuse_stamps=True)
 
     def _continue_background_work(self) -> None:
         """Resume deferred work after the selected frame becomes idle."""
@@ -1702,6 +1739,7 @@ class AppController(QObject):
             "export": self.export_worker,
             "contact_sheet": self.export_worker,
             "normalization": self.norm_worker,
+            "fade_roll": self.fade_roll_worker,
             "stitch": self.stitch_worker,
             "hdr": self.hdr_worker,
             "frame_merge": self.frame_merge_worker,
@@ -1774,6 +1812,8 @@ class AppController(QObject):
             self.export_worker.cancel()
         elif self._active_batch == "normalization":
             self.norm_worker.cancel()
+        elif self._active_batch == "fade_roll":
+            self.fade_roll_worker.cancel()
         elif self._active_batch == "autocrop":
             self._autocrop_cancel_requested = True
             self.batch_autocrop_worker.cancel(self._autocrop_batch_token)
@@ -1811,7 +1851,8 @@ class AppController(QObject):
         saved = self.session.repo.get_global_setting("session_active_roll")
         if not isinstance(saved, str):
             return self._roll_id_for_restored_paths(paths)
-        return saved if saved and rolls.roll_for_id(self.session.repo, saved) else None
+        repo = self.session.repo
+        return saved if saved and rolls.roll_for_id(repo, saved) and not rolls.is_hidden(repo, saved) else None
 
     def _roll_id_for_restored_paths(self, paths: List[str]) -> Optional[str]:
         """The one roll every restored path agrees on, or None: the same "only when
@@ -2000,7 +2041,7 @@ class AppController(QObject):
             self.session.repo.save_global_setting("library_roots", [*roots, *new])
 
     def has_rolls(self) -> bool:
-        return bool(rolls.saved_rolls(self.session.repo))
+        return bool(rolls.all_rolls_sorted(self.session.repo))
 
     def import_subfolders_as_rolls(self, parent_path: str) -> List[str]:
         """Recognize every roll folder under *parent_path* as its own roll, and
@@ -2010,21 +2051,48 @@ class AppController(QObject):
             self._register_library_roots([parent_path])
         return roll_ids
 
-    def recognize_library_folders(self, folders: List[str]) -> List[str]:
-        """Recognize each folder as a roll without opening it; it is not an import source."""
-        roll_ids = [rolls.recognize_folder(self.session.repo, folder) for folder in folders]
-        self._register_library_roots(folders)
-        return roll_ids
+    def recognize_library_folder(self, folder: str) -> str:
+        """Recognize the folder as a roll without opening it; it is not an import source."""
+        roll_id = rolls.recognize_folder(self.session.repo, folder)
+        self._register_library_roots([folder])
+        return roll_id
 
     def rediscover_rolls(self) -> tuple[int, int]:
         """Walk every Import Subfolders source again under the current discovery filters;
         returns (new rolls, rolls dropped by a filter)."""
         repo = self.session.repo
         dropped = rolls.prune_filtered_rolls(repo)
-        before = len(rolls.saved_rolls(repo))
+        before = {roll_id for roll_id, _entry in rolls.all_rolls_sorted(repo)}
         for source in rolls.import_sources(repo):
             rolls.import_subfolders_as_rolls(repo, source, skip_dismissed=True)
-        return len(rolls.saved_rolls(repo)) - before, dropped
+        listed = {roll_id for roll_id, _entry in rolls.all_rolls_sorted(repo)}
+        if self.state.active_roll_id and self.state.active_roll_id not in listed:
+            self._leave_open_roll()
+        return len(listed - before), dropped
+
+    def delete_rolls(self, roll_ids: List[str]) -> None:
+        """Forget *roll_ids* with the edits made only in them. The open roll closes first, so no
+        save of its frames writes a fork back."""
+        if self.state.active_roll_id in roll_ids:
+            self._leave_open_roll()
+        for roll_id in roll_ids:
+            for fork_hash in rolls.delete_roll(self.session.repo, roll_id):
+                self.session.repo.delete_file_settings(fork_hash)
+
+    def _leave_open_roll(self) -> None:
+        """Close the open roll that the Library no longer lists. Its frames stay loaded, in no roll,
+        on their shared edits."""
+        self.session.save_active_edit()
+        for asset in self.state.uploaded_files:
+            if asset.get("hash"):
+                asset["hash"] = rolls.unforked_hash(asset["hash"])
+        self.state.active_roll_id = None
+        self._announce_roll_modes(None)
+        self.session.persist_session()
+        self.session.asset_model.refresh()
+        if self.state.current_file_hash:
+            self._reselect_active_frame()
+        self.config_updated.emit()
 
     def open_library_folder(self, folder: str, add_to_session: bool = False) -> None:
         self.open_library_folders([folder], add_to_session=add_to_session)
@@ -2061,10 +2129,17 @@ class AppController(QObject):
             if folder_roll_missing(self.session.repo, roll_id):
                 self.roll_folder_missing.emit(roll_id)
                 return
+            # Opening the folder by hand shows a roll a Discovery Filter hides; Refresh hides it again.
+            if rolls.is_hidden(self.session.repo, roll_id):
+                rolls.recognize_folder(self.session.repo, entry["folder_path"])
+                self.library_cleared.emit()
             paths = [entry["folder_path"]]
             self._extras_notice = roll_id if self._unnoticed_extras(roll_id, entry) else None
         else:
             paths = list(entry.get("member_paths", []))
+            if paths and len(missing_member_folders(entry)) == len(member_folders(entry)):
+                self.roll_folder_missing.emit(roll_id)
+                return
         if not paths:
             self.set_status(tr("This roll has no frames"), 3000)
             return
@@ -2136,6 +2211,13 @@ class AppController(QObject):
         existing = rolls.folder_roll_id_for_path(self.session.repo, folder)
         if existing:
             name = (rolls.roll_for_id(self.session.repo, existing) or {}).get("name") or folder
+            if rolls.is_hidden(self.session.repo, existing):
+                return (
+                    "blocked",
+                    tr("“{name}” is a folder roll that Discovery Filters hide. Open its folder to show it.", name=name),
+                    None,
+                    [],
+                )
             return "blocked", tr("“{name}” is already a folder roll, so open it from the Library.", name=name), None, []
         return "ready", "", folder, missing
 
@@ -2228,8 +2310,6 @@ class AppController(QObject):
             if new_path is None:
                 return False
             if old_path:
-                from negpy.services.assets.rehome import rehome_path_prefix
-
                 rehome_path_prefix(self.session.repo, old_path, new_path)
             if old_path and roll_id == self.state.active_roll_id:
                 self.session.rehome_folder_paths(old_path, new_path)
@@ -2248,6 +2328,13 @@ class AppController(QObject):
         else:
             self.open_roll(roll_id)
         return ""
+
+    def relink_member_folders(self, roll_id: str, moves: list[tuple[str, str]]) -> None:
+        """Repoint a virtual roll's frames from each gone folder to the folder the user located, then open the roll."""
+        # Deepest first: a move of a parent folder also carries every folder under it.
+        for old_folder, new_folder in sorted(moves, key=lambda move: len(move[0]), reverse=True):
+            rehome_path_prefix(self.session.repo, old_folder, new_folder)
+        self.open_roll(roll_id)
 
     def invalidate_library_walk(self) -> None:
         """Drop the cached traversal so the next search re-reads the folders."""
@@ -4867,9 +4954,9 @@ class AppController(QObject):
         )
         return True
 
-    def _waits_for_auto_crop(self, asset: dict) -> bool:
+    def _waits_for_auto_crop(self, asset: dict, config: Optional[WorkspaceConfig] = None) -> bool:
         """Auto Crop is on, and no crop was found under the current settings (_resolve_armed_autocrop)."""
-        geometry = self._config_for_batch_asset(asset).geometry
+        geometry = (config or self._config_for_batch_asset(asset)).geometry
         found = geometry.crop_rect is not None and geometry.crop_detect_key == autocrop_detection_key(geometry)
         return geometry.crop_from_auto and geometry.autocrop_mode == AutocropMode.IMAGE and not found
 
@@ -6205,18 +6292,20 @@ class AppController(QObject):
         stays until Roll or Scene Analysis runs. A slide never prints on an average, so the run
         leaves slide frames out."""
         roll_id = self.state.active_roll_id
-        if roll_id is None or self._active_batch is not None or self._background_baseline is not None:
+        if roll_id is None or not self.state.auto_roll_average or self._active_batch is not None or self._background_baseline is not None:
             return
         repo = self.session.repo
         for scene_id in [None, *(sid for sid, _entry in rolls.roll_scenes(repo, roll_id))]:
-            targets = [f for f in self._normalization_targets(scene_id) if not self._waits_for_auto_crop(f)]
-            configs = {f["hash"]: self._config_for_batch_asset(f) for f in targets}
-            frames = [f for f in targets if render_path(configs[f["hash"]].process) is RenderPath.PRINT]
+            candidates = self._normalization_targets(scene_id)
+            configs = {f["hash"]: self._config_for_batch_asset(f) for f in candidates}
+            seen = {f["hash"]: self._baseline_inputs(f, configs[f["hash"]]) for f in candidates}
+            self._baseline_seen.update(seen)
+            frames = [f for f in candidates if not seen[f["hash"]][1] and seen[f["hash"]][0] is RenderPath.PRINT]
             hashes = tuple(f["hash"] for f in frames)
             saved = rolls.scene_normalization(repo, roll_id, scene_id) if scene_id else rolls.roll_normalization(repo, roll_id)
             if len(frames) < 2 or (saved and saved["frames"] is None):
                 continue
-            inputs = {h: meter_inputs_key(configs[h]) for h in hashes}
+            inputs = {h: seen[h][2] for h in hashes}
             if not saved or not set(hashes) <= set(saved["frames"]) or self._inputs_changed(saved, inputs):
                 break
         else:
@@ -6232,6 +6321,29 @@ class AppController(QObject):
             )
         )
         self.config_updated.emit()
+
+    def _baseline_inputs(self, asset: dict, config: WorkspaceConfig) -> tuple:
+        """What the background check reads from a frame: render path, whether it waits for Auto Crop, meter inputs."""
+        return render_path(config.process), self._waits_for_auto_crop(asset, config=config), meter_inputs_key(config)
+
+    def _schedule_baseline_after_edit(self) -> None:
+        """Schedules the background check when an edit can have moved a frame it reads: the open or
+        a written frame's inputs differ from the last check's, or a setting hydration reads changed.
+        The sticky snapshot copies the open frame, and only Restore Session reads the session_* keys."""
+        repo = self.session.repo
+        edits = set(repo.take_edit_writes())
+        settings = {k for k in repo.take_setting_writes() if k != STICKY_CONFIG_KEY and not k.startswith("session_")}
+        if "*" in edits or settings:
+            self._background_baseline_timer.start()
+            return
+        edits.add(self.state.current_file_hash or "")
+        frames = (f for f in self.state.uploaded_files if f.get("hash") in edits)
+        if any(self._baseline_seen.get(f["hash"]) != self._baseline_inputs(f, self._config_for_batch_asset(f)) for f in frames):
+            self._background_baseline_timer.start()
+
+    def _on_auto_roll_average_changed(self, on: bool) -> None:
+        if on:
+            self._background_baseline_timer.start()
 
     def _meter_inputs(self, frames: List[dict]) -> Dict[str, str]:
         return {f["hash"]: meter_inputs_key(self._config_for_batch_asset(f)) for f in frames}
@@ -6501,6 +6613,29 @@ class AppController(QObject):
         self.set_status(tr("Reset {value} to defaults", value=count_of(len(visible), "frame")), timeout=3000)
         self.request_render()
 
+    def reset_open_roll(self) -> None:
+        """Reset Roll: the open roll loses its own values, card locks, baseline, film base and
+        scenes, and every loaded frame resets, as one batch for undo_last_batch."""
+        if self._roll_needed(tr("Open a roll to reset it.")) or self._batch_busy(tr("Reset Roll")):
+            return
+        roll_id = self.state.active_roll_id
+        frames = list(self.state.uploaded_files)
+        with self.session.recording_batch(tr("Reset Roll")) as batch:
+            # Before the frames: a frame's reset starts from the roll's values.
+            dropped = rolls.reset_roll_settings(self.session.repo, roll_id)
+            self.session.reset_roll(frames)
+            batch.roll_undo = lambda: self._roll_settings_replaced(roll_id, restore=dropped)
+        self._roll_settings_replaced(roll_id)
+        self.set_status(tr("Reset the roll and {value}", value=count_of(len(frames), "frame")), timeout=3000)
+        self.request_render()
+
+    def _roll_settings_replaced(self, roll_id: str, restore: Optional[dict] = None) -> None:
+        if restore is not None:
+            rolls.restore_roll_settings(self.session.repo, roll_id, restore)
+        if roll_id == self.state.active_roll_id:
+            self.session.refresh_scene_marks()
+            self._roll_defaults_changed(roll_id, set(rolls.ROLL_DEFAULT_FIELDS))
+
     def set_roll_baseline_from_frame(self, roll_id: str) -> None:
         """Save the active frame's own measurement as the roll's baseline, then push it out the
         way a Roll Analysis result is pushed. Its own, not what it renders: a frame on the
@@ -6654,16 +6789,25 @@ class AppController(QObject):
     def roll_card_locked(self, card_key: str) -> bool:
         return card_key in self.locked_roll_cards()
 
-    def roll_crossover_table(self) -> Optional[tuple]:
-        """The crossover table the active frame's roll holds, None with no roll or no table."""
+    def _open_frame_roll(self) -> Optional[str]:
+        """The roll the open frame takes its defaults from, None with no frame or no roll."""
         if not self.state.current_file_hash:
             return None
         idx = self.state.selected_file_idx
         files = self.state.uploaded_files
         asset = files[idx] if 0 <= idx < len(files) else {}
-        roll_id = rolls.frame_roll(self.session.repo, self.state.active_roll_id, asset)
+        return rolls.frame_roll(self.session.repo, self.state.active_roll_id, asset)
+
+    def roll_crossover_table(self) -> Optional[tuple]:
+        """The crossover table the active frame's roll holds, None with no roll or no table."""
+        roll_id = self._open_frame_roll()
         table = None if roll_id is None else rolls.roll_defaults(self.session.repo, roll_id).get("fade_crossover_table")
         return None if table is None else tuple(table)
+
+    def roll_crossover_source(self) -> str:
+        """The frame Share Crossover took the roll's crossover table from, "" when none or since replaced."""
+        roll_id = self._open_frame_roll()
+        return "" if roll_id is None else rolls.roll_crossover_source(self.session.repo, roll_id, self.roll_crossover_table())
 
     def diverged_roll_cards(self) -> List[str]:
         """Every Roll-tab card locked away from the roll on the active frame -- what
@@ -6741,15 +6885,12 @@ class AppController(QObject):
         self._lock_roll_card("film", before)
 
     def set_roll_default(self, card_key: str, persist: bool = True, readback_metrics: bool = True, **changes) -> None:
-        """Edits *card_key* for the active frame alone, same as any other control --
-        marking it locked away from the roll the instant it changes and was not
-        already, since the frame no longer matches whatever the roll currently says.
-        The card's own Roll button (apply_roll_card) is the only thing that pushes a
-        value back out; editing alone never does, here or on an already-locked card.
+        """Edits *card_key* for the active frame alone. A saved edit locks the card while
+        the frame differs from the roll and unlocks it when the frame matches it again
+        (rolls.settle_card_lock). Only the card's Roll button pushes the value to the roll.
 
-        persist=False (a slider mid-drag) previews on the active frame only, same as
-        any other live preview -- the lock only follows the settled value, not every
-        intermediate tick.
+        persist=False (a slider mid-drag) previews on the active frame only; the lock
+        follows the saved value, not each intermediate tick.
         """
         before = self.state.config
         self._edit_card(card_key, rolls.ROLL_DEFAULT_FIELDS[card_key][0], persist, readback_metrics, changes)
@@ -6799,24 +6940,52 @@ class AppController(QObject):
         names = {name for card in pushed for name in rolls.card_fields(card)}
         snapshot = rolls.roll_fields_snapshot(repo, roll_id, names)
         baselines = {card: rolls.frame_baseline(repo, roll_id, frame_hash, card) for card in pushed}
+        film_before = self._film_followers(roll_id) if "film" in pushed else {}
         with self.session.recording_batch(tr("Apply to Roll")) as batch:
             for card_key in pushed:
                 rolls.set_roll_defaults(repo, roll_id, **self._card_values(self.state.config, card_key))
                 rolls.set_frame_override(repo, roll_id, frame_hash, card_key, False)
+            self._restore_chroma_leaving_mono(film_before)
             batch.roll_undo = lambda: self._restore_roll_push(roll_id, frame_hash, baselines, snapshot)
         self._roll_defaults_changed(roll_id, set(pushed))
-        message = tr("Applied to the roll: {value}", value=self._roll_card_names(pushed))
-        own = self._frames_keeping_own(roll_id, set(pushed))
-        if own:
-            message = tr("{message}. Frames that keep their own value: {count}", message=message, count=own)
-        self.set_status(message, 5000 if own else 3000)
+        self._report_roll_push(roll_id, set(pushed), self._roll_card_names(pushed))
         return len(set(pushed))
+
+    def _film_followers(self, roll_id: str) -> Dict[str, tuple]:
+        """hash -> (asset, effective config) for every loaded frame but the open one that follows *roll_id*'s film card."""
+        repo, current = self.session.repo, self.state.current_file_hash
+        return {
+            f["hash"]: (f, self.session.config_for_asset(f))
+            for f in self.state.uploaded_files
+            if f["hash"] != current and "film" not in rolls.frame_override_cards(repo, roll_id, rolls.unforked_hash(f["hash"]))
+        }
+
+    def _restore_chroma_leaving_mono(self, before: Dict[str, tuple]) -> None:
+        """chroma_for_mono on each frame a Film Mode push takes out of black and white. The push
+        changes only the roll's default, so with_process_mode never runs on these frames.
+        _roll_defaults_changed flags them for a new thumbnail."""
+        for file_hash, (asset, was) in before.items():
+            now = self.session.config_for_asset(asset)
+            saturation = chroma_for_mono(is_mono(was.process), is_mono(now.process), now.lab.saturation)
+            if saturation == now.lab.saturation:
+                continue
+            saved = self.session.repo.load_file_settings(file_hash) or now
+            updated = replace(saved, lab=replace(saved.lab, saturation=saturation))
+            self.session.push_external_history(file_hash, saved, updated)
+            self.session.repo.save_file_settings(file_hash, updated, file_path=asset["path"])
 
     def _frames_keeping_own(self, roll_id: str, cards: set) -> int:
         """Loaded frames locked on any of *cards*: a push to the roll does not reach them."""
         entry = rolls.roll_for_id(self.session.repo, roll_id) or {}
         overrides = entry.get("frame_overrides", {})
         return sum(1 for f in self.state.uploaded_files if cards & set(overrides.get(rolls.unforked_hash(f["hash"]), ())))
+
+    def _report_roll_push(self, roll_id: str, cards: set, names: str) -> None:
+        message = tr("Applied to the roll: {value}", value=names)
+        own = self._frames_keeping_own(roll_id, cards)
+        if own:
+            message = tr("{message}. Frames that keep their own value: {count}", message=message, count=own)
+        self.set_status(message, 5000 if own else 3000)
 
     def _restore_roll_push(self, roll_id: str, frame_hash: str, baselines: dict, snapshot: dict) -> None:
         """Gives the roll back the values a push replaced; the frame that pushed keeps its own again.
@@ -6876,6 +7045,138 @@ class AppController(QObject):
         self.config_updated.emit()
         if changed_hashes:
             self.session.frames_edited_offscreen.emit(changed_hashes)
+
+    def _fade_roll_frames(self) -> List[dict]:
+        """The slides Estimate Roll reads: the selected frames when more than one is selected, else every
+        visible frame of the roll."""
+        state = self.state
+        picked = [state.uploaded_files[i] for i in state.selected_indices if 0 <= i < len(state.uploaded_files)]
+        frames = picked if len(picked) > 1 else [state.uploaded_files[i] for i in self.session.asset_model.visible_actual_indices_ordered()]
+        return [f for f in frames if self._is_slide(f)]
+
+    def _is_slide(self, asset: dict) -> bool:
+        return render_path(self._config_for_batch_asset(asset).process) is not RenderPath.PRINT
+
+    def estimate_fade_roll(self) -> None:
+        """Estimate Roll: reads each slide of the roll (or the selection), pools one set of fade values and
+        gives them to the roll."""
+        if self._roll_needed(tr("Open or save a roll to estimate it.")) or self._batch_busy(tr("Estimate Roll")):
+            return
+        conf = self.state.config.process
+        if render_path(conf) is RenderPath.PRINT:
+            return
+        frames = self._fade_roll_frames()
+        if len(frames) < ROLL_MIN_FRAMES:
+            self.fade_roll_hint.emit(tr("Estimate Roll needs at least three slides."), "", "")
+            return
+        if self._begin_batch("fade_roll", tr("Estimating the roll"), abortable=True) is None:
+            return
+        self._fade_roll_target = self.state.active_roll_id
+        self.fade_roll_requested.emit(
+            FadeRollTask(
+                frames=[(f, self._config_for_batch_asset(f)) for f in frames],
+                workspace_color_space=self.state.workspace_color_space,
+            )
+        )
+
+    def _on_fade_roll_progress(self, current: int, total: int, name: str) -> None:
+        self.set_status(tr("Estimating {current}/{total}: {name}…", current=current, total=total, name=name))
+        self.status_progress_requested.emit(current, total)
+        self.batch_progress.emit(current, total, name)
+
+    def _on_fade_roll_error(self, message: str) -> None:
+        self._on_batch_error("fade_roll")
+        self._report_worker_error(tr("Estimate Roll"), message)
+
+    def _on_fade_roll_finished(self, result: FadeRollResult) -> None:
+        # The result belongs to the roll it was read from.
+        if self._fade_roll_target != self.state.active_roll_id:
+            self._on_batch_cancelled("fade_roll")
+            return
+        self._end_batch("fade_roll")
+        if not result.changes:
+            self.fade_roll_hint.emit(result.reason, "", "")
+            return
+        hint = tr("Estimated from {counted} of {read} slides.", counted=result.counted, read=result.read + len(result.unread))
+        details = []
+        if result.outliers:
+            hint += " " + tr("Left out: {count}.", count=len(result.outliers))
+            details.append(tr("Left out: {names}.", names=", ".join(result.outliers)))
+        if result.no_grays:
+            hint += " " + tr("No clear grays: {count}.", count=len(result.no_grays))
+            details.append(tr("No clear grays: {names}.", names=", ".join(result.no_grays)))
+        if result.unread:
+            hint += " " + tr("Not read: {count}.", count=len(result.unread))
+            details.append(tr("Not read: {names}.", names=", ".join(result.unread)))
+        if result.changes.get("fade_auto_red"):
+            hint += " " + tr("Restore Range on.")
+        pick = result.crossover
+        suggestion = tr("Try the crossover from {name}.", name=pick.key) if pick is not None and pick.clear else ""
+        self._apply_fade_roll(dict(result.changes), hint, suggestion, "\n".join(details))
+
+    def roll_survivals(self) -> dict:
+        """The survivals and shift the open frame's roll holds, {} for the fields it has none of."""
+        roll_id = self._open_frame_roll()
+        defaults = {} if roll_id is None else rolls.roll_defaults(self.session.repo, roll_id)
+        names = ("fade_ratio_r", "fade_ratio_g", "fade_ratio_b", "fade_density_shift")
+        return {n: defaults[n] for n in names if n in defaults}
+
+    def share_crossover(self, table: tuple, space: str) -> None:
+        """Gives the open frame and the roll *table*, measured on this frame, at the frame's Crossover
+        strength. A frame locked on the Fade card keeps its own; one undo gives the roll its values back."""
+        roll_id = self._open_frame_roll()
+        conf = self.state.config.process
+        idx = self.state.selected_file_idx
+        if roll_id is None or not 0 <= idx < len(self.state.uploaded_files):
+            self.set_status(_NOTHING_TO_APPLY, 2500)
+            return
+        repo = self.session.repo
+        fields = {"fade_crossover_table": table, "fade_crossover": conf.fade_crossover, "fade_crossover_space": space}
+        undo = self._fade_roll_undo(roll_id, set(fields))
+        with self.session.recording_batch(tr("Share Crossover")) as batch:
+            rolls.set_roll_defaults(repo, roll_id, **fields)
+            rolls.set_roll_crossover_source(repo, roll_id, self.state.uploaded_files[idx].get("name", ""), table)
+            self.set_roll_default("fade", **fields)
+            batch.roll_undo = undo
+        self._roll_defaults_changed(roll_id, {"fade"})
+        self._report_roll_push(roll_id, {"fade"}, tr("Crossover"))
+
+    def _fade_roll_undo(self, roll_id: str, names: set, clear_hint: bool = False) -> Callable[[], None]:
+        """The undo of a write of the roll's *names* fields: the roll gets its values back. *clear_hint* also
+        takes the roll hint off the card."""
+        repo = self.session.repo
+        snapshot = rolls.roll_fields_snapshot(repo, roll_id, names)
+
+        def undo() -> None:
+            rolls.restore_roll_fields(repo, roll_id, snapshot)
+            self._roll_defaults_changed(roll_id, {"fade"})
+            if clear_hint:
+                self.fade_roll_hint.emit("", "", "")
+
+        return undo
+
+    def _apply_fade_roll(self, changes: dict, hint: str, suggestion: str = "", details: str = "") -> None:
+        """Gives the roll and every slide on it *changes*, and only those: a frame locked on the Fade card
+        takes them into its own edit, so its crossover and Gray Mix stay. One undo takes it all back."""
+        roll_id = self.state.active_roll_id
+        if roll_id is None:
+            return
+        repo = self.session.repo
+
+        current = self.state.current_file_hash
+        frames = [f for f in self.state.uploaded_files if rolls.frame_roll(repo, roll_id, f) == roll_id and self._is_slide(f)]
+        others = [f for f in frames if f.get("hash") != current]
+        undo = self._fade_roll_undo(roll_id, set(changes), clear_hint=True)
+        with self.session.recording_batch(tr("Estimate Roll")) as batch:
+            rolls.set_roll_defaults(repo, roll_id, **changes)
+            if len(others) < len(frames):
+                self.set_roll_default("fade", **changes)
+            written = self.session.write_frame_fields(others, "process", changes)
+            batch.roll_undo = undo
+        self._roll_defaults_changed(roll_id, {"fade"})
+        if written:
+            self.session.frames_edited_offscreen.emit(written)
+        self.fade_roll_hint.emit(hint, suggestion, details)
 
     def set_card_scope(self, card_key: Union[str, tuple], scope: str) -> None:
         """A Roll-tab card's scope pair: Roll gives the roll this frame's value for that
@@ -7822,6 +8123,20 @@ class AppController(QObject):
         name = (rolls.roll_for_id(self.session.repo, roll_id) or {}).get("name") or tr("this roll")
         self.set_status(tr("Restored {value} to “{name}”", value=count_of(count, "frame"), name=name), 3000)
 
+    def remove_missing_frames(self, roll_id: str) -> int:
+        """Take a virtual roll's frames whose files are gone out of the roll, with their locks,
+        scenes and forks in it. A gone file has no hash, so its saved rows give its hashes, halves and forks included;
+        a frame never edited or marked keeps no record to find."""
+        repo = self.session.repo
+        paths = gone_member_paths(rolls.roll_for_id(repo, roll_id))
+        if not paths:
+            return 0
+        hashes = list(dict.fromkeys(rolls.unforked_hash(h) for p in paths for h in repo.file_hashes_for_path(p)))
+        for from_hash in rolls.remove_members(repo, roll_id, paths, hashes):
+            repo.delete_file_settings(rolls.roll_edit_hash(from_hash, roll_id))
+        self.set_status(tr("Removed {value} from the roll", value=count_of(len(paths), "frame")), 3000)
+        return len(paths)
+
     def request_remove_from_roll(self, indices: List[int]) -> None:
         """Take the frames at *indices* out of the active roll and the Film Strip, with
         their locks, scenes and forks in that roll."""
@@ -8279,6 +8594,18 @@ class AppController(QObject):
         self.session.save_icc_prefs()
         self.config_updated.emit()
         self.request_render()
+
+    def gray_proof_profile(self) -> str:
+        """While a color frame previews through a gray profile: the proof profile's file name, or the
+        export color space it follows. Else "". The export profile carries to every file."""
+        if not self.proof_active() or is_mono(self.state.config.process):
+            return ""
+        icc = self.effective_proof_icc()
+        if not icc or not is_gray_profile(icc):
+            return ""
+        if self.state.proof_icc_path:
+            return os.path.splitext(os.path.basename(self.state.proof_icc_path))[0]
+        return self.state.config.export.export_color_space
 
     def proof_active(self) -> bool:
         """True when the preview should soft-proof: the toggle is on and an input or
@@ -9654,11 +9981,8 @@ class AppController(QObject):
         ]
         self._dispatch_preset_export(visible_files)
 
-    def _contact_sheet_output_dir(self, visible_files: list) -> Optional[str]:
-        """Resolve the contact sheet output folder (custom path or export destination rules)."""
-        custom = self.state.config.export.contact_sheet_output_path.strip()
-        if custom:
-            return custom
+    def _contact_sheet_default_dir(self, visible_files: list) -> Optional[str]:
+        """The export destination rules' folder, used when the sheet has no folder of its own."""
         export_path = self._ensure_valid_export_path()
         if export_path is None:
             return None
@@ -9678,8 +10002,10 @@ class AppController(QObject):
         visible_files = [self.state.uploaded_files[i] for i in self.session.asset_model.visible_actual_indices_ordered()]
         if not visible_files:
             return
-        out_dir = self._contact_sheet_output_dir(visible_files)
-        if not out_dir:
+        custom_dir = self.state.config.export.contact_sheet_output_path.strip()
+        # A sheet with its own folder never needs the export folder, which can prompt for a path.
+        default_dir = "" if custom_dir else self._contact_sheet_default_dir(visible_files)
+        if not custom_dir and not default_dir:
             return
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
@@ -9687,7 +10013,13 @@ class AppController(QObject):
         finally:
             QApplication.restoreOverrideCursor()
         generation = self.contact_sheet_preview.prepare(tuple(visible_files))
-        self._contact_sheet_pending = {"generation": generation, "assets": visible_files, "configs": configs, "out_dir": out_dir}
+        self._contact_sheet_pending = {
+            "generation": generation,
+            "assets": visible_files,
+            "configs": configs,
+            "custom_dir": custom_dir,
+            "default_dir": default_dir,
+        }
         self.set_status(tr("Reading capture dates…"), 0)
 
     def _on_contact_sheet_prepared(self, generation: int, facts: list) -> None:
@@ -9726,15 +10058,23 @@ class AppController(QObject):
             settings,
             lambda fmt: sheet_look(frames, fmt, label, library),
             label,
-            pending["out_dir"],
+            pending["custom_dir"],
             tiles=self.contact_sheet_preview,
             lane_busy=self._contact_sheet_lane_message,
             proof=proof,
             scene_proof=scene_proof,
             parent=QApplication.activeWindow(),
             repo=self.session.repo,
+            default_dir=pending["default_dir"],
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        folder = dialog.folder()
+        if folder != pending["custom_dir"]:
+            export = replace(self.state.config.export, contact_sheet_output_path=folder)
+            self.session.update_config(replace(self.state.config, export=export), persist=True)
+        out_dir = folder or pending["default_dir"] or self._contact_sheet_default_dir(pending["assets"])
+        if not out_dir:
             return
         settings = dialog.settings()
         self.session.repo.save_global_setting(self._CONTACT_SHEET_SETTINGS_KEY, settings.to_dict())
@@ -9746,7 +10086,7 @@ class AppController(QObject):
             frame_size=frame_size,
             settings=settings,
             look=dialog.look(),
-            out_dir=pending["out_dir"],
+            out_dir=out_dir,
             gpu_enabled=self.state.gpu_enabled,
             working_color_space=self.state.workspace_color_space,
             jpeg_quality=int(export_conf.jpeg_quality),
@@ -10428,7 +10768,8 @@ class AppController(QObject):
         elapsed = time.time() - self._export_start_time
         owner = self._active_batch if self._active_batch in ("export", "contact_sheet") else "export"
         self._end_batch(owner)
-        self.export_finished.emit(elapsed, list(self._export_errors))
+        folder, self._export_folder = self._export_folder, ""
+        self.export_finished.emit(elapsed, list(self._export_errors), folder)
         quit_pending, self._launch_quit_pending = self._launch_quit_pending, None
         if quit_pending is not None and owner == "export" and not self._export_errors:
             self.launch_export_done.emit(quit_pending)
@@ -10443,6 +10784,9 @@ class AppController(QObject):
             )
             self._contact_sheet_folder = ""
         self._update_thumbnail_from_state()
+
+    def _on_export_batch_written(self, folder: str) -> None:
+        self._export_folder = folder
 
     def _on_contact_sheet_written(self, folder: str) -> None:
         self._contact_sheet_folder = folder

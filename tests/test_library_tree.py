@@ -29,6 +29,7 @@ def _make(tmp_path) -> LibraryTree:
     controller.session.repo = repo
     controller.removed_frame_count.return_value = 0
     controller.save_choice.return_value = ("hidden", "")
+    controller.delete_rolls.side_effect = lambda roll_ids: [delete_roll(repo, roll_id) for roll_id in roll_ids]
     return LibraryTree(controller)
 
 
@@ -817,9 +818,13 @@ def test_a_roll_whose_folder_is_gone_is_marked_missing(widget, tmp_path):
 
 
 def _check_folders(widget) -> None:
+    """Run a disk check to the end, including the one a reload queued."""
     widget.check_folders()
-    QThreadPool.globalInstance().waitForDone()
-    QApplication.processEvents()
+    while True:
+        QThreadPool.globalInstance().waitForDone()
+        QApplication.processEvents()
+        if not widget._checking:
+            return
 
 
 def test_a_folder_renamed_while_running_is_marked_missing_in_place(widget, tree_dirs):
@@ -851,6 +856,7 @@ class _StubCheck:
 
 
 def _start_stub_check(widget, monkeypatch) -> _StubCheck:
+    _check_folders(widget)
     stubs = []
     monkeypatch.setattr("negpy.desktop.view.sidebar.library_tree._DiskCheck", lambda paths: stubs.append(_StubCheck(paths)) or stubs[-1])
     monkeypatch.setattr("negpy.desktop.view.sidebar.library_tree.QThreadPool.globalInstance", lambda: MagicMock())
@@ -1299,9 +1305,6 @@ def test_import_folder_declined_at_the_confirm_opens_nothing(widget, tree_dirs, 
     widget.controller.open_library_folder.assert_not_called()
 
 
-# --- dropping folders on the Library ------------------------------------------
-
-
 def test_one_dropped_folder_imports_like_the_menu(widget, tree_dirs, monkeypatch):
     calls = []
     monkeypatch.setattr(widget, "import_folder", lambda path: calls.append(path) or True)
@@ -1311,13 +1314,13 @@ def test_one_dropped_folder_imports_like_the_menu(widget, tree_dirs, monkeypatch
 
 
 def test_several_dropped_roll_folders_become_rolls_and_none_opens(widget, tree_dirs):
-    widget.controller.recognize_library_folders.side_effect = lambda folders: folders
+    widget.controller.recognize_library_folder.side_effect = lambda folder: folder
     changed = []
     widget.rolls_changed.connect(lambda: changed.append(True))
     folders = [str(tree_dirs / "roll_b"), str(tree_dirs / "roll_a")]
 
     assert widget.import_dropped(folders) is True
-    assert [c.args[0] for c in widget.controller.recognize_library_folders.call_args_list] == [[f] for f in sorted(folders)]
+    assert [c.args[0] for c in widget.controller.recognize_library_folder.call_args_list] == sorted(folders)
     widget.controller.import_subfolders_as_rolls.assert_not_called()
     widget.controller.open_library_folder.assert_not_called()
     assert changed == [True]
@@ -1336,7 +1339,7 @@ def _real_imports(widget):
     from negpy.services.assets import rolls
 
     widget.controller.import_subfolders_as_rolls.side_effect = lambda parent: rolls.import_subfolders_as_rolls(widget.repo, parent)
-    widget.controller.recognize_library_folders.side_effect = lambda folders: [recognize_folder(widget.repo, f) for f in folders]
+    widget.controller.recognize_library_folder.side_effect = lambda folder: recognize_folder(widget.repo, folder)
 
 
 @pytest.mark.parametrize("child_first", [False, True])
@@ -1470,7 +1473,6 @@ def test_a_drop_outside_the_library_stays_with_the_window(widget, tree_dirs, dro
 
 
 def test_a_dropped_parent_folder_makes_each_roll_folder_a_roll(widget, tree_dirs):
-    """End to end: the drop, the deferred import, the subfolder walk and the roll list."""
     from negpy.services.assets import rolls
 
     widget.controller.import_subfolders_as_rolls.side_effect = lambda parent: rolls.import_subfolders_as_rolls(widget.repo, parent)
@@ -1488,3 +1490,179 @@ def test_a_dropped_parent_folder_makes_each_roll_folder_a_roll(widget, tree_dirs
     widget.controller.open_library_folder.assert_not_called()
     widget.controller.set_status.assert_called_once()
     assert host.drops == []
+
+
+def test_a_virtual_roll_with_some_frames_gone_counts_them_and_one_with_all_gone_is_missing(widget, tree_dirs):
+    roll_a = tree_dirs / "roll_a"
+    create_virtual_roll(widget.repo, "picks", [str(roll_a / "a1.NEF"), str(tree_dirs / "roll_b" / "b1.NEF")])
+    widget.reload()
+    _check_folders(widget)
+    item = widget.tree.topLevelItem(0)
+    assert not item.data(0, _MISSING_ROLE) and _count(item) == "2 photos"
+
+    roll_a.rename(tree_dirs / "moved")
+    _check_folders(widget)
+
+    assert not item.data(0, _MISSING_ROLE)
+    assert item.data(0, _DETAIL_ROLE).startswith("2 photos · 1 missing")
+    assert "not on disk" in item.toolTip(0)
+
+    (tree_dirs / "roll_b").rename(tree_dirs / "moved_b")
+    _check_folders(widget)
+
+    assert item.data(0, _MISSING_ROLE) and item.data(0, _DETAIL_ROLE) == "files missing"
+
+
+def test_a_virtual_roll_is_not_looked_up_on_disk_while_the_tree_builds(widget, tree_dirs, monkeypatch):
+    create_virtual_roll(widget.repo, "picks", [str(tree_dirs / "gone" / "x.NEF")])
+    looked = []
+    monkeypatch.setattr("negpy.desktop.view.sidebar.library_tree._DiskCheck", lambda paths: looked.append(paths) or MagicMock())
+    monkeypatch.setattr("negpy.desktop.view.sidebar.library_tree.QThreadPool.globalInstance", lambda: MagicMock())
+    real_exists = __import__("os").path.exists
+    monkeypatch.setattr("os.path.exists", lambda p: (_ for _ in ()).throw(AssertionError(p)) if "gone" in str(p) else real_exists(p))
+
+    widget.reload()
+
+    assert looked and not widget.tree.topLevelItem(0).data(0, _MISSING_ROLE)
+
+
+def test_locate_repoints_a_virtual_rolls_gone_folder(widget, tree_dirs, monkeypatch):
+    roll_a = tree_dirs / "roll_a"
+    roll_id = create_virtual_roll(widget.repo, "picks", [str(roll_a / "a1.NEF")])
+    moved = tree_dirs / "moved"
+    roll_a.rename(moved)
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory", staticmethod(lambda *a, **k: str(moved)))
+
+    widget.locate_folder(roll_id)
+
+    widget.controller.relink_member_folders.assert_called_once_with(roll_id, [(str(roll_a), str(moved))])
+
+
+def test_locate_refuses_a_folder_without_the_virtual_rolls_frames(widget, tree_dirs, monkeypatch):
+    roll_a = tree_dirs / "roll_a"
+    roll_id = create_virtual_roll(widget.repo, "picks", [str(roll_a / "a1.NEF")])
+    roll_a.rename(tree_dirs / "moved")
+    picks = iter([str(tree_dirs / "roll_b"), ""])
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory", staticmethod(lambda *a, **k: next(picks)))
+    warnings = []
+    monkeypatch.setattr(QMessageBox, "warning", staticmethod(lambda *a, **k: warnings.append(a)))
+
+    widget.locate_folder(roll_id)
+
+    assert warnings
+    widget.controller.relink_member_folders.assert_not_called()
+
+
+def test_locate_takes_a_virtual_rolls_folders_in_any_order(widget, tree_dirs, monkeypatch):
+    roll_a, roll_b = tree_dirs / "roll_a", tree_dirs / "roll_b"
+    roll_id = create_virtual_roll(widget.repo, "picks", [str(roll_a / "a1.NEF"), str(roll_b / "b1.NEF")])
+    roll_a.rename(tree_dirs / "moved_a")
+    roll_b.rename(tree_dirs / "moved_b")
+    picks = iter([str(tree_dirs / "moved_b"), str(tree_dirs / "moved_a")])
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory", staticmethod(lambda *a, **k: next(picks)))
+
+    widget.locate_folder(roll_id)
+
+    widget.controller.relink_member_folders.assert_called_once_with(
+        roll_id, [(str(roll_b), str(tree_dirs / "moved_b")), (str(roll_a), str(tree_dirs / "moved_a"))]
+    )
+
+
+def _menu_texts(widget, monkeypatch, item) -> list[str]:
+    shown = []
+    monkeypatch.setattr(
+        "negpy.desktop.view.sidebar.library_tree.QMenu.exec", lambda menu, *a: shown.extend(a.text() for a in menu.actions())
+    )
+    widget.tree.setCurrentItem(item)
+    widget._show_context_menu(widget.tree.visualItemRect(item).center())
+    return shown
+
+
+def test_a_virtual_roll_with_gone_files_offers_remove_missing_frames(widget, tree_dirs, monkeypatch):
+    create_virtual_roll(widget.repo, "picks", [str(tree_dirs / "gone" / "x.NEF"), str(tree_dirs / "roll_b" / "b1.NEF")])
+    (tree_dirs / "roll_b" / "deleted.NEF").write_bytes(b"x")
+    widget.reload()
+    _check_folders(widget)
+    shown = _menu_texts(widget, monkeypatch, widget.tree.topLevelItem(0))
+    assert "Remove Missing Frames…" in shown and "Locate Folder…" in shown
+
+
+def test_a_deleted_file_in_a_present_folder_offers_only_remove_missing_frames(widget, tree_dirs, monkeypatch):
+    create_virtual_roll(widget.repo, "picks", [str(tree_dirs / "roll_b" / "deleted.NEF"), str(tree_dirs / "roll_b" / "b1.NEF")])
+    widget.reload()
+    _check_folders(widget)
+    item = widget.tree.topLevelItem(0)
+    shown = _menu_texts(widget, monkeypatch, item)
+    assert "Remove Missing Frames…" in shown and "Locate Folder…" not in shown
+    assert item.data(0, _DETAIL_ROLE).startswith("2 photos · 1 missing")
+
+
+def test_locate_refuses_a_folder_that_fits_two_missing_folders(widget, tree_dirs, monkeypatch):
+    names = ["Image (1).NEF", "Image (2).NEF"]
+    roll_id = create_virtual_roll(widget.repo, "picks", [str(tree_dirs / f / n) for f in ("Z_roll", "B_roll") for n in names])
+    other = tree_dirs / "other"
+    other.mkdir()
+    for n in names:
+        (other / n).write_bytes(b"x")
+    picks = iter([str(other), ""])
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory", staticmethod(lambda *a, **k: next(picks)))
+    warnings = []
+    monkeypatch.setattr(QMessageBox, "warning", staticmethod(lambda *a, **k: warnings.append(a[2])))
+
+    widget.locate_folder(roll_id)
+
+    assert warnings and "more than one" in warnings[0]
+    widget.controller.relink_member_folders.assert_not_called()
+
+
+def test_locate_finds_a_gone_subfolder_under_the_located_folder(widget, tree_dirs, monkeypatch):
+    old = tree_dirs / "S" / "2024"
+    roll_id = create_virtual_roll(widget.repo, "picks", [str(old / "a.NEF"), str(old / "rejects" / "r.NEF")])
+    new = tree_dirs / "A" / "2024"
+    (new / "rejects").mkdir(parents=True)
+    (new / "a.NEF").write_bytes(b"x")
+    (new / "rejects" / "r.NEF").write_bytes(b"x")
+    picks = iter([str(new)])
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory", staticmethod(lambda *a, **k: next(picks)))
+
+    widget.locate_folder(roll_id)
+
+    widget.controller.relink_member_folders.assert_called_once_with(
+        roll_id, [(str(old), str(new)), (str(old / "rejects"), str(new / "rejects"))]
+    )
+
+
+def test_locating_one_folder_relinks_the_sibling_folders_that_moved_with_it(widget, tree_dirs, monkeypatch):
+    names = ("roll_x", "roll_y", "roll_z")
+    roll_id = create_virtual_roll(widget.repo, "picks", [str(tree_dirs / "old" / n / f"{n}.NEF") for n in names])
+    for n in names:
+        (tree_dirs / "new" / n).mkdir(parents=True)
+        (tree_dirs / "new" / n / f"{n}.NEF").write_bytes(b"x")
+    picks = iter([str(tree_dirs / "new" / "roll_y")])
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory", staticmethod(lambda *a, **k: next(picks)))
+
+    widget.locate_folder(roll_id)
+
+    (called_id, moves), _ = widget.controller.relink_member_folders.call_args
+    assert called_id == roll_id
+    assert sorted(moves) == [(str(tree_dirs / "old" / n), str(tree_dirs / "new" / n)) for n in names]
+
+
+def test_deleting_a_folder_row_forgets_the_rolls_a_discovery_filter_hides(widget, tmp_path, monkeypatch):
+    from negpy.services.assets.rolls import all_rolls_sorted, import_sources, import_subfolders_as_rolls, prune_filtered_rolls
+    from negpy.services.assets.rolls import set_discovery_filters
+
+    for name in ("roll_a", "scratch/roll_b"):
+        (tmp_path / "scans" / name).mkdir(parents=True)
+        (tmp_path / "scans" / name / "1.tif").write_bytes(b"x")
+    import_subfolders_as_rolls(widget.repo, str(tmp_path / "scans"))
+    set_discovery_filters(widget.repo, ["scratch"])
+    prune_filtered_rolls(widget.repo)
+    widget.reload()
+    assert [e["name"] for _rid, e in all_rolls_sorted(widget.repo)] == ["scans/roll_a"]
+    monkeypatch.setattr("negpy.desktop.view.sidebar.library_tree.confirm_delete_named", lambda *a, **k: True)
+
+    widget._delete_folder(widget.tree.topLevelItem(0))
+
+    assert saved_rolls(widget.repo) == {}
+    assert import_sources(widget.repo) == []

@@ -293,6 +293,7 @@ class ExportWorker(QObject):
     # Advisory about files that were written; never counted as a failure.
     warning = pyqtSignal(str)
     contact_sheet_written = pyqtSignal(str)  # the folder the sheets went to
+    batch_written = pyqtSignal(str)  # the folder a finished batch wrote to, "" for several or none
 
     def __init__(self) -> None:
         super().__init__()
@@ -407,12 +408,18 @@ class ExportWorker(QObject):
                 _drain(pending.popleft())
             if border_crushed:
                 self.warning.emit(
-                    f"{border_crushed} of {len(tasks)} exports rendered almost black with no crop set: "
-                    "the bright scan border drives automatic levels. Crop or Auto Crop, then re-export."
+                    tr(
+                        "{count} of {total} exports rendered almost black with no crop set: "
+                        "the bright scan border drives automatic levels. Crop or Auto Crop, then re-export.",
+                        count=border_crushed,
+                        total=len(tasks),
+                    )
                 )
             if self._cancel.is_set():
                 self.cancelled.emit()
             else:
+                folders = {os.path.dirname(path) for path in self._written}
+                self.batch_written.emit(folders.pop() if len(folders) == 1 else "")
                 self.finished.emit()
         except Exception as e:
             self.error.emit(str(e))
@@ -483,7 +490,10 @@ class ExportWorker(QObject):
             self._written.add(path)
 
         if _export_target_is_a_source(path, task):
-            return f"Export skipped for {task.file_info['name']}: it would overwrite the source file. Change the filename pattern or destination."
+            return tr(
+                "Export skipped for {value}: it would overwrite the source file. Change the filename pattern or destination.",
+                value=task.file_info["name"],
+            )
 
         tmp_path = None
         try:

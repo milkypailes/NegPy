@@ -1033,20 +1033,51 @@ def test_a_filter_never_skips_the_picked_folder(tmp_path):
     assert import_subfolders_as_rolls(repo, str(picked)) != []
 
 
-def test_prune_filtered_rolls_drops_rolls_a_new_filter_catches_and_a_rescan_restores_them(tmp_path):
+def test_prune_filtered_rolls_hides_rolls_a_new_filter_catches_and_a_rescan_restores_them(tmp_path):
     _roll_dir(tmp_path / "roll_a")
     _roll_dir(tmp_path / "scratch" / "roll_b")
     repo = _repo()
     import_subfolders_as_rolls(repo, str(tmp_path))
-    assert len(saved_rolls(repo)) == 2
+    assert len(all_rolls_sorted(repo)) == 2
 
     set_discovery_filters(repo, ["scratch"])
     assert prune_filtered_rolls(repo) == 1
-    assert [e["folder_path"] for e in saved_rolls(repo).values()] == [str(tmp_path / "roll_a")]
+    assert prune_filtered_rolls(repo) == 0
+    assert [e["folder_path"] for _rid, e in all_rolls_sorted(repo)] == [str(tmp_path / "roll_a")]
 
     set_discovery_filters(repo, [])
     import_subfolders_as_rolls(repo, str(tmp_path), skip_dismissed=True)
-    assert len(saved_rolls(repo)) == 2
+    assert len(all_rolls_sorted(repo)) == 2
+
+
+def test_a_filtered_roll_comes_back_with_its_settings_and_forks(tmp_path):
+    folder = _roll_dir(tmp_path / "scratch" / "roll_b")
+    repo = _repo()
+    import_subfolders_as_rolls(repo, str(tmp_path))
+    roll_id = folder_roll_id_for_path(repo, str(folder))
+    set_roll_defaults(repo, roll_id, film_stock_id="hp5")
+    set_frame_override(repo, roll_id, "h1", "film", True)
+    fork_edit(repo, roll_id, "h1", str(folder / "a.tif"), MagicMock())
+
+    set_discovery_filters(repo, ["scratch"])
+    prune_filtered_rolls(repo)
+    assert all_rolls_sorted(repo) == []
+    set_discovery_filters(repo, [])
+    assert import_subfolders_as_rolls(repo, str(tmp_path), skip_dismissed=True) == [roll_id]
+
+    assert roll_defaults(repo, roll_id) == {"film_stock_id": "hp5"}
+    assert frame_override_cards(repo, roll_id, "h1") == {"film"}
+    assert is_forked(repo, roll_id, "h1")
+    assert "filtered" not in roll_for_id(repo, roll_id)
+
+
+def test_delete_roll_returns_the_edit_hashes_of_its_forks():
+    repo = _repo()
+    roll_id = create_virtual_roll(repo, "Picks", [])
+    fork_edit(repo, roll_id, "h1#1", "/a/1.tif", MagicMock())
+
+    assert delete_roll(repo, roll_id) == [roll_edit_hash("h1#1", roll_id)]
+    assert delete_roll(repo, roll_id) == []
 
 
 def test_prune_filtered_rolls_leaves_rolls_outside_import_sources(tmp_path):
@@ -1169,7 +1200,7 @@ def test_a_stored_camera_raw_roll_white_is_not_read():
     store = repo.get_global_setting(ROLLS_KEY)
     store[roll_id]["defaults"] = dict(fade_ratio_r=0.5, fade_white_r=-0.4, fade_white_g=-0.5, fade_white_b=-0.6, fade_white_space="abc123")
     repo.save_global_setting(ROLLS_KEY, store)
-    assert roll_defaults(repo, roll_id) == dict(fade_ratio_r=0.5)
+    assert roll_defaults(repo, roll_id) == dict(fade_ratio_r=0.5, fade_red_trim=1.0)
 
 
 def test_a_measured_camera_raw_frame_keeps_its_white_over_a_scanner_roll_white():
@@ -1213,3 +1244,17 @@ def test_a_baseline_follows_its_lock_through_a_replacement_a_copy_and_a_removal(
 
     remove_members(repo, source, ["/scans/1-merged.tif"], ["h1", "h2"])
     assert roll_for_id(repo, source)["frame_baselines"] == {}
+
+
+def test_a_roll_red_with_no_trim_reads_as_no_trim():
+    from negpy.services.assets.rolls import roll_defaults
+
+    repo = _repo()
+    roll_id = create_virtual_roll(repo, "Slides", ["/s/a.tif"])
+    set_roll_defaults(repo, roll_id, fade_ratio_r=0.6, fade_auto_red=True)
+    assert roll_defaults(repo, roll_id)["fade_red_trim"] == 1.0
+    set_roll_defaults(repo, roll_id, fade_red_trim=0.8)
+    assert roll_defaults(repo, roll_id)["fade_red_trim"] == 0.8
+    other = create_virtual_roll(repo, "Negatives", ["/n/a.tif"])
+    set_roll_defaults(repo, other, film_stock_id="portra400")
+    assert "fade_red_trim" not in roll_defaults(repo, other)

@@ -17,6 +17,7 @@ from negpy.desktop.view.styles.templates import (
 )
 from negpy.desktop.view.styles.theme import THEME, scene_color
 from negpy.kernel.system.text import count_of
+from negpy.desktop.view.widgets.fold import group_fold
 from negpy.desktop.view.widgets.searchable_gear_combo import SearchableGearCombo
 from negpy.services.assets import rolls
 
@@ -36,18 +37,8 @@ DETECT_SCENES_TOOLTIP = tr("Detect Scenes: find the groups of frames under anoth
 
 
 class RollAnalysisSidebar(BaseSidebar):
-    """
-    Which roll's Roll Analysis baseline this frame's Use Luma/Color Average axes
-    borrow: a searchable picker over every roll in your library, ticked once it has
-    one. Picking a roll loads its baseline immediately -- there is no separate Apply.
-    Reanalyze, beside the picker, runs Roll Analysis itself (the metering pass that
-    fills the tick in) -- the same action the Library's own "Roll Analysis" offers,
-    reachable here too since this is where you notice a roll has never been measured.
-    Use This Frame, beside it, writes the current frame's own bounds there instead, for
-    a roll that wants one chosen frame as its reference rather than an average. Both are
-    enabled only for the loaded roll, since both act on the files currently open, not on
-    whichever one this picker happens to show.
-    """
+    """The roll baseline this frame's Use Luma/Color Average axes read. Reanalyze and Use This
+    Frame act on the open files, so only the loaded roll enables them."""
 
     def _init_ui(self) -> None:
         # With no roll open the body grays out under one hint; the hint stays readable outside it.
@@ -66,12 +57,12 @@ class RollAnalysisSidebar(BaseSidebar):
         self.roll_combo.setToolTip(wrap_tooltip(tr("Picking a roll loads its saved baseline onto the loaded files.")))
         self.reanalyze_btn = self._labeled_action("fa5s.tachometer-alt", tr("Reanalyze"), BATCH_ANALYSIS_TOOLTIP)
         self.from_frame_btn = self._labeled_action("fa5s.crosshairs", tr("Use Frame"), FROM_FRAME_TOOLTIP)
-        self.layout.addLayout(header_actions(section_subheader(tr("ROLLS")), self.reanalyze_btn, self.from_frame_btn))
-        self.layout.addWidget(hint_label(tr("Roll Analysis first crops the frames that wait for Auto Crop."), "muted"))
-        self.layout.addWidget(self.roll_combo)
-
+        self.layout.addLayout(header_actions(section_subheader(tr("ROLL BASELINE")), self.reanalyze_btn, self.from_frame_btn))
         self.roll_status_hint = hint_label("", "muted")
         self.layout.addWidget(self.roll_status_hint)
+        other_row, self.other_roll_fold = group_fold("baseline_other_roll", tr("From Another Roll"), self.roll_combo)
+        self.layout.addLayout(other_row)
+        self.layout.addWidget(self.other_roll_fold)
 
         self.scenes_header = section_subheader(tr("SCENES"))
         self.detect_scenes_btn = self._labeled_action("mdi6.lightbulb-group-outline", tr("Detect"), DETECT_SCENES_TOOLTIP)
@@ -295,6 +286,7 @@ class RollAnalysisSidebar(BaseSidebar):
             self.roll_status_hint.setText(STALE_ROLL_HINT)
         else:
             self.roll_status_hint.setText("")
+        self.roll_status_hint.setVisible(bool(self.roll_status_hint.text()))
 
     def _update_reanalyze_btn(self, active_id: Optional[str], selected_id: str) -> None:
         """Both ways of filling a baseline write onto the loaded roll, same as the

@@ -27,7 +27,7 @@ def _with_trims(*names: str) -> set:
 TRANSFER = (
     {"density", "grade", "wb_cyan", "wb_magenta", "wb_yellow", "shadow_density", "highlight_density", "cast_removal_strength"}
     | {f"{zone}_{dye}" for zone in ("shadow", "highlight") for dye in ("cyan", "magenta", "yellow")}
-    | _with_trims("toe", "shoulder", "toe_width", "shoulder_width", "dye_separation")
+    | _with_trims("toe", "shoulder", "dye_separation")
     | {"separation_damping"}
     # Display-referred levels run after the output transform on every path, so they
     # move a slide exactly like a print.
@@ -97,8 +97,6 @@ def _moved(field: str, value):
         return value - 25.0 if "high" in field else value + 25.0
     if "grade" in field:
         return value + 15.0
-    if field in ("toe_width", "shoulder_width"):
-        return value + 1.5
     if field in ("preflash", "diffusion", "contrast_mask_strength"):
         return 0.8
     return value + 0.25

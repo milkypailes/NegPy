@@ -3,6 +3,7 @@ from dataclasses import replace
 
 from PyQt6.QtWidgets import QHBoxLayout
 
+from negpy.kernel.system.config import DEFAULT_WORKSPACE_CONFIG
 from negpy.desktop.view.sidebar.base import BaseSidebar
 from negpy.desktop.view.styles.templates import field_label, hint_label, wrap_tooltip
 from negpy.desktop.view.widgets.sliders import CompactSlider
@@ -19,12 +20,20 @@ class LensSidebar(BaseSidebar):
 
     def _init_ui(self) -> None:
         conf = self.state.config.geometry
+        default = DEFAULT_WORKSPACE_CONFIG.geometry
 
         self.distortion_slider = CompactSlider(
-            tr("Distortion Correction"), -0.10, 0.10, conf.distortion_k1, step=0.001, precision=1000, has_neutral=True
+            tr("Distortion Correction"),
+            -0.10,
+            0.10,
+            default.distortion_k1,
+            step=0.001,
+            precision=1000,
+            has_neutral=True,
         )
         # Nothing derives the readout's decimals from `precision`, so a 0.001 step needs both.
         self.distortion_slider.spin.setDecimals(3)
+        self.distortion_slider.setValue(conf.distortion_k1)
         self.distortion_slider.setToolTip(wrap_tooltip(tr("Straightens lines that bow out (positive) or in (negative).")))
 
         self.metadata_distortion_btn = self._labeled_toggle(
@@ -83,7 +92,7 @@ class LensSidebar(BaseSidebar):
             button.setChecked(enabled)
             button.setEnabled(available or enabled)
             button.edited_dot.set_active(enabled)
-        text = lens.description if lens.available else tr("Unavailable: {reason}", reason=lens.reason)
+        text = lens.description if lens.available else tr("Unavailable: {reason}", reason=tr(lens.reason))
         self.lens_hint.setText(text)
         self.lens_hint.setVisible(bool(text))
         self.distortion_slider.setEnabled(not config.geometry.lens_distortion_from_metadata)

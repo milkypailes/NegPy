@@ -97,7 +97,7 @@ def _fmt_source_encoding(values: tuple) -> str:
 
 def _fmt_print_stock(values: tuple) -> str:
     profile = PAPER_PROFILES.get(values[0])
-    return profile.label if profile else str(values[0])
+    return tr(profile.label) if profile else str(values[0])
 
 
 def _fmt_process(values: tuple) -> str:
@@ -275,13 +275,9 @@ CATALOG: list[tuple[str, tuple[SettingRow, ...]]] = [
         _row(mark("Snap"), "exposure", "midtone_gamma"),
         _row(mark("Snap Trim"), "exposure", "midtone_gamma_trim_red", "midtone_gamma_trim_green", "midtone_gamma_trim_blue", channels="RGB"),
         _row(mark("Toe"), "exposure", "toe"),
-        _row(mark("Toe Width"), "exposure", "toe_width"),
         _row(mark("Toe Trim"), "exposure", "toe_trim_red", "toe_trim_green", "toe_trim_blue", channels="RGB"),
-        _row(mark("Toe Width Trim"), "exposure", "toe_width_trim_red", "toe_width_trim_green", "toe_width_trim_blue", channels="RGB"),
         _row(mark("Shoulder"), "exposure", "shoulder"),
-        _row(mark("Shoulder Width"), "exposure", "shoulder_width"),
         _row(mark("Shoulder Trim"), "exposure", "shoulder_trim_red", "shoulder_trim_green", "shoulder_trim_blue", channels="RGB"),
-        _row(mark("Shoulder Width Trim"), "exposure", "shoulder_width_trim_red", "shoulder_width_trim_green", "shoulder_width_trim_blue", channels="RGB"),
         _row(mark("Dye Separation"), "exposure", "dye_separation"),
         _row(mark("Dye Separation Trim"), "exposure", "dye_separation_trim_red", "dye_separation_trim_green", "dye_separation_trim_blue", channels="RGB"),
         _row(mark("Separation Damping"), "exposure", "separation_damping"),
@@ -450,7 +446,7 @@ BOUNDS_INPUT_FIELDS = frozenset(
 
 # The Roll-tab card names a frame's locks are listed by.
 ROLL_CARD_LABELS = {
-    "film": tr("Film Mode"),
+    "film": tr("Setup"),
     "sensor": tr("Calibration"),
     "fade": tr("Fade Restoration"),
     "demosaic": tr("Raw Decode"),
@@ -640,21 +636,13 @@ PAPER_FIELDS = (
     "midtone_gamma_trim_green",
     "midtone_gamma_trim_blue",
     "toe",
-    "toe_width",
     "toe_trim_red",
     "toe_trim_green",
     "toe_trim_blue",
-    "toe_width_trim_red",
-    "toe_width_trim_green",
-    "toe_width_trim_blue",
     "shoulder",
-    "shoulder_width",
     "shoulder_trim_red",
     "shoulder_trim_green",
     "shoulder_trim_blue",
-    "shoulder_width_trim_red",
-    "shoulder_width_trim_green",
-    "shoulder_width_trim_blue",
     "dye_separation",
     "dye_separation_trim_red",
     "dye_separation_trim_green",
@@ -704,7 +692,7 @@ GLOBAL_TIER_SECTIONS: frozenset[str] = frozenset({"export", "metadata"})
 
 
 # Color controls a B&W frame hides; the render has no color for them to act on.
-_BW_UNUSED_LAB_FIELDS = frozenset({"saturation", "skin_protection", "chroma_denoise"})
+BW_UNUSED_LAB_FIELDS = frozenset({"saturation", "skin_protection", "chroma_denoise"})
 
 
 def unused_in_mode(section: str, field: str, cfg: WorkspaceConfig) -> bool:
@@ -713,7 +701,7 @@ def unused_in_mode(section: str, field: str, cfg: WorkspaceConfig) -> bool:
     mode = cfg.process.process_mode
     if section == "exposure" and field == "paper_profile":
         return effective_paper_profile(cfg.exposure.paper_profile, mode).kind == "default"
-    return section == "lab" and field in _BW_UNUSED_LAB_FIELDS and is_mono(cfg.process)
+    return section == "lab" and field in BW_UNUSED_LAB_FIELDS and is_mono(cfg.process)
 
 
 def _row_edited(row: SettingRow, cfg: WorkspaceConfig) -> bool:

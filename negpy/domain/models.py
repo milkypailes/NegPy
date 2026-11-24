@@ -26,6 +26,7 @@ from negpy.features.hdr.models import HdrConfig, hdr_active
 from negpy.features.stitch.models import StitchConfig
 from negpy.features.metadata.models import MetadataConfig
 from negpy.domain.migrations import migrate_export_fmt, migrate_flat_config
+from negpy.kernel.system.i18n import mark, tr
 from negpy.kernel.system.logging import get_logger
 import negpy.kernel.system.paths as paths
 
@@ -106,9 +107,9 @@ class ProofIntent(StrEnum):
 
 
 PROOF_INTENT_LABELS: dict[str, str] = {
-    ProofIntent.PERCEPTUAL.value: "Perceptual",
-    ProofIntent.RELATIVE_COLORIMETRIC.value: "Relative Colorimetric",
-    ProofIntent.SATURATION.value: "Saturation",
+    ProofIntent.PERCEPTUAL.value: mark("Perceptual"),
+    ProofIntent.RELATIVE_COLORIMETRIC.value: mark("Relative Colorimetric"),
+    ProofIntent.SATURATION.value: mark("Saturation"),
 }
 
 
@@ -327,7 +328,7 @@ class ExportPreset:
 def preset_display_name(preset: ExportPreset) -> str:
     """Preset list/checkbox label, flagging flat-master presets."""
     if preset.render_intent == RenderIntent.FLAT:
-        return f"{preset.name} (flat)"
+        return tr("{name} (flat)", name=preset.name)
     return preset.name
 
 
@@ -587,12 +588,6 @@ def flat_master_config(config: WorkspaceConfig) -> WorkspaceConfig:
         shoulder_trim_red=0.0,
         shoulder_trim_green=0.0,
         shoulder_trim_blue=0.0,
-        toe_width_trim_red=0.0,
-        toe_width_trim_green=0.0,
-        toe_width_trim_blue=0.0,
-        shoulder_width_trim_red=0.0,
-        shoulder_width_trim_green=0.0,
-        shoulder_width_trim_blue=0.0,
         grade_trim_red=0.0,
         grade_trim_green=0.0,
         grade_trim_blue=0.0,

@@ -37,7 +37,7 @@ from negpy.desktop.view.sidebar.pick_better_window import PickBetterWindow
 from negpy.desktop.view.sidebar.right_panel import RightPanel
 from negpy.desktop.view.sidebar.files import FileBrowser, table_color
 from negpy.desktop.view.update_notice import UpdateNotice
-from negpy.desktop.view.styles.templates import hint_label, labeled_action
+from negpy.desktop.view.styles.templates import choice_label, hint_label, labeled_action
 from negpy.desktop.view.styles.theme import THEME
 from negpy.desktop.view.widgets.collapsible import fit_pane
 from negpy.desktop.view.widgets.command_palette import CommandPalette, FindField
@@ -458,11 +458,12 @@ class MainWindow(QMainWindow):
 
     def show_library(self, ask_if_unset: bool = True) -> None:
         """Open the Library tab, offering an import when there is no roll yet."""
-        if ask_if_unset and not self.controller.has_rolls():
-            self.right_panel.library_tree.prompt_import_folder()
         if not self.drawer.isVisible():
             self.toggle_controls_dock()
         self.right_panel.show_tab_by_key("library")
+        # After the tab: a first import shows the Roll tab.
+        if ask_if_unset and not self.controller.has_rolls():
+            self.right_panel.library_tree.prompt_import_folder()
 
     def show_tutorial(self) -> None:
         from negpy.desktop.view.widgets.tutorial_steps import build
@@ -689,6 +690,8 @@ class MainWindow(QMainWindow):
         # An imported, renamed or deleted roll leaves the cached search walk describing a library
         # that no longer exists.
         library.rolls_changed.connect(self.controller.invalidate_library_walk)
+        # A new roll starts at Setup, which is on the Roll tab.
+        library.folder_roll_created.connect(lambda _path: self.right_panel.show_tab_by_key("roll"))
         self.controller.library_cleared.connect(library.reload)
         self.controller.library_cleared.connect(self.controller.invalidate_library_walk)
         # Found scenes are reviewed on the Light Table, where Scene sort shows each as one block.
@@ -970,8 +973,10 @@ class MainWindow(QMainWindow):
         st = self.state
         if not st.current_file_path:
             self.canvas.hud.set_zoom_note("")
+            self.canvas.hud.set_advisory("")
             self.canvas.hud.update_info("", "")
             return
+        self.canvas.hud.set_advisory(self._canvas_advisory())
         w, h = st.original_res
         proof = ""
         if st.soft_proof_enabled:
@@ -989,6 +994,13 @@ class MainWindow(QMainWindow):
         )
         self._on_zoom_info_changed(self.canvas.zoom_level)
 
+    def _canvas_advisory(self) -> str:
+        """A standing warning about a state that makes the whole preview misleading."""
+        gray = self.controller.gray_proof_profile()
+        if not gray:
+            return ""
+        return tr("Gray preview from the {value} profile. Choose another profile or turn off Proof on Screen.", value=choice_label(gray))
+
     def _on_zoom_info_changed(self, zoom: float) -> None:
         """The zoom readout: under the navigator while it is up, else at the strip's right end."""
         if not self.state.current_file_path:
@@ -1002,14 +1014,15 @@ class MainWindow(QMainWindow):
         full = self.state.canvas_info_level == INFO_FULL
         self.canvas.hud.set_zoom_note(" · ".join(s for s in (percent if full else "", note) if s))
 
-    def _on_export_finished(self, elapsed: float, errors: list) -> None:
+    def _on_export_finished(self, elapsed: float, errors: list, folder: str = "") -> None:
         self.canvas.hud.hide_progress()
-        msg = (
-            tr("Export complete in {value:.2f}s, {failed} failed", value=elapsed, failed=count_of(len(errors), "file"))
-            if errors
-            else tr("Export complete in {value:.2f}s", value=elapsed)
-        )
-        self.canvas.hud.showMessage(msg, timeout=6000 if errors else 3000, kind="warning" if errors else "info")
+        if errors:
+            msg = tr("Export complete in {value:.2f}s, {failed} failed", value=elapsed, failed=count_of(len(errors), "file"))
+        elif folder:
+            msg = tr("Exported to {folder} in {value:.2f}s", folder=folder, value=elapsed)
+        else:
+            msg = tr("Export complete in {value:.2f}s", value=elapsed)
+        self.canvas.hud.showMessage(msg, timeout=6000 if errors or folder else 3000, kind="warning" if errors else "info")
         if errors:
             # A toast holds one line and the next one replaces it; the box keeps every file.
             box = QMessageBox(

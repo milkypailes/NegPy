@@ -17,6 +17,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from negpy.kernel.system.config import DEFAULT_WORKSPACE_CONFIG
 from negpy.desktop.auto_sliders import grade_softest_reached, shown_values, stored_value
 from negpy.desktop.view.confirm import warn_targets_affect_unbaked
 from negpy.desktop.view.shortcut_registry import tooltip_with_shortcut
@@ -108,6 +109,7 @@ class ToneSidebar(BaseSidebar):
 
     def _init_ui(self) -> None:
         conf = self.state.config.exposure
+        default = DEFAULT_WORKSPACE_CONFIG.exposure
 
         self.density_slider = CompactSlider(tr("Print Density"), 0.0, 2.0, conf.density)
         # Travel matches the kernel's grade clamp, so the slider never offers a grade it would clip.
@@ -193,31 +195,29 @@ class ToneSidebar(BaseSidebar):
         grade_row = QVBoxLayout()
         grade_row.addWidget(self.grade_slider)
         grade_row.addWidget(self.grade_trim_slider)
-        self.grade_softest_hint = hint_label(tr("Flat negative: this is the softest Grade it can print."), kind="warning")
-        self.grade_softest_hint.setToolTip(
-            wrap_tooltip(tr("This negative has so little contrast that a softer Grade prints the same as this one."))
-        )
-        self.grade_softest_hint.setVisible(False)
-        grade_row.addWidget(self.grade_softest_hint)
         self.layout.addLayout(grade_row)
 
-        self.shadow_grade_slider = CompactSlider(tr("Shadows Grade"), -50.0, 50.0, conf.shadow_grade, step=1.0, inverted=True, unit=" R")
+        self.shadow_grade_slider = CompactSlider(
+            tr("Shadows Grade"), -50.0, 50.0, default.shadow_grade, value=conf.shadow_grade, step=1.0, inverted=True, unit=" R"
+        )
         self.highlight_grade_slider = CompactSlider(
-            tr("Highlights Grade"), -50.0, 50.0, conf.highlight_grade, step=1.0, inverted=True, unit=" R"
+            tr("Highlights Grade"), -50.0, 50.0, default.highlight_grade, value=conf.highlight_grade, step=1.0, inverted=True, unit=" R"
         )
         self.split_grade_fold = rail_fold("tone_split_grade", self.grade_slider, self.shadow_grade_slider, self.highlight_grade_slider)
         self.split_grade_fold.attach(self.grade_trim_slider)
         self.layout.addWidget(self.split_grade_fold)
 
-        self.contrast_mask_slider = CompactSlider(tr("Contrast Mask"), 0.0, 1.0, conf.contrast_mask_strength)
+        self.contrast_mask_slider = CompactSlider(
+            tr("Contrast Mask"), 0.0, 1.0, default.contrast_mask_strength, value=conf.contrast_mask_strength
+        )
         self.contrast_mask_slider.setToolTip(
             tr(
                 "Contrast Mask: a soft darkroom mask that opens up large dark areas and holds back large bright ones, modeled on the Fujifilm Frontier's digital interpretation."
             )
         )
         # Light given to the paper, not the shape of its curve, so it sits with the exposure controls.
-        self.preflash_slider = CompactSlider(tr("Preflash"), 0.0, 1.0, conf.preflash)
-        self.diffusion_slider = CompactSlider(tr("Diffusion"), 0.0, 1.0, conf.diffusion)
+        self.preflash_slider = CompactSlider(tr("Preflash"), 0.0, 1.0, default.preflash, value=conf.preflash)
+        self.diffusion_slider = CompactSlider(tr("Diffusion"), 0.0, 1.0, default.diffusion, value=conf.diffusion)
         self.diffusion_slider.setToolTip(tr("Diffusion: a soft glow that spreads dark areas into bright ones and softens edges, off at 0."))
         aids_header, self.aids_fold = group_fold(
             "tone_aids", tr("Printing Aids"), self.preflash_slider, self.diffusion_slider, self.contrast_mask_slider
@@ -683,7 +683,8 @@ class ToneSidebar(BaseSidebar):
             slider.set_default(default)
             slider.setValue(shown.get(field, getattr(config.exposure, field)))
             slider.blockSignals(False)
-        self.grade_softest_hint.setVisible(self._channel_index() == 0 and grade_softest_reached(config, meters))
+        softest = self._channel_index() == 0 and grade_softest_reached(config, meters)
+        self.grade_slider.set_advisory(tr("Flat negative: this is the softest Grade it can print.") if softest else "")
 
     def _set_driven(self, field: str, value: float, persist: bool) -> None:
         # A value at the slider's default is a reset: back to the neutral offset exactly.

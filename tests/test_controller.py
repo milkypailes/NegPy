@@ -1505,6 +1505,123 @@ class TestAppController(unittest.TestCase):
 
         self.assertEqual(rolls.frame_override_cards(repo, roll_id, "h1"), set())
 
+    def _slide_roll(self, count: int = 4) -> str:
+        """An open roll of *count* slides, h1 open, and one negative."""
+        from negpy.services.assets import rolls
+
+        self._wire_repo_store()
+        session = self.mock_session_manager
+        state = session.state
+        files = [{"name": f"s{i}.tif", "path": f"/r/s{i}.tif", "hash": f"h{i}"} for i in range(1, count + 1)]
+        files.append({"name": "neg.tif", "path": "/r/neg.tif", "hash": "neg"})
+        roll_id = rolls.create_virtual_roll(session.repo, "Slides", [f["path"] for f in files])
+        state.active_roll_id = roll_id
+        state.uploaded_files = files
+        state.current_file_hash = "h1"
+        state.selected_file_idx = 0
+        state.selected_indices = [0]
+        state.config = _slide_config(WorkspaceConfig())
+        session.asset_model.visible_actual_indices_ordered.return_value = list(range(len(files)))
+        session.config_for_asset.side_effect = lambda f: WorkspaceConfig() if f["hash"] == "neg" else state.config
+        session.write_frame_fields.return_value = []
+        return roll_id
+
+    def test_estimate_roll_reads_the_slides_of_the_roll_and_no_negative(self):
+        self._slide_roll()
+        self.controller.fade_roll_requested.disconnect(self.controller.fade_roll_worker.process)
+        tasks = []
+        self.controller.fade_roll_requested.connect(tasks.append)
+
+        self.controller.estimate_fade_roll()
+
+        self.assertEqual([info["hash"] for info, _ in tasks[0].frames], ["h1", "h2", "h3", "h4"])
+        self.assertEqual(self.controller._active_batch, "fade_roll")
+        self.controller._on_batch_cancelled("fade_roll")
+
+    def test_estimate_roll_with_under_three_slides_says_so_and_starts_nothing(self):
+        self._slide_roll(count=2)
+        hints = []
+        self.controller.fade_roll_hint.connect(lambda *args: hints.append(args))
+
+        self.controller.estimate_fade_roll()
+
+        self.assertTrue(hints and hints[0][0])
+        self.assertIsNone(self.controller._active_batch)
+
+    def test_estimate_roll_gives_the_roll_its_values_and_no_crossover(self):
+        from negpy.desktop.workers.fade_roll import FadeRollResult
+        from negpy.features.process.fade_roll import CrossoverPick
+        from negpy.services.assets import rolls
+
+        roll_id = self._slide_roll()
+        repo = self.controller.session.repo
+        changes = dict(
+            fade_ratio_r=0.8, fade_ratio_g=0.9, fade_ratio_b=0.7, fade_density_shift=0.0, fade_auto_red=False, fade_white_anchor=False
+        )
+        hints = []
+        self.controller.fade_roll_hint.connect(lambda *args: hints.append(args))
+        self.controller._active_batch = "fade_roll"
+        self.controller._fade_roll_target = roll_id
+
+        self.controller._on_fade_roll_finished(
+            FadeRollResult(
+                changes=changes,
+                read=4,
+                counted=3,
+                outliers=["s4.tif"],
+                unread=["s5.tif"],
+                crossover=CrossoverPick("s2.tif", True),
+            )
+        )
+
+        defaults = rolls.roll_defaults(repo, roll_id)
+        self.assertEqual({k: defaults[k] for k in changes}, changes)
+        self.assertNotIn("fade_crossover_table", defaults)
+        others, section, written = self.mock_session_manager.write_frame_fields.call_args.args
+        self.assertEqual(([f["hash"] for f in others], section, written), (["h2", "h3", "h4"], "process", changes))
+        text, suggestion, details = hints[0]
+        self.assertIn("3 of 5", text)
+        self.assertIn("s2.tif", suggestion)
+        self.assertIn("s4.tif", details)
+        self.assertIn("s5.tif", details)
+        self.assertEqual(
+            self.controller.roll_survivals(), {k: v for k, v in changes.items() if k.startswith(("fade_ratio", "fade_density"))}
+        )
+
+    def test_estimate_roll_that_ends_on_another_roll_writes_nothing(self):
+        from negpy.desktop.workers.fade_roll import FadeRollResult
+        from negpy.services.assets import rolls
+
+        roll_id = self._slide_roll()
+        repo = self.controller.session.repo
+        other = rolls.create_virtual_roll(repo, "Other", [])
+        self.controller._active_batch = "fade_roll"
+        self.controller._fade_roll_target = roll_id
+        self.mock_session_manager.state.active_roll_id = other
+
+        self.controller._on_fade_roll_finished(FadeRollResult(changes={"fade_ratio_g": 0.9}, read=4, counted=4))
+
+        self.assertNotIn("fade_ratio_g", rolls.roll_defaults(repo, roll_id))
+        self.assertNotIn("fade_ratio_g", rolls.roll_defaults(repo, other))
+        self.assertIsNone(self.controller._active_batch)
+        self.mock_session_manager.write_frame_fields.assert_not_called()
+
+    def test_share_crossover_gives_the_roll_the_table_and_names_its_frame(self):
+        from negpy.services.assets import rolls
+
+        roll_id = self._slide_roll()
+        repo = self.controller.session.repo
+        state = self.mock_session_manager.state
+        state.config = replace(state.config, process=replace(state.config.process, fade_crossover=0.6))
+        table = tuple(0.01 * i for i in range(16))
+
+        self.controller.share_crossover(table, "space")
+
+        defaults = rolls.roll_defaults(repo, roll_id)
+        self.assertEqual(tuple(defaults["fade_crossover_table"]), table)
+        self.assertEqual((defaults["fade_crossover"], defaults["fade_crossover_space"]), (0.6, "space"))
+        self.assertEqual(self.controller.roll_crossover_source(), "s1.tif")
+
     def test_set_roll_default_matches_a_tuple_the_store_read_back_as_a_list(self):
         """The roll store is JSON, so crosstalk_matrix comes back as a list. Picking the roll's
         own crosstalk matrix again must still read as matching the roll."""
@@ -1869,6 +1986,38 @@ class TestAppController(unittest.TestCase):
         session._batch = None
         session.last_batch = None
         session.recording_batch = types.MethodType(DesktopSessionManager.recording_batch, session)
+
+    def test_a_film_push_out_of_bw_restores_chroma_on_the_roll(self):
+        from negpy.features.process.models import ProcessMode, with_process_mode
+        from negpy.services.assets import rolls
+
+        self._wire_repo_store()
+        repo = self.controller.session.repo
+        roll_id = rolls.create_virtual_roll(repo, "Portra", [])
+        gray = replace(WorkspaceConfig(), lab=replace(WorkspaceConfig().lab, saturation=0.0))
+        saved = {h: gray for h in ("h1", "h2", "h3", "h4")}
+        repo.load_file_settings.side_effect = saved.get
+        repo.save_file_settings.side_effect = lambda h, cfg, **kw: saved.__setitem__(h, cfg)
+        self.mock_session_manager.config_for_asset.side_effect = lambda f: rolls.resolve_roll_config(
+            repo, roll_id, f["hash"], saved[f["hash"]]
+        )
+        rolls.set_frame_override(repo, roll_id, "h4", "film", locked=True)
+        state = self.mock_session_manager.state
+        state.active_roll_id = roll_id
+        state.uploaded_files = [{"name": f"{h}.dng", "path": f"/{h}.dng", "hash": h} for h in saved]
+        state.current_file_hash = "h1"
+        state.stale_thumbnails = set()
+
+        def push(mode):
+            state.config = with_process_mode(state.config, mode)
+            rolls.set_frame_override(repo, roll_id, "h1", "film", locked=True)
+            self.controller.apply_roll_card("film")
+
+        state.config = gray
+        push(ProcessMode.BW)
+        self.assertEqual({h: c.lab.saturation for h, c in saved.items()}, dict.fromkeys(saved, 0.0))
+        push(ProcessMode.C41)
+        self.assertEqual({h: c.lab.saturation for h, c in saved.items()}, {"h1": 0.0, "h2": 1.0, "h3": 1.0, "h4": 0.0})
 
     def test_apply_roll_card_refreshes_the_thumbnails_of_frames_that_follow_the_roll(self):
         """A frame locked on the pushed card keeps its own value, so it is neither
@@ -2469,6 +2618,26 @@ class TestAppController(unittest.TestCase):
         self.controller.state.soft_proof_enabled = True
         # An export color space resolves an effective output profile → proof active.
         self.assertTrue(self.controller.proof_active())
+
+    def test_gray_proof_profile_names_a_gray_proof_on_a_color_frame(self):
+        from negpy.domain.models import ColorSpace
+        from negpy.features.process.models import ProcessMode, with_process_mode
+
+        state = self.controller.state
+        state.soft_proof_enabled = True
+        state.proof_icc_path = None
+        gray = ColorSpace.GREYSCALE.value
+        state.config = replace(state.config, export=replace(state.config.export, export_color_space=gray))
+        self.assertEqual(self.controller.gray_proof_profile(), gray)
+
+        state.config = with_process_mode(state.config, ProcessMode.BW)
+        self.assertEqual(self.controller.gray_proof_profile(), "")
+        state.config = with_process_mode(state.config, ProcessMode.C41)
+        state.soft_proof_enabled = False
+        self.assertEqual(self.controller.gray_proof_profile(), "")
+        state.soft_proof_enabled = True
+        state.config = replace(state.config, export=replace(state.config.export, export_color_space=ColorSpace.SRGB.value))
+        self.assertEqual(self.controller.gray_proof_profile(), "")
 
     def test_effective_input_icc(self):
         """The explicit Input ICC, else None."""
@@ -4110,7 +4279,7 @@ class TestPresetExportSelected(unittest.TestCase):
 
     def test_background_run_measures_a_new_frame_quietly(self):
         tasks = self._capture_background_runs()
-        self.controller._waits_for_auto_crop.side_effect = lambda f: f["hash"] == "h3"
+        self.controller._waits_for_auto_crop.side_effect = lambda f, config=None: f["hash"] == "h3"
 
         with patch.object(rolls, "roll_normalization", return_value={"frames": ("h1",)}):
             self.controller._run_background_baseline()
@@ -4144,6 +4313,68 @@ class TestPresetExportSelected(unittest.TestCase):
         for saved in ({"frames": ("h1", "h2", "h3", "h4")}, {"frames": None}):
             with patch.object(rolls, "roll_normalization", return_value=saved):
                 self.controller._run_background_baseline()
+        self.assertEqual(tasks, [])
+
+    def test_background_run_hydrates_each_frame_once(self):
+        self._capture_background_runs()
+        del self.controller._waits_for_auto_crop
+        self.mock_session_manager.state.current_file_hash = None
+        files = self.mock_session_manager.state.uploaded_files
+
+        with patch.object(rolls, "roll_normalization", return_value={"frames": None}):
+            self.controller._run_background_baseline()
+        self.assertEqual(self.mock_session_manager.config_for_asset.call_count, len(files))
+
+    def _after_a_check(self, edits: set, settings: set) -> None:
+        """A background check saw every frame; the next config_updated finds *edits* and *settings* written."""
+        self._capture_background_runs()
+        with patch.object(rolls, "roll_normalization", return_value={"frames": None}):
+            self.controller._run_background_baseline()
+        self.mock_session_manager.repo.take_edit_writes.return_value = edits
+        self.mock_session_manager.repo.take_setting_writes.return_value = settings
+        self.controller._background_baseline_timer.stop()
+
+    def _edit_open_frame(self, **process) -> bool:
+        """Edits the open frame's exposure (or *process* fields); True when the background check was scheduled."""
+        state = self.mock_session_manager.state
+        state.config = (
+            replace(state.config, process=replace(state.config.process, **process))
+            if process
+            else replace(state.config, exposure=replace(state.config.exposure, density=state.config.exposure.density + 0.1))
+        )
+        self.controller.config_updated.emit()
+        return self.controller._background_baseline_timer.isActive()
+
+    def test_an_edit_that_moves_no_meter_input_schedules_no_background_check(self):
+        self._after_a_check({"h2"}, {"sticky_config"})
+        self.assertFalse(self._edit_open_frame())
+
+    def test_a_metering_edit_schedules_the_background_check(self):
+        self._after_a_check({"h2"}, {"sticky_config"})
+        self.assertTrue(self._edit_open_frame(analysis_buffer=0.2))
+
+    def test_a_write_that_moves_another_frames_meter_inputs_schedules_the_background_check(self):
+        self._after_a_check({"h2", "h3"}, set())
+        self.assertFalse(self._edit_open_frame())
+
+        moved = replace(WorkspaceConfig(), process=replace(WorkspaceConfig().process, analysis_buffer=0.2))
+        self.mock_session_manager.config_for_asset.side_effect = lambda f: moved if f["hash"] == "h3" else WorkspaceConfig()
+        self.assertTrue(self._edit_open_frame())
+
+    def test_a_session_restore_setting_schedules_no_background_check(self):
+        self._after_a_check(set(), {"session_active_path", "session_files"})
+        self.assertFalse(self._edit_open_frame())
+
+    def test_a_changed_roll_schedules_the_background_check(self):
+        self._after_a_check(set(), {rolls.ROLLS_KEY})
+        self.assertTrue(self._edit_open_frame())
+
+    def test_turning_the_background_check_off_skips_it(self):
+        tasks = self._capture_background_runs()
+        self.mock_session_manager.state.auto_roll_average = False
+
+        with patch.object(rolls, "roll_normalization", return_value=None):
+            self.controller._run_background_baseline()
         self.assertEqual(tasks, [])
 
     def _slides(self, *hashes: str) -> None:
@@ -5692,22 +5923,13 @@ class TestContactSheetOutputDir(unittest.TestCase):
         del self.controller
         gc.collect()
 
-    def test_custom_path_wins_over_export_destination(self):
-        export = ExportConfig(
-            contact_sheet_output_path="/custom/contact",
-            output_mode=ExportPresetOutputMode.SAME_AS_SOURCE,
-        )
-        self.controller.state.config = replace(self.controller.state.config, export=export)
-        out = self.controller._contact_sheet_output_dir(self.visible_files)
-        self.assertEqual(out, "/custom/contact")
-
     def test_empty_path_uses_source_folder_when_same_as_source(self):
         export = ExportConfig(
             contact_sheet_output_path="",
             output_mode=ExportPresetOutputMode.SAME_AS_SOURCE,
         )
         self.controller.state.config = replace(self.controller.state.config, export=export)
-        out = self.controller._contact_sheet_output_dir(self.visible_files)
+        out = self.controller._contact_sheet_default_dir(self.visible_files)
         self.assertEqual(out, "/rolls/frame")
 
     def test_empty_path_uses_export_path_when_absolute(self):
@@ -5717,17 +5939,8 @@ class TestContactSheetOutputDir(unittest.TestCase):
             export_path="/home/user/NegPy/export",
         )
         self.controller.state.config = replace(self.controller.state.config, export=export)
-        out = self.controller._contact_sheet_output_dir(self.visible_files)
+        out = self.controller._contact_sheet_default_dir(self.visible_files)
         self.assertEqual(out, "/home/user/NegPy/export")
-
-    def test_whitespace_only_path_falls_back_to_export_rules(self):
-        export = ExportConfig(
-            contact_sheet_output_path="   ",
-            output_mode=ExportPresetOutputMode.SAME_AS_SOURCE,
-        )
-        self.controller.state.config = replace(self.controller.state.config, export=export)
-        out = self.controller._contact_sheet_output_dir(self.visible_files)
-        self.assertEqual(out, "/rolls/frame")
 
     def _dict_repo(self) -> None:
         store: dict = {}
@@ -5749,7 +5962,7 @@ class TestContactSheetOutputDir(unittest.TestCase):
         ):
             with self.subTest(roll=label):
                 self.controller.state.active_roll_id = roll_id
-                self.assertEqual(self.controller._contact_sheet_output_dir(self.visible_files), os.path.join("/rolls/frame", "export"))
+                self.assertEqual(self.controller._contact_sheet_default_dir(self.visible_files), os.path.join("/rolls/frame", "export"))
 
 
 class TestRetouchPersistence(unittest.TestCase):
@@ -7772,6 +7985,53 @@ class TestLibrarySearch(unittest.TestCase):
 
         self.assertEqual(missing, [roll_id])
         discovery.assert_not_called()
+
+    def test_open_virtual_roll_whose_frames_are_all_gone_asks_to_locate_them(self):
+        self._dict_repo()
+        from negpy.services.assets.rolls import create_virtual_roll
+
+        roll_id = create_virtual_roll(self.controller.session.repo, "picks", ["/photos/gone/a.tif"])
+        missing = []
+        self.controller.roll_folder_missing.connect(missing.append)
+
+        with patch.object(self.controller, "request_asset_discovery") as discovery:
+            self.controller.open_roll(roll_id)
+
+        self.assertEqual(missing, [roll_id])
+        discovery.assert_not_called()
+
+    def test_remove_missing_frames_drops_only_the_gone_files_and_their_forks(self):
+        self._dict_repo()
+        import os
+        import tempfile
+
+        from negpy.services.assets.rolls import create_virtual_roll, roll_for_id
+
+        with tempfile.TemporaryDirectory() as tmp:
+            here = os.path.join(tmp, "a.tif")
+            open(here, "wb").close()
+            gone = os.path.join(tmp, "gone", "b.tif")
+            repo = self.controller.session.repo
+            roll_id = create_virtual_roll(repo, "picks", [here, gone])
+            repo.file_hashes_for_path = lambda p: ["hb", "hb#1#roll:" + roll_id] if p == gone else []
+            repo.delete_file_settings = MagicMock()
+            with patch("negpy.desktop.controller.rolls.remove_members", wraps=rolls.remove_members) as remove:
+                self.assertEqual(self.controller.remove_missing_frames(roll_id), 1)
+
+            remove.assert_called_once_with(repo, roll_id, [gone], ["hb", "hb#1"])
+            self.assertEqual(roll_for_id(repo, roll_id)["member_paths"], [here])
+            self.assertEqual(self.controller.remove_missing_frames(roll_id), 0)
+
+    def test_relinking_a_virtual_rolls_folders_moves_the_deepest_first_and_opens_it(self):
+        self._dict_repo()
+        with (
+            patch.object(self.controller, "open_roll") as reopen,
+            patch("negpy.desktop.controller.rehome_path_prefix") as rehome,
+        ):
+            self.controller.relink_member_folders("r1", [("/s/2024", "/a/2024"), ("/s/2024/rejects", "/b/rejects")])
+
+        self.assertEqual([c.args[1:] for c in rehome.call_args_list], [("/s/2024/rejects", "/b/rejects"), ("/s/2024", "/a/2024")])
+        reopen.assert_called_once_with("r1")
 
     def test_relinking_the_open_roll_repoints_its_frames_without_reopening(self):
         self._dict_repo()

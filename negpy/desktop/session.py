@@ -12,7 +12,7 @@ from typing import Any, Callable, Collection, Dict, Iterable, Iterator, List, Op
 import numpy as np
 from PyQt6.QtCore import QAbstractListModel, QModelIndex, QObject, Qt, pyqtSignal
 
-from negpy.desktop.settings_catalog import GLOBAL_TIER_SECTIONS, ROLL_CARD_LABELS, apply_selected_fields
+from negpy.desktop.settings_catalog import BW_UNUSED_LAB_FIELDS, GLOBAL_TIER_SECTIONS, ROLL_CARD_LABELS, apply_selected_fields
 from negpy.features.retouch.models import HEAL_SIZE_MAX, HEAL_SIZE_MIN
 from negpy.services.capture.presets import PresetStore
 from negpy.desktop.sticky import (
@@ -25,6 +25,7 @@ from negpy.desktop.sticky import (
     load_sticky_rows,
     migrate_legacy,
     migrate_auto_crop_sticky_row,
+    migrate_carried_chroma_zero,
     migrate_square_before_crop_sticky_row,
     migrate_legacy_export_destination,
     sticky_snapshot,
@@ -33,6 +34,7 @@ from negpy.desktop.view.canvas.crop_guides import CropGuide
 from negpy.domain.models import PROOF_INTENT_LABELS, ExportPreset, ProofIntent, WorkspaceConfig
 from negpy.features.exposure.models import apply_targets
 from negpy.features.process.capture_color import is_source_profile
+from negpy.features.process.path import is_mono
 from negpy.features.geometry.logic import flip_geometry_and_analysis, has_manual_crop, rotate_geometry_and_analysis
 from negpy.features.process.models import (
     SCAN_SETUP_PAPERS,
@@ -182,8 +184,10 @@ class AppState:
     ir_degenerate: bool = False  # IR plane carries image content (B&W/Kodachrome) → IR restore disabled
     original_res: tuple[int, int] = (0, 0)
     clipboard: Optional[WorkspaceConfig] = None
-    # The rows a card copy holds; Paste writes them with no picker. None after a whole copy.
+    # The rows a card copy holds; Paste offers only them. None after a whole copy.
     clipboard_rows: Optional[list] = None
+    # A Roll tab card copy: its values are one unit, so Paste starts with every row on.
+    clipboard_whole_card: bool = False
 
     # ICC Management
     icc_input_path: Optional[str] = None
@@ -234,6 +238,8 @@ class AppState:
     canvas_bg_index: int = 2
     # Render the thumbnails of frames a bulk edit wrote without opening them; off marks them stale
     auto_thumbnail_refresh: bool = False
+    # Measure the roll average in the background when a frame lacks it; off waits for Roll Analysis
+    auto_roll_average: bool = True
     # Preferences > Accessibility, a key into styles.color_vision.PALETTES
     color_vision: str = "standard"
 
@@ -427,6 +433,11 @@ class AppState:
         if peek is not None and key in peek:
             return peek[key]
         return self.last_metrics.get(key, default)
+
+
+def _row_fields(rows: Iterable[Any]) -> frozenset:
+    """The config field names that catalog *rows* write."""
+    return frozenset(f for row in rows for f in row.fields)
 
 
 def camera_raw_preview(state: Any) -> bool:
@@ -779,7 +790,7 @@ class AssetListModel(QAbstractListModel):
         if role == Qt.ItemDataRole.ToolTipRole:
             failed = file_info.get("decode_failed")
             if failed:
-                return f"{file_info['path']}\nFailed to load: {failed}\nClick to retry."
+                return file_info["path"] + "\n" + tr("Failed to load: {error}", error=failed) + "\n" + tr("Click to retry.")
             lines = [file_info["path"]]
             summary = composite_summary(file_info)
             if summary:
@@ -1040,6 +1051,7 @@ class DesktopSessionManager(QObject):
     # A view that reads styles.color_vision repaints on this.
     color_vision_changed = pyqtSignal()
     auto_thumbnail_refresh_changed = pyqtSignal(bool)
+    auto_roll_average_changed = pyqtSignal(bool)
     canvas_bg_changed = pyqtSignal()
     settings_synced = pyqtSignal(str)  # Bulk "Apply to selected" done — carries a status message
     frames_edited_offscreen = pyqtSignal(list)  # hashes whose saved edits changed without a render
@@ -1076,6 +1088,7 @@ class DesktopSessionManager(QObject):
         migrate_legacy_export_destination(self.repo)
         migrate_auto_crop_sticky_row(self.repo)
         migrate_square_before_crop_sticky_row(self.repo)
+        migrate_carried_chroma_zero(self.repo)
 
         # Load global hardware settings
         saved_gpu = self.repo.get_global_setting("gpu_enabled")
@@ -1096,6 +1109,7 @@ class DesktopSessionManager(QObject):
         if saved_bg is not None:
             self.state.canvas_bg_index = int(saved_bg)
         self.state.auto_thumbnail_refresh = bool(self.repo.get_global_setting("auto_thumbnail_refresh", False))
+        self.state.auto_roll_average = bool(self.repo.get_global_setting("auto_roll_average", True))
         self.state.color_vision = str(self.repo.get_global_setting("color_vision", "standard") or "standard")
         self.state.zone_hover_highlight = bool(self.repo.get_global_setting("zone_hover_highlight", True))
         self.state.cursor_probe = bool(self.repo.get_global_setting("cursor_probe", False))
@@ -1299,6 +1313,12 @@ class DesktopSessionManager(QObject):
             self.repo.save_global_setting("auto_thumbnail_refresh", on)
             self.auto_thumbnail_refresh_changed.emit(on)
 
+    def set_auto_roll_average(self, on: bool) -> None:
+        if self.state.auto_roll_average != on:
+            self.state.auto_roll_average = on
+            self.repo.save_global_setting("auto_roll_average", on)
+            self.auto_roll_average_changed.emit(on)
+
     def set_color_vision(self, key: str) -> None:
         if self.state.color_vision != key:
             self.state.color_vision = key
@@ -1500,6 +1520,9 @@ class DesktopSessionManager(QObject):
             keep_stored(("crop_from_auto", "crop_rect", "crop_detect_key"))
         if self.film_scanner_file(self.state.current_file_path or ""):
             keep_stored(_CAMERA_ONLY_FIELDS)
+        if is_mono(config.process):
+            # The color controls a black-and-white frame hides: a value there was never seen.
+            keep_stored(BW_UNUSED_LAB_FIELDS)
         self.repo.save_global_settings(
             {
                 STICKY_CONFIG_KEY: snapshot,
@@ -1889,7 +1912,7 @@ class DesktopSessionManager(QObject):
                 synced = replace(synced, process=replace(synced.process, **changes))
             self.push_external_history(target_hash, target_config, synced)
             self.repo.save_file_settings(target_hash, synced, file_path=target_path)
-            self._lock_diverged_cards(self.state.uploaded_files[idx], synced, target_config)
+            self._lock_diverged_cards(self.state.uploaded_files[idx], synced, target_config, applied=_row_fields(rows))
             changed_hashes.append(target_hash)
             count += 1
 
@@ -1934,7 +1957,7 @@ class DesktopSessionManager(QObject):
                 before = self.state.config
                 overlaid = apply_selected_fields(source, before, rows)
                 self.update_config(finish(overlaid) if finish else overlaid, persist=True, render=False)
-                self.relock_diverged_cards(before)
+                self.relock_diverged_cards(before, applied=_row_fields(rows))
                 count += 1
                 continue
             target_hash = self.state.uploaded_files[idx]["hash"]
@@ -1944,7 +1967,7 @@ class DesktopSessionManager(QObject):
                 synced = finish(synced)
             self.push_external_history(target_hash, target_config, synced)
             self.repo.save_file_settings(target_hash, synced, file_path=self.state.uploaded_files[idx]["path"])
-            self._lock_diverged_cards(self.state.uploaded_files[idx], synced, target_config)
+            self._lock_diverged_cards(self.state.uploaded_files[idx], synced, target_config, applied=_row_fields(rows))
             changed_hashes.append(target_hash)
             count += 1
 
@@ -2228,7 +2251,7 @@ class DesktopSessionManager(QObject):
         """Persist the active frame's Auto-crop all frames result before it goes live in memory,
         so a storage error never leaves an unsaved crop live."""
         if not self.state.current_file_hash:
-            raise RuntimeError("Cannot persist batch settings without an active file")
+            raise RuntimeError(tr("Cannot persist batch settings without an active file"))
         self.repo.save_file_settings(
             self.state.current_file_hash,
             config,
@@ -2257,14 +2280,16 @@ class DesktopSessionManager(QObject):
             )
             if moved:
                 batch.after[batch.active_hash] = self.state.config
-            if batch.frames or moved or batch.roll_undo:
+            # An apply that changes no value can still release a lock, which Undo must give back.
+            relocked = any(rolls.card_locks_snapshot(self.repo, r, list(held)) != held for r, held in batch.locks.items())
+            if batch.frames or moved or batch.roll_undo or relocked:
                 self.last_batch = batch
                 self.batch_recorded.emit()
 
     def undo_last_batch(self) -> tuple[int, int]:
         """Puts back every setting the last batch changed, and the roll's values it pushed. A setting
         changed again after the batch keeps that value; every other setting stays as it is now. Each
-        frame also gets an ordinary history step. Returns how many frames moved and how many kept a later change."""
+        frame also gets an ordinary history step. Returns how many frames moved or got a lock back, and how many kept a later change."""
         batch, self.last_batch = self.last_batch, None
         if batch is None:
             return 0, 0
@@ -2281,9 +2306,13 @@ class DesktopSessionManager(QObject):
         for file_hash, (_now, _undone, kept_fields) in plans.items():
             cards = kept_cards.setdefault(unforked_hash(file_hash), set())
             cards.update(c for c, (section, names) in rolls.ROLL_DEFAULT_FIELDS.items() if any((section, n) in kept_fields for n in names))
+        relocked = set()
         for roll_id, locks in batch.locks.items():
             for base, snapshot in locks.items():
                 cards = [c for c in rolls.ROLL_DEFAULT_FIELDS if c not in kept_cards.get(base, ())]
+                now_locks = rolls.card_locks_snapshot(self.repo, roll_id, [base])[base]
+                if any(now_locks[c] != snapshot[c] for c in cards):
+                    relocked.add(base)
                 rolls.restore_card_locks(self.repo, roll_id, cards, {base: snapshot})
         if batch.roll_undo is not None:
             batch.roll_undo()
@@ -2313,7 +2342,8 @@ class DesktopSessionManager(QObject):
                     rolls.settle_card_lock(self.repo, roll_id, base, card_key, values, old, process=undone.process)
         if changed:
             self.frames_edited_offscreen.emit(changed)
-        return moved, kept
+        moved_bases = {unforked_hash(h) for h, (now, undone, _kept) in plans.items() if undone is not now}
+        return moved + len(relocked - moved_bases), kept
 
     def follow_last_batch(self, file_hash: str, config: WorkspaceConfig, names: Iterable[str]) -> None:
         """An automatic write of process *names* to a frame whose baseline or Use Average choices the last
@@ -2327,6 +2357,21 @@ class DesktopSessionManager(QObject):
         if all(rolls.same_value(getattr(before.process, n), getattr(after.process, n)) for n in (*names, *_AVERAGE_CHOICES)):
             return
         batch.after[file_hash] = replace(after, process=replace(after.process, **{n: getattr(config.process, n) for n in names}))
+
+    def write_frame_fields(self, assets: list, section: str, changes: dict) -> list[str]:
+        """Writes *changes* into each of *assets*' own edits and settles its roll locks; every other field
+        stays. A frame that follows the roll already shows them and is skipped. Returns the written hashes."""
+        written = []
+        for asset in assets:
+            before = self.config_for_asset(asset)
+            after = replace(before, **{section: replace(getattr(before, section), **changes)})
+            if after == before:
+                continue
+            self.push_external_history(asset["hash"], before, after)
+            self.repo.save_file_settings(asset["hash"], after, file_path=asset["path"])
+            self._lock_diverged_cards(asset, after, before)
+            written.append(asset["hash"])
+        return written
 
     def push_external_history(self, file_hash: str, old_config: WorkspaceConfig, new_config: WorkspaceConfig) -> None:
         """Record a bulk apply (roll bake, apply-to-roll…) in a NON-ACTIVE file's
@@ -2361,18 +2406,22 @@ class DesktopSessionManager(QObject):
         held = self._batch.locks.setdefault(roll_id, {})
         base = unforked_hash(asset["hash"])
         if base not in held:
-            held.update(rolls.card_locks_snapshot(self.repo, roll_id, None, [base]))
+            held.update(rolls.card_locks_snapshot(self.repo, roll_id, [base]))
 
-    def relock_diverged_cards(self, before: Optional[WorkspaceConfig] = None) -> None:
+    def relock_diverged_cards(self, before: Optional[WorkspaceConfig] = None, applied: frozenset = frozenset()) -> None:
         """Lock each roll card on which the restored config differs from the roll's: history, a work
         print and a paste restore no locks, and an unlocked card takes the roll's values on load.
-        A card that the step from *before* changed also unlocks where it matches the roll again."""
+        A card that the step from *before* changed or *applied* covers also unlocks where it matches the roll again."""
         idx = self.state.selected_file_idx
         if not self.state.current_file_hash or not (0 <= idx < len(self.state.uploaded_files)):
             return
-        self._lock_diverged_cards(self.state.uploaded_files[idx], self.state.config, before)
+        self._lock_diverged_cards(self.state.uploaded_files[idx], self.state.config, before, applied)
 
-    def _lock_diverged_cards(self, asset: dict, config: WorkspaceConfig, before: Optional[WorkspaceConfig] = None) -> None:
+    def _lock_diverged_cards(
+        self, asset: dict, config: WorkspaceConfig, before: Optional[WorkspaceConfig] = None, applied: frozenset = frozenset()
+    ) -> None:
+        """*applied* holds the field names an apply wrote: a card it covers whole settles even when its values did
+        not change, so applying the roll's values releases a frame that already holds them."""
         roll_id = rolls.frame_roll(self.repo, self.state.active_roll_id, asset)
         if roll_id is None:
             return
@@ -2383,7 +2432,8 @@ class DesktopSessionManager(QObject):
             values = {n: getattr(getattr(config, section), n) for n in names}
             old = None if before is None else {n: getattr(getattr(before, section), n) for n in names}
             # A pin on a card the step did not touch stays.
-            if old is not None and not all(rolls.same_value(values[n], old[n]) for n in names):
+            touched = old is not None and not all(rolls.same_value(values[n], old[n]) for n in names)
+            if touched or (old is not None and applied.issuperset(names)):
                 rolls.settle_card_lock(self.repo, roll_id, base, card_key, values, old, process=config.process)
             elif card_key not in locked and any(n in defaults and not rolls.same_value(values[n], defaults[n]) for n in names):
                 rolls.set_frame_override(self.repo, roll_id, base, card_key, True)
@@ -2427,9 +2477,9 @@ class DesktopSessionManager(QObject):
         """Default name offered for the next save: the first free `Work print N`."""
         taken = set(self.work_prints())
         n = 1
-        while f"Work print {n}" in taken:
+        while tr("Work print {n}", n=n) in taken:
             n += 1
-        return f"Work print {n}"
+        return tr("Work print {n}", n=n)
 
     def save_work_print(self, name: str) -> None:
         """Keep the live edit under `name`. Unlike a history step this is never pruned
@@ -2603,13 +2653,15 @@ class DesktopSessionManager(QObject):
             )
         self.state.clipboard = cfg
         self.state.clipboard_rows = None
+        self.state.clipboard_whole_card = False
         self.state_changed.emit()
         self.settings_copied.emit()
 
-    def copy_card_settings(self, rows) -> None:
+    def copy_card_settings(self, rows, whole_card: bool = False) -> None:
         """Copy one card: the clipboard holds the config, and Paste writes only these rows."""
         self.copy_settings()
         self.state.clipboard_rows = list(rows)
+        self.state.clipboard_whole_card = whole_card
 
     def copy_settings_with_bounds(self) -> None:
         self.copy_settings(include_bounds=True)

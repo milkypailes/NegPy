@@ -3,8 +3,9 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, Optional
 
 from negpy.domain.migrations import CROSSTALK_PROFILE_RENAMES
-from negpy.kernel.system.i18n import mark
+from negpy.kernel.system.i18n import mark, tr
 from negpy.features.exposure.models import EXPOSURE_CONSTANTS, ExposureConfig
+from negpy.features.lab.models import LabConfig
 
 if TYPE_CHECKING:
     from negpy.domain.models import WorkspaceConfig
@@ -42,7 +43,7 @@ class SensorUnmix(StrEnum):
 
     @property
     def label(self) -> str:
-        return {"linear": "Linear", "two_scale": "Two-Scale", "density": "Density"}[self.value]
+        return tr({"linear": mark("Linear"), "two_scale": mark("Two-Scale"), "density": mark("Density")}[self.value])
 
 
 class DemosaicMode(StrEnum):
@@ -90,6 +91,14 @@ def auto_meter_for_mode(mode: str, current: bool) -> bool:
     if mode == ProcessMode.E6:
         return slide_default if current == negative_default else current
     return negative_default if current == slide_default else current
+
+
+def chroma_for_mono(was_mono: bool, now_mono: bool, saturation: float) -> float:
+    """The Chroma a frame carries after a switch between a black-and-white and a color render.
+    A black-and-white frame hides Chroma, so leaving it turns a 0 into the default; any other value stays."""
+    if was_mono and not now_mono and saturation == 0.0:
+        return float(LabConfig.saturation)
+    return saturation
 
 
 def mode_aware_exposure_reset(mode: str, base: ExposureConfig) -> ExposureConfig:
@@ -147,7 +156,7 @@ FADE_RENDER_FIELDS = (
 #: The fade fields a frame's bounds measurement reads: the crossover table is set from them.
 FADE_METER_FIELDS = tuple(f for f in FADE_RENDER_FIELDS if f not in ("fade_crossover_table", "fade_crossover_space"))
 #: Every field of the Fade Restoration card.
-FADE_CARD_FIELDS = FADE_RENDER_FIELDS + ("fade_auto_red", "fade_neutrals_mix")
+FADE_CARD_FIELDS = FADE_RENDER_FIELDS + ("fade_auto_red", "fade_red_trim", "fade_neutrals_mix")
 
 
 @dataclass(frozen=True)
@@ -259,6 +268,8 @@ class ProcessConfig:
     fade_crossover_space: str = ""
     # Restore Range: Red Survival and the shift come from `fade_auto_red.auto_red`.
     fade_auto_red: bool = False
+    # A hand Red Survival under Restore Range, as a factor on the Red it fits; each fit applies it again.
+    fade_red_trim: float = 1.0
     # Gray Mix: Estimate's grays from the gray finder (0) to the tone bands (1) (`fade.gray_refs`).
     fade_neutrals_mix: float = 0.0
 
@@ -353,8 +364,8 @@ def invalidate_local_bounds(process: ProcessConfig) -> dict:
 
 
 def with_process_mode(config: "WorkspaceConfig", mode: str) -> "WorkspaceConfig":
-    """*config* switched to Film Mode *mode*: the Cast Removal and Auto Density/Auto Grade
-    defaults move with it, and leaving Slide drops Positive. Every path that sets a frame's mode
+    """*config* switched to Film Mode *mode*: the Cast Removal, Auto Density/Auto Grade and
+    Chroma defaults move with it, and leaving Slide drops Positive. Every path that sets a frame's mode
     goes through here. The same mode returns *config* unchanged, since the default rewrites
     would read a slide's deliberate negative-default value as untouched."""
     proc, exp = config.process, config.exposure
@@ -375,7 +386,7 @@ def with_process_mode(config: "WorkspaceConfig", mode: str) -> "WorkspaceConfig"
         slide_bw=proc.slide_bw and slide,
         **invalidate_local_bounds(proc),
     )
-    return replace(config, process=proc, exposure=exp)
+    return replace(config, process=proc, exposure=exp, lab=_lab_after(config, proc))
 
 
 def with_positive_source(config: "WorkspaceConfig", checked: bool) -> "WorkspaceConfig":
@@ -391,7 +402,17 @@ def with_slide_bw(config: "WorkspaceConfig", checked: bool) -> "WorkspaceConfig"
     proc = config.process
     if proc.process_mode != ProcessMode.E6 or proc.slide_bw == checked:
         return config
-    return replace(config, process=replace(proc, slide_bw=checked))
+    proc = replace(proc, slide_bw=checked)
+    return replace(config, process=proc, lab=_lab_after(config, proc))
+
+
+def _lab_after(config: "WorkspaceConfig", proc: ProcessConfig) -> LabConfig:
+    """*config*'s Lab section once its process becomes *proc* (chroma_for_mono)."""
+    from negpy.features.process.path import is_mono
+
+    lab = config.lab
+    saturation = chroma_for_mono(is_mono(config.process), is_mono(proc), lab.saturation)
+    return lab if saturation == lab.saturation else replace(lab, saturation=saturation)
 
 
 def with_film_fields(config: "WorkspaceConfig", fields: dict) -> "WorkspaceConfig":

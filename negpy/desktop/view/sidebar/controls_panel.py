@@ -82,7 +82,7 @@ _SENSOR_FIELDS = (
     "crosstalk_process",
     "hue_trim",
 )
-_FADE_FIELDS = (*FADE_METER_FIELDS, "fade_auto_red", "fade_neutrals_mix")
+_FADE_FIELDS = (*FADE_METER_FIELDS, "fade_auto_red", "fade_red_trim", "fade_neutrals_mix")
 # ProcessConfig is split across five cards. Each tuple is both the card's reset scope and
 # its modified count, so a field is resettable from the one card that counts it.
 # Linear RAW and the two demosaic choices are in none: they come from the scanning
@@ -128,6 +128,7 @@ _DEFAULT_ALTPROC = AltProcessConfig()
 _DEFAULT_GEOMETRY = DEFAULT_WORKSPACE_CONFIG.geometry
 _DEFAULT_PROCESS = DEFAULT_WORKSPACE_CONFIG.process
 _DEFAULT_FINISH = FinishConfig()
+_DEFAULT_RETOUCH = DEFAULT_WORKSPACE_CONFIG.retouch
 _DEFAULT_FLATFIELD = FlatFieldConfig()
 _DEFAULT_CONFIG = DEFAULT_WORKSPACE_CONFIG
 
@@ -250,15 +251,16 @@ class ControlsPanel(QWidget):
             icon_name="mdi.view-split-vertical",
         )
 
-        # Where this frame's bounds come from: the roll and scene baselines, then the Use
-        # Luma/Color Average switches that read them.
+        # Where this frame's bounds come from: the Use Luma/Color Average switches, then the
+        # roll and scene baselines they read.
         self.roll_sidebar = RollAnalysisSidebar(self.controller)
         baseline_body = QWidget()
         baseline_layout = QVBoxLayout(baseline_body)
         baseline_layout.setContentsMargins(0, 0, 0, 0)
         baseline_layout.setSpacing(THEME.space_sm)
-        baseline_layout.addWidget(self.roll_sidebar)
+        baseline_layout.addWidget(self.roll_sidebar.no_roll_hint)
         baseline_layout.addWidget(self.process_sidebar.baseline_bar)
+        baseline_layout.addWidget(self.roll_sidebar)
         self.baseline_section = self._make_section(
             tr("Roll Analysis"),
             "baseline",
@@ -597,7 +599,7 @@ class ControlsPanel(QWidget):
         copy = menu.addAction(tr("Copy Card Settings"))
         copy.setToolTip(tr("Copy this card alone; Paste then offers only its settings"))
         copy.setEnabled(bool(rows))
-        copy.triggered.connect(lambda: self.controller.session.copy_card_settings(rows))
+        copy.triggered.connect(lambda: self.controller.session.copy_card_settings(rows, whole_card=roll_card))
         undo = menu.addAction(label_with_shortcut(tr("Undo Change to Several Frames"), "undo_roll_push"))
         undo.setToolTip(tr("Put back every frame and roll value the last Apply, Paste, Reset or Roll push changed"))
         undo.setEnabled(self.controller.can_undo_batch())
@@ -702,26 +704,14 @@ class ControlsPanel(QWidget):
         )
         paper.toe_slider.setToolTip(
             tooltip_with_shortcut(
-                tr("Shapes the shadows: positive lifts them, and negative makes them deeper."),
+                tr("Shapes how the shadows reach black: positive makes the change softer, and negative makes it harder."),
                 ["toe_inc", "toe_dec"],
-            )
-        )
-        paper.toe_w_slider.setToolTip(
-            tooltip_with_shortcut(
-                tr("How far the Toe change reaches into the midtones."),
-                ["toe_width_inc", "toe_width_dec"],
             )
         )
         paper.sh_slider.setToolTip(
             tooltip_with_shortcut(
-                tr("Shapes the highlights: positive softens them, and negative brightens them and can lose detail."),
+                tr("Shapes how the highlights reach white: positive makes the change softer, and negative makes it harder."),
                 ["shoulder_inc", "shoulder_dec"],
-            )
-        )
-        paper.sh_w_slider.setToolTip(
-            tooltip_with_shortcut(
-                tr("How far the Shoulder change reaches into the midtones."),
-                ["shoulder_width_inc", "shoulder_width_dec"],
             )
         )
         paper.midtone_gamma_slider.setToolTip(
@@ -801,7 +791,7 @@ class ControlsPanel(QWidget):
 
         proc.slide_bw_btn.setToolTip(
             tooltip_with_shortcut(
-                tr("B&W, slides only: render the slide in black and white, for B&W reversal film or a color slide."),
+                tr("B&W Slide: render the slide in black and white, for B&W reversal film or a color slide."),
                 "toggle_slide_bw",
             )
         )
@@ -1295,6 +1285,11 @@ class ControlsPanel(QWidget):
         lab_count = sum(
             [
                 lab.saturation != _lab.saturation and not unused_in_mode("lab", "saturation", cfg),
+                # Skin Protection only steers a Chroma change, and Radius a sharpen.
+                lab.skin_protection != _lab.skin_protection
+                and lab.saturation != _lab.saturation
+                and not unused_in_mode("lab", "skin_protection", cfg),
+                lab.sharpen_radius != _lab.sharpen_radius and lab.sharpen > 0,
                 lab.clahe_strength != _lab.clahe_strength,
                 lab.sharpen != _lab.sharpen,
                 lab.chroma_denoise != _lab.chroma_denoise and not unused_in_mode("lab", "chroma_denoise", cfg),
@@ -1361,10 +1356,28 @@ class ControlsPanel(QWidget):
         )
 
         ret = cfg.retouch
-        # Heal-tool clicks and scratch polylines both commit into manual_heal_strokes, where
-        # manual_dust_spots is the legacy list, so count them or the Finish tab's edited dot
-        # never lights for healed images.
-        retouch_count = int(ret.dust_remove) + len(ret.manual_dust_spots) + len(ret.manual_heal_strokes)
+        _ret = _DEFAULT_RETOUCH
+        # Every repair that reaches the pixels, and each setting while it steers one. The Clone
+        # brush settings only set the next stroke, which keeps its own copy.
+        ir_on = ret.ir_dust_remove and self.controller.state.has_ir
+        retouch_count = sum(
+            [
+                ret.dust_remove,
+                ir_on,
+                len(ret.manual_dust_spots),
+                len(ret.manual_heal_strokes),
+                len(ret.scratch_lines),
+                len(ret.dust_exclusion_strokes),
+                len(ret.clone_strokes),
+                *(
+                    (getattr(ret, f) != getattr(_ret, f) for f in ("dust_threshold", "dust_hair_threshold", "dust_size"))
+                    if ret.dust_remove
+                    else ()
+                ),
+                ir_on and ret.ir_threshold != _ret.ir_threshold,
+                bool(ret.scratch_lines) and ret.scratch_threshold != _ret.scratch_threshold,
+            ]
+        )
 
         _fin = _DEFAULT_FINISH
         fin = cfg.finish

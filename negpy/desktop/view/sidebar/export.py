@@ -6,10 +6,8 @@ from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QActionGroup
 from PyQt6.QtWidgets import (
     QApplication,
-    QFileDialog,
     QHBoxLayout,
     QInputDialog,
-    QLineEdit,
     QMenu,
     QPushButton,
     QSizePolicy,
@@ -23,6 +21,7 @@ from negpy.desktop.view.sidebar.base import BaseSidebar
 from negpy.desktop.view.styles.templates import (
     field_label,
     FIELD_LABEL_WIDTH,
+    header_actions,
     hint_label,
     icon_button,
     icon_text,
@@ -96,7 +95,6 @@ class ExportSidebar(BaseSidebar):
 
         self._add_presets_section()
         self._add_soft_proof_section()
-        self._add_contact_sheet_section()
         self._add_alongside_section()
         self.tabs = SubTabs(
             self.controller.session.repo,
@@ -105,7 +103,7 @@ class ExportSidebar(BaseSidebar):
                 ("file", tr("File"), "mdi6.file-image-outline", body),
                 ("proof", tr("Proof"), "mdi6.printer-outline", tab_page(self._soft_proof_section)),
                 ("presets", tr("Presets"), "mdi6.layers-triple-outline", tab_page(self._presets_section)),
-                ("alongside", tr("Alongside Exports"), "mdi6.puzzle-outline", tab_page(self.contact_sheet_section, self.alongside_section)),
+                ("alongside", tr("Alongside Exports"), "mdi6.puzzle-outline", tab_page(self.alongside_section)),
             ),
             icon_only=("presets", "alongside"),
         )
@@ -290,44 +288,6 @@ class ExportSidebar(BaseSidebar):
         self.bake_on_export_btn.setChecked(active)
         self.bake_on_export_btn.blockSignals(False)
 
-    def _add_contact_sheet_section(self) -> None:
-        conf = self.state.config.export
-
-        content = QWidget()
-        content_layout = QVBoxLayout(content)
-        content_layout.setContentsMargins(0, 0, 0, 0)
-        content_layout.setSpacing(THEME.space_md)
-
-        cs_path_row = QHBoxLayout()
-        cs_path_label = field_label(tr("Path"), FIELD_LABEL_WIDTH)
-        cs_path_row.addWidget(cs_path_label)
-        self.cs_output_path_edit = QLineEdit(conf.contact_sheet_output_path)
-        self.cs_output_path_edit.setPlaceholderText(tr("Uses export destination"))
-        self.cs_output_path_edit.setToolTip(wrap_tooltip(tr("The folder for contact sheets, or the export folder when this is empty.")))
-        self.cs_output_path_edit.textChanged.connect(lambda _: self.update_timer.start())
-        self.cs_output_path_browse_btn = icon_button("fa5s.folder-open", tr("Choose contact sheet output folder"))
-        self.cs_output_path_browse_btn.clicked.connect(self._browse_contact_sheet_output_path)
-        cs_path_row.addWidget(self.cs_output_path_edit)
-        cs_path_row.addWidget(self.cs_output_path_browse_btn)
-        content_layout.addLayout(cs_path_row)
-
-        self.contact_sheet_btn = labeled_action(
-            "fa5s.th",
-            tr("Contact Sheet…"),
-            tr("Lay every visible frame out as film strips on photographic paper, then export the sheet"),
-        )
-        content_layout.addWidget(self.contact_sheet_btn)
-
-        self.contact_sheet_section = make_section(
-            self.controller.session.repo, tr("Contact Sheet"), "contact_sheet", content, "fa5s.th", collapsible=False
-        )
-
-    def _browse_contact_sheet_output_path(self) -> None:
-        start = self.cs_output_path_edit.text().strip() or self.state.config.export.export_path
-        path = QFileDialog.getExistingDirectory(self, tr("Select Contact Sheet Output Folder"), start)
-        if path:
-            self.cs_output_path_edit.setText(path)
-
     def apply_shortcut_tooltips(self) -> None:
         for btn, action in ((self.contact_sheet_btn, "contact_sheet"), (self.soft_proof_btn, "toggle_soft_proof")):
             btn.setToolTip(wrap_tooltip(tooltip_with_shortcut(btn.plain_tooltip, action)))
@@ -338,7 +298,12 @@ class ExportSidebar(BaseSidebar):
         self.recipe_hint.setVisible(False)
         self._body.addWidget(self.recipe_hint)
         self._intent_header = section_subheader(tr("OUTPUT INTENT"))
-        self._body.addWidget(self._intent_header)
+        self.contact_sheet_btn = labeled_action(
+            "fa5s.th",
+            tr("Contact Sheet…"),
+            tr("Lay every visible frame out as film strips on photographic paper, then export the sheet"),
+        )
+        self._body.addLayout(header_actions(self._intent_header, self.contact_sheet_btn))
 
         # What Flat and Linear turn on rides a rail under the choice; Print has none.
         rail_body = QWidget()
@@ -767,7 +732,7 @@ class ExportSidebar(BaseSidebar):
         combo.blockSignals(True)
         combo.clear()
         for key, label in TIFF_GAMMA_OPTIONS:
-            combo.addItem(label, key)
+            combo.addItem(tr(label), key)
         current = self.state.linear_gamma_key
         for i, (key, _label) in enumerate(TIFF_GAMMA_OPTIONS):
             if key == current:
@@ -863,7 +828,7 @@ class ExportSidebar(BaseSidebar):
         )
         self.proof_save_btn = icon_button("fa5s.save", tr("Save the current proof set-up as a named preset"))
         self.proof_delete_btn = icon_button("fa5s.trash", tr("Delete the selected preset"))
-        cond_row = self._proof_row("Preset", self.proof_condition_combo, railed=True)
+        cond_row = self._proof_row(tr("Preset"), self.proof_condition_combo, railed=True)
         cond_row.addWidget(self.proof_save_btn)
         cond_row.addWidget(self.proof_delete_btn)
 
@@ -878,7 +843,7 @@ class ExportSidebar(BaseSidebar):
         self.proof_intent_combo = StepCombo()
         constrain_combo(self.proof_intent_combo)
         for value, label in PROOF_INTENT_LABELS.items():
-            self.proof_intent_combo.addItem(label, value)
+            self.proof_intent_combo.addItem(tr(label), value)
         self.proof_intent_combo.setToolTip(
             tr(
                 "How to handle colors the paper cannot print: Relative Colorimetric clips them, and Perceptual compresses all colors to keep their relations."
@@ -912,8 +877,8 @@ class ExportSidebar(BaseSidebar):
         col.addWidget(
             SliderGroup(
                 cond_row,
-                self._proof_row("Profile", self.proof_profile_combo, railed=True),
-                self._proof_row("Intent", self.proof_intent_combo, railed=True),
+                self._proof_row(tr("Profile"), self.proof_profile_combo, railed=True),
+                self._proof_row(tr("Intent"), self.proof_intent_combo, railed=True),
                 self.proof_bpc_btn,
                 self.proof_paper_white_btn,
                 self.proof_ink_black_btn,
@@ -1348,7 +1313,6 @@ class ExportSidebar(BaseSidebar):
             filename_pattern=vals["filename_pattern"],
             overwrite=vals["overwrite"],
             export_sidecars_enabled=self.sidecars_enabled_btn.isChecked(),
-            contact_sheet_output_path=self.cs_output_path_edit.text(),
         )
 
     def _on_display_changed(self, index: int) -> None:
@@ -1421,10 +1385,6 @@ class ExportSidebar(BaseSidebar):
             override = self.state.monitor_profile_override
             self.display_combo.setCurrentText(override if override in self.display_spaces else tr("As detected"))
             self._refresh_display_info()
-            # setText() unconditionally moves the caret to the end; skip the refresh while the
-            # user is actively editing the field, same as ExportSettingsForm._set_text_preserving_edit.
-            if not self.cs_output_path_edit.hasFocus():
-                self.cs_output_path_edit.setText(conf.contact_sheet_output_path)
             self.sidecars_enabled_btn.setChecked(conf.export_sidecars_enabled)
             self.bake_on_export_btn.setChecked(self.state.bake_on_export)
             self.printing_notes_preview_btn.setChecked(self.state.printing_notes)
@@ -1456,7 +1416,6 @@ class ExportSidebar(BaseSidebar):
             self.proof_ink_black_btn,
             self.proof_gamut_btn,
             self.display_combo,
-            self.cs_output_path_edit,
             self.sidecars_enabled_btn,
             self.bake_on_export_btn,
             self.flat_peek_btn,

@@ -39,6 +39,9 @@ ROLL_PATH_SEP = "/"
 DISCOVERY_FILTERS_KEY = "roll_discovery_filters"
 DEFAULT_DISCOVERY_FILTERS = ("export",)
 _FORK_SEP = "#roll:"
+# A folder roll a Discovery Filter skips keeps its record under this mark, out of every roll list,
+# until its folder is recognized again. It stays in the one store, so every migration still reaches it.
+FILTERED = "filtered"
 
 
 def _read(repo: Any) -> Dict[str, dict]:
@@ -119,6 +122,10 @@ def recognize_folder(repo: Any, path: str, name: str = "") -> str:
     undismiss_folder(repo, path)
     existing = folder_roll_id_for_path(repo, path)
     if existing:
+        if _view(repo)[existing].get(FILTERED):
+            store = _read(repo)
+            store[existing] = {k: v for k, v in store[existing].items() if k != FILTERED}
+            _write(repo, store)
         return existing
     store = _read(repo)
     roll_id = uuid.uuid4().hex
@@ -266,14 +273,15 @@ def _under(key: str, folder_key: str) -> bool:
 
 
 def prune_filtered_rolls(repo: Any) -> int:
-    """Drop folder rolls under an import source whose path from it matches a discovery
-    filter; returns how many. Not a delete, so removing the filter brings them back."""
+    """Hide folder rolls under an import source whose path from it matches a discovery
+    filter; returns how many it hid. A hidden roll keeps its settings, locks and forks,
+    and a walk that finds its folder again shows it."""
     filters = discovery_filters(repo)
     sources = [_folder_key(p) for p in import_sources(repo)]
     store = _read(repo)
     dropped = []
     for roll_id, entry in store.items():
-        if entry.get("kind") != "folder":
+        if entry.get("kind") != "folder" or entry.get(FILTERED):
             continue
         key = _folder_key(entry.get("folder_path") or "")
         for source in sources:
@@ -282,10 +290,25 @@ def prune_filtered_rolls(repo: Any) -> int:
                     dropped.append(roll_id)
                 break
     for roll_id in dropped:
-        del store[roll_id]
+        store[roll_id] = {**store[roll_id], FILTERED: True}
     if dropped:
         _write(repo, store)
     return len(dropped)
+
+
+def is_hidden(repo: Any, roll_id: Optional[str]) -> bool:
+    """Whether a Discovery Filter hides *roll_id* from every roll list."""
+    return bool(roll_id) and bool((_view(repo).get(roll_id) or {}).get(FILTERED))
+
+
+def hidden_rolls_under(repo: Any, folders: Sequence[str]) -> List[str]:
+    """The hidden folder rolls at or under one of *folders*."""
+    keys = [_folder_key(folder) for folder in folders]
+    return [
+        roll_id
+        for roll_id, entry in _view(repo).items()
+        if entry.get(FILTERED) and any(_under(_folder_key(entry.get("folder_path") or ""), key) for key in keys)
+    ]
 
 
 def forget_import_sources(repo: Any, folders: List[str]) -> None:
@@ -622,32 +645,78 @@ def rename_folder_roll_disk(repo: Any, roll_id: str, new_name: str) -> Optional[
 def rehome_paths(repo: Any, move: Callable[[str], str]) -> None:
     """Pass every folder and member path of every roll through *move*."""
     store = _read(repo)
-    for entry in store.values():
+    owned = {_folder_key(e["folder_path"]): rid for rid, e in store.items() if e.get("kind") == "folder" and e.get("folder_path")}
+    for roll_id, entry in store.items():
         if entry.get("folder_path"):
-            entry["folder_path"] = move(entry["folder_path"])
-        for key in ("member_paths", "excluded_paths", "extra_paths"):
+            moved = move(entry["folder_path"])
+            # A folder roll never moves onto a folder that another folder roll holds; its removed frames stay with it.
+            if owned.get(_folder_key(moved), roll_id) != roll_id:
+                continue
+            entry["folder_path"] = moved
+        for key in ("member_paths", "excluded_paths"):
             if key in entry:
                 entry[key] = [move(p) for p in entry[key]]
     _write(repo, store)
 
 
-def delete_roll(repo: Any, roll_id: str) -> None:
-    """Forget a roll. A deleted folder roll is not recognized again by a Library refresh."""
+def delete_roll(repo: Any, roll_id: str) -> List[str]:
+    """Forget a roll. A deleted folder roll is not recognized again by a Library refresh.
+    Returns the edit hashes of its forks, which the caller deletes."""
     store = _read(repo)
     entry = store.pop(roll_id, None)
     if entry is None:
-        return
+        return []
     _write(repo, store)
     path = entry.get("folder_path")
     if entry.get("kind") == "folder" and path:
         dismissed = _dismissed_folders(repo)
         if _folder_key(path) not in {_folder_key(p) for p in dismissed}:
             repo.save_global_setting(DISMISSED_FOLDERS_KEY, [*dismissed, path])
+    return [roll_edit_hash(h, roll_id) for h in entry.get("forked_hashes", [])]
+
+
+_ROLL_SETTINGS_KEYS = (
+    "defaults",
+    "frame_seed",
+    "frame_overrides",
+    "frame_baselines",
+    "normalization",
+    "scenes",
+    "film_base",
+    "fade_crossover_source",
+)
+
+
+def reset_roll_settings(repo: Any, roll_id: str) -> Dict[str, Any]:
+    """Drop the roll's own values, card locks, baseline, film base and scenes. The name, the
+    frames and the forks stay. Returns what it dropped, for restore_roll_settings."""
+    store = _read(repo)
+    entry = store.get(roll_id)
+    if entry is None:
+        return {}
+    dropped = {key: entry.pop(key) for key in _ROLL_SETTINGS_KEYS if key in entry}
+    if dropped:
+        _write(repo, store)
+    return dropped
+
+
+def restore_roll_settings(repo: Any, roll_id: str, dropped: Dict[str, Any]) -> None:
+    """Put back what reset_roll_settings dropped, over whatever the roll holds for those keys now."""
+    store = _read(repo)
+    entry = store.get(roll_id)
+    if entry is None:
+        return
+    for key in _ROLL_SETTINGS_KEYS:
+        entry.pop(key, None)
+    entry.update(copy.deepcopy(dropped))
+    _write(repo, store)
 
 
 def all_rolls_sorted(repo: Any) -> List[tuple]:
-    """(roll_id, entry) pairs for every roll, folder and virtual alike, name-sorted."""
-    return sorted(_view(repo).items(), key=lambda pair: pair[1].get("name", "").casefold())
+    """(roll_id, entry) pairs for every roll the Library lists, folder and virtual alike,
+    name-sorted: a roll a Discovery Filter hides is left out."""
+    listed = (pair for pair in _view(repo).items() if not pair[1].get(FILTERED))
+    return sorted(listed, key=lambda pair: pair[1].get("name", "").casefold())
 
 
 def virtual_rolls(repo: Any) -> List[tuple]:
@@ -773,7 +842,11 @@ def roll_defaults(repo: Any, roll_id: str) -> Dict[str, Any]:
     here has no roll default yet -- the frame's own saved value is what is used,
     exactly as before roll defaults existed."""
     entry = roll_for_id(repo, roll_id)
-    return _without_decode_white(dict(entry["defaults"])) if entry and entry.get("defaults") else {}
+    defaults = _without_decode_white(dict(entry["defaults"])) if entry and entry.get("defaults") else {}
+    # A roll Red stored before the Red trim existed has no trim, so a frame's own trim would sit on it.
+    if "fade_ratio_r" in defaults:
+        defaults.setdefault("fade_red_trim", 1.0)
+    return defaults
 
 
 def set_roll_defaults(repo: Any, roll_id: str, **fields: Any) -> None:
@@ -789,6 +862,24 @@ def set_roll_defaults(repo: Any, roll_id: str, **fields: Any) -> None:
     defaults.update(_without_decode_white(fields))
     entry["defaults"] = defaults
     _write(repo, store)
+
+
+def set_roll_crossover_source(repo: Any, roll_id: str, name: str, table: Any) -> None:
+    """Records the frame *name* whose crossover *table* Share Crossover gave the roll. No-op for an unknown id."""
+    store = _read(repo)
+    entry = store.get(roll_id)
+    if entry is None:
+        return
+    entry["fade_crossover_source"] = {"name": name, "table": list(table)}
+    _write(repo, store)
+
+
+def roll_crossover_source(repo: Any, roll_id: str, table: Any) -> str:
+    """The frame Share Crossover took *table* from, "" when the roll's table came from elsewhere since."""
+    source = (roll_for_id(repo, roll_id) or {}).get("fade_crossover_source")
+    if not isinstance(source, dict) or table is None or not same_value(tuple(source.get("table") or ()), tuple(table)):
+        return ""
+    return str(source.get("name", ""))
 
 
 # A snapshot value for a field the roll had no default for.
@@ -909,24 +1000,18 @@ def set_frame_override(
     _write(repo, store)
 
 
-def _card_keys(card_keys: Any) -> tuple:
-    if card_keys is None:
-        return tuple(ROLL_DEFAULT_FIELDS)
-    return (card_keys,) if isinstance(card_keys, str) else tuple(card_keys)
-
-
-def card_locks_snapshot(repo: Any, roll_id: str, card_keys: Any, hashes) -> Dict[str, Any]:
-    """For each of *hashes* (unforked) and each of *card_keys* (one key, several, or None for every card),
-    the baseline its lock holds, or None where the card follows the roll."""
-    keys = _card_keys(card_keys)
+def card_locks_snapshot(repo: Any, roll_id: str, hashes) -> Dict[str, Any]:
+    """For each of *hashes* (unforked) and each card, the baseline its lock holds, or None where the card follows the roll."""
     entry = roll_for_id(repo, roll_id) or {}
     overrides, baselines = entry.get("frame_overrides", {}), entry.get("frame_baselines", {})
-    return {h: {c: dict(baselines.get(h, {}).get(c, {})) if c in overrides.get(h, ()) else None for c in keys} for h in hashes}
+    return {
+        h: {c: dict(baselines.get(h, {}).get(c, {})) if c in overrides.get(h, ()) else None for c in ROLL_DEFAULT_FIELDS} for h in hashes
+    }
 
 
-def restore_card_locks(repo: Any, roll_id: str, card_keys: Any, snapshot: Dict[str, Any]) -> None:
+def restore_card_locks(repo: Any, roll_id: str, card_keys, snapshot: Dict[str, Any]) -> None:
     """Puts back the locks and baselines a card_locks_snapshot holds for *card_keys*. No-op for an unknown roll id."""
-    keys = set(_card_keys(card_keys))
+    keys = set(card_keys)
     store = _read(repo)
     entry = store.get(roll_id)
     if entry is None:
